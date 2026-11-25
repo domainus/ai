@@ -202,3 +202,21 @@ def test_fp8_small_matrix_one_step(shape):
 def test_fp8_rejects_fp32_dtype():
     with pytest.raises(TypeError):
         polar_express_fp8(torch.randn(64, 256, device="cuda"), dtype=torch.float32)
+
+
+@pytest.mark.parametrize("n", [64, 128, 256])
+@pytest.mark.parametrize("aspect", [1, 2, 4])
+def test_fp8_default_one_step_bounded_on_small_n(n, aspect):
+    m = n * aspect
+    for kind in ("gaussian", "uniform"):
+        if kind == "gaussian":
+            X = rand((n, m), torch.bfloat16, seed=n + aspect)
+        else:
+            X32 = torch.randn(n, m, device="cuda", generator=torch.Generator(device="cuda").manual_seed(n + aspect))
+            U = torch.linalg.qr(X32[:n, :n])[0]
+            V = torch.linalg.qr(X32.mT)[0]
+            X = (U @ V.mT).to(torch.bfloat16)
+        Q, meta = polar_express_fp8(X, return_meta=True)
+        check_clean(Q)
+        assert meta["fp8_steps_used"] == 1
+        assert torch.linalg.svdvals(Q.double()).max().item() < 1.2

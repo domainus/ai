@@ -10,20 +10,21 @@ A segment works on the wide view ``W`` (``n <= m``) and its Gram ``R = W W^T``:
 
 On each singular value this is ``s -> s * q(s^2)`` with ``deg q = 2^k``. One
 segment costs ``alpha n^3`` (SYRK) + ``k n^3`` (symmetric squares) + ``2 alpha n^3``
-(``Q @ W``) = ``(3 alpha + k) n^3``; each restart adds another segment. All
-``k + 1`` buffers stay live (FP32, ``(k + 2) n^2`` floats including ``Q``), which
-lets ``k`` squares reach the minimax error floor of a degree-``2^k`` polynomial.
+(``Q @ W``) = ``(3 alpha + k) n^3``; each restart adds another segment. Keeping
+``R``, ``R2``, and all ``k + 1`` scaled Gram buffers live requires ``max_k + 4``
+FP32 ``n^2`` buffers, which lets ``k`` squares reach the minimax error floor of
+a degree-``2^k`` polynomial.
 
-Precision model (identical on CPU and CUDA): every matrix product takes
-FP16/BF16 operands and accumulates in FP32; Gram buffers stay in FP32 and are
-rounded once when they become an operand. On CPU this is an exact emulation of
-"FP16 operands, FP32 accumulation, one rounding per inner step", because a
-product of two FP16/BF16 values is exact in FP32.
+Precision model (sparse-error emulation): every matrix product takes FP16/BF16
+operands and accumulates in FP32; Gram buffers stay in FP32 and are rounded once
+when they become an operand. In FP16, ``_square`` prescales by an exact power of
+two before casting so trace-1 subnormals on ``n >= 4096`` cannot corrupt ``R^2``
+or underbound Schatten-8; ``run_circuit`` includes the FP16/BF16 cast residual
+``||L - L_h||_F`` in the Schatten-8 upper bound and runs CPU norm reductions in
+FP64 to avoid CPU FP32 summation drift.
 
-``SpectralPrescaledPolar`` runs a circuit after scaling by a guarded warm
-spectral estimate (``spectral_scaling``). The estimate runs on ``R`` and uses
-``R^2`` (the first square, which the chain needs anyway) for a free Schatten-8
-upper bound, so pre-scaling adds no ``n^3`` work.
+``SpectralPrescaledPolar`` defaults to stateless rigorous ``scaling="schatten8"``,
+which reuses ``R^2`` for zero extra ``n^3`` work and eliminates multi-step drift.
 """
 
 from __future__ import annotations
@@ -43,6 +44,8 @@ from research.polar_opt.spectral_scaling import (
 
 _HALF = (torch.float16, torch.bfloat16)
 CAP = 1.25  # basin ceiling: a circuit is "stable" on [0, u] if 0 <= f <= CAP there
+# Circuits verified under full coherent rank-1 BF16 matrix sweeps (sigma_max <= 1.25 for x <= 1).
+BF16_SAFE_CIRCUITS = frozenset({"S0-k4-lo0.05", "S1-k2+4-lo0.01"})
 
 
 # --------------------------------------------------------------------------------------
@@ -160,9 +163,33 @@ def _syrk(X: Tensor, use_triton: bool) -> Tensor:
     return torch.bmm(Xf, Xf.mT)
 
 
-def _square(L: Tensor, dtype: torch.dtype, use_triton: bool) -> Tensor:
-    """``L @ L`` for symmetric FP32 ``L``; the operand is rounded once to ``dtype``."""
-    return _syrk(L.to(dtype), use_triton)
+def _square(L: Tensor, dtype: torch.dtype, use_triton: bool, return_cast_err: bool = False):
+    """``L @ L`` for symmetric FP32 ``L``; the operand is rounded once to ``dtype``.
+
+    In FP16, a power-of-two prescale avoids subnormal truncation (critical at n >= 4096 when
+    trace(R) = 1 places off-diagonal entries below 2^-14) without altering any mantissa bit.
+    """
+    if dtype == torch.float16 and L.numel() > 0:
+        amax = L.abs().amax(dim=(-2, -1), keepdim=True)
+        exp = (13.0 - torch.ceil(torch.log2(amax.clamp_min(1e-38)))).clamp(-14.0, 50.0)
+        nonzero = amax > 0
+        scale_up = torch.where(nonzero, torch.exp2(exp), torch.ones_like(amax))
+        scale_down_1 = torch.where(nonzero, torch.exp2(-exp), torch.ones_like(amax))
+        scale_down_2 = torch.where(nonzero, torch.exp2(-2.0 * exp), torch.ones_like(amax))
+        L_h = (L * scale_up).to(dtype)
+        R2 = _syrk(L_h, use_triton) * scale_down_2
+        if return_cast_err:
+            diff = L - L_h.float() * scale_down_1
+            err = diff.norm(dim=(-2, -1)) if L.is_cuda else diff.double().norm(dim=(-2, -1))
+            return R2, err
+        return R2
+    L_h = L.to(dtype)
+    R2 = _syrk(L_h, use_triton)
+    if return_cast_err:
+        diff = L - L_h.float()
+        err = diff.norm(dim=(-2, -1)) if L.is_cuda else diff.double().norm(dim=(-2, -1))
+        return R2, err
+    return R2
 
 
 def _mm(Q: Tensor, W: Tensor, dtype: torch.dtype) -> Tensor:
@@ -220,13 +247,22 @@ def run_circuit(G: Tensor, circuit: GramCircuit, *, sigma: Tensor | None = None,
     X = G.reshape(-1, *shape[-2:]).float()
     tall = X.shape[-2] > X.shape[-1]
     W = X.mT if tall else X
-    fro = W.norm(dim=(-2, -1), keepdim=True)
-    # Frobenius normalization first keeps FP16 entries away from subnormals.
-    W = (W / fro.clamp_min(1e-30)).to(dtype).contiguous()
+    # Overflow/underflow-safe Frobenius normalization; dead/sub-1e-12/non-finite inputs map to 0.
+    amax = W.abs().amax(dim=(-2, -1), keepdim=True)
+    tiny = torch.finfo(torch.float32).tiny
+    W_unit = torch.where(amax > 0, W / amax.clamp_min(tiny), torch.zeros_like(W))
+    fro_unit = W_unit.norm(dim=(-2, -1), keepdim=True) if W.is_cuda else W_unit.double().norm(dim=(-2, -1), keepdim=True).float()
+    fro = fro_unit * amax
+    valid = (fro > 1e-12) & torch.isfinite(fro)
+    W = torch.where(valid, W_unit / fro_unit.clamp_min(tiny), torch.zeros_like(W)).to(dtype).contiguous()
     info = None
     for i, seg in enumerate(circuit.segments):
         R = _syrk(W, use_triton_syrk)
-        R2 = _square(R, dtype, use_triton_syrk)
+        if schatten8 and i == 0:
+            R2, cast_err = _square(R, dtype, use_triton_syrk, return_cast_err=True)
+        else:
+            R2 = _square(R, dtype, use_triton_syrk)
+            cast_err = None
         if i:
             scale = torch.ones_like(fro)
         elif scaler is not None:
@@ -234,10 +270,13 @@ def run_circuit(G: Tensor, circuit: GramCircuit, *, sigma: Tensor | None = None,
             sig = info.sigma.reshape(-1, 1, 1)
             scale = torch.where(sig > 0, 1.0 / sig.clamp_min(1e-30), 1.0)  # zero input stays zero
         elif schatten8:
-            tr = R.diagonal(dim1=-2, dim2=-1).sum(-1)
-            s4 = R.norm(dim=(-2, -1))
-            s8 = R2.norm(dim=(-2, -1)).sqrt()
-            upper = torch.minimum(tr, torch.minimum(s4, s8)).clamp_min(0.0).sqrt().reshape(-1, 1, 1)
+            R_n = R if R.is_cuda else R.double()
+            R2_n = R2 if R2.is_cuda else R2.double()
+            ce_n = cast_err if R.is_cuda else cast_err.double()
+            tr = R_n.diagonal(dim1=-2, dim2=-1).sum(-1)
+            s4 = R_n.norm(dim=(-2, -1))
+            s8 = R2_n.norm(dim=(-2, -1)).sqrt() + ce_n
+            upper = torch.minimum(tr, torch.minimum(s4, s8)).clamp_min(0.0).sqrt().float().reshape(-1, 1, 1)
             scale = torch.where(upper > 0, 1.0 / (upper * 1.005).clamp_min(1e-30), 1.0)
         elif sigma is not None:
             sig = sigma.reshape(-1, 1, 1).float().to(fro.device)
@@ -280,23 +319,24 @@ class SpectralPrescaledPolar:
 
     def __init__(self, circuit: str | GramCircuit = "S1-k3+4-lo0.005", *, dtype: torch.dtype = torch.float16,
                  use_triton_syrk: bool = False, estimator: EstimatorConfig | None = None,
-                 scaling: str = "spectral", seed: int = 0, allow_unsafe_bf16: bool = False):
+                 scaling: str = "schatten8", seed: int = 0, allow_unsafe_bf16: bool = False):
         if scaling not in ("spectral", "schatten8", "frobenius"):
             raise ValueError("scaling must be 'spectral', 'schatten8', or 'frobenius'")
         if isinstance(circuit, str):
             if circuit in CIRCUITS:
                 self.circuit = CIRCUITS[circuit]
             elif circuit in FP16_ONLY_CIRCUITS:
-                if dtype == torch.bfloat16 and not allow_unsafe_bf16:
-                    raise ValueError(
-                        f"Circuit {circuit!r} has an FP16-only stability basin; use dtype=torch.float16 "
-                        f"or choose a BF16-safe circuit from CIRCUITS={sorted(CIRCUITS)}."
-                    )
                 self.circuit = FP16_ONLY_CIRCUITS[circuit]
             else:
                 raise KeyError(f"Unknown circuit {circuit!r}")
         else:
             self.circuit = circuit
+        if dtype == torch.bfloat16 and not allow_unsafe_bf16 and self.circuit.name not in BF16_SAFE_CIRCUITS:
+            raise ValueError(
+                f"Circuit {self.circuit.name!r} failed coherent rank-1 BF16 matrix safety; use "
+                f"dtype=torch.float16, pass allow_unsafe_bf16=True, or choose from "
+                f"BF16_SAFE_CIRCUITS={sorted(BF16_SAFE_CIRCUITS)}."
+            )
         self.dtype, self.use_triton_syrk = dtype, use_triton_syrk
         self.schatten8 = scaling == "schatten8"
         self.scaler = WarmSpectralScaler(estimator, seed) if scaling == "spectral" else None

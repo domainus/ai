@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import random
+import subprocess
 import time
 from pathlib import Path
 
@@ -104,21 +105,30 @@ def _clone_scaler(src: WarmSpectralScaler, key: str) -> WarmSpectralScaler:
 
 def _make_spectral_wrapper(circuit_name: str, dtype: torch.dtype = torch.float16, use_triton: bool = True):
     circuit, _ = _lookup_circuit(circuit_name)
-    prewarmed_cache: dict[tuple[int, tuple[int, ...]], WarmSpectralScaler] = {}
+    last_prev: Tensor | None = None
+    last_base: WarmSpectralScaler | None = None
 
     def apply(matrix: torch.Tensor, previous: torch.Tensor | None) -> torch.Tensor:
+        nonlocal last_prev, last_base
         if previous is None:
             scaler = WarmSpectralScaler()
             return run_circuit(matrix, circuit, dtype=dtype, use_triton_syrk=use_triton, scaler=scaler, key="k")
-        cache_key = (previous.data_ptr(), tuple(previous.shape))
-        base = prewarmed_cache.get(cache_key)
-        if base is None:
+        same_prev = (
+            last_prev is not None
+            and last_base is not None
+            and previous.shape == last_prev.shape
+            and previous.dtype == last_prev.dtype
+            and previous.device == last_prev.device
+            and torch.equal(previous, last_prev)
+        )
+        if not same_prev:
             base = WarmSpectralScaler()
             run_circuit(previous, circuit, dtype=dtype, use_triton_syrk=use_triton, scaler=base, key="k")
             if previous.is_cuda:
                 torch.cuda.synchronize(previous.device)
-            prewarmed_cache[cache_key] = base
-        scaler = _clone_scaler(base, "k")
+            last_prev = previous.detach().clone()
+            last_base = base
+        scaler = _clone_scaler(last_base, "k")
         return run_circuit(matrix, circuit, dtype=dtype, use_triton_syrk=use_triton, scaler=scaler, key="k")
 
     return apply
@@ -146,14 +156,19 @@ def benchmark_llm_shapes(device: torch.device, circuit_names: list[str], warmup:
         G = torch.randn(shape, generator=rng, dtype=torch.float32).to(device)
         ref = svd_polar_fp64(G).reshape(-1, *shape[-2:])
 
-        # Prepare steady-state warm scalers for spectral circuits (pre-warmed on a realistic neighbor M_{t-1}).
+        # Prepare independent steady-state warm scalers per precision (avoid shared mutable state).
         G_prev = (0.95 * G + 0.05 * torch.randn(shape, generator=rng, dtype=torch.float32).to(device))
-        warm_scalers = {}
+        warm_scalers_fp16 = {}
+        warm_scalers_bf16 = {}
         for cname in circuit_names:
-            c, _ = _lookup_circuit(cname)
-            sc = WarmSpectralScaler()
-            run_circuit(G_prev, c, dtype=torch.float16, use_triton_syrk=True, scaler=sc, key="steady")
-            warm_scalers[cname] = sc
+            c, bf16_safe = _lookup_circuit(cname)
+            sc16 = WarmSpectralScaler()
+            run_circuit(G_prev, c, dtype=torch.float16, use_triton_syrk=True, scaler=sc16, key="steady")
+            warm_scalers_fp16[cname] = sc16
+            if bf16_safe:
+                scb = WarmSpectralScaler()
+                run_circuit(G_prev, c, dtype=torch.bfloat16, use_triton_syrk=True, scaler=scb, key="steady")
+                warm_scalers_bf16[cname] = scb
 
         calls = {
             "polar_express_eager": lambda x: polar_express(x, steps=5),
@@ -167,9 +182,9 @@ def benchmark_llm_shapes(device: torch.device, circuit_names: list[str], warmup:
         }
         for cname in circuit_names:
             c, bf16_safe = _lookup_circuit(cname)
-            sc = warm_scalers[cname]
+            sc16 = warm_scalers_fp16[cname]
             calls[f"{cname}_steady_triton_fp16"] = (
-                lambda x, circ=c, scaler=sc: run_circuit(
+                lambda x, circ=c, scaler=sc16: run_circuit(
                     x, circ, dtype=torch.float16, use_triton_syrk=True, scaler=scaler, key="steady"
                 )
             )
@@ -179,8 +194,9 @@ def benchmark_llm_shapes(device: torch.device, circuit_names: list[str], warmup:
                 )
             )
             if bf16_safe:
+                scb = warm_scalers_bf16[cname]
                 calls[f"{cname}_steady_triton_bf16"] = (
-                    lambda x, circ=c, scaler=sc: run_circuit(
+                    lambda x, circ=c, scaler=scb: run_circuit(
                         x, circ, dtype=torch.bfloat16, use_triton_syrk=True, scaler=scaler, key="steady"
                     )
                 )
@@ -261,6 +277,7 @@ def main() -> None:
     args = ap.parse_args()
 
     device = configure_device(args.device)
+    loadavg_start = list(os.getloadavg())
     circuit_names = _select_circuits(args.circuits)
     print(f"Selected spectral circuits: {circuit_names}", flush=True)
 
@@ -298,8 +315,8 @@ def main() -> None:
         sym_flops = batches * (3 * segs * wide * n**2 + ksum * n**3)
         dense_flops = batches * (4 * segs * wide * n**2 + 2 * ksum * n**3)
         max_k = max(s.squarings for s in circ.segments)
-        # W fp16/fp32 + max_k+2 FP32 Gram buffers
-        peak = batches * (4 * n * wide + 4 * (max_k + 2) * n * n)
+        # W fp16/fp32 + R + R2 + max_k+1 scaled FP32 Gram buffers = max_k+4 buffers
+        peak = batches * (4 * n * wide + 4 * (max_k + 4) * n * n)
         return TheoreticalCost(
             dense_flops,
             f"({4 * segs}α + {2 * ksum})n³",
@@ -330,11 +347,20 @@ def main() -> None:
     )
     tier1_summary = tier1_summarize(tier1_results)
 
+    try:
+        git_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except Exception:
+        git_sha = None
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "git_sha": git_sha,
+        "cli_args": vars(args) | {"trajectories": str(args.trajectories), "output": str(args.output)},
         "device": torch.cuda.get_device_name(device),
         "capability": list(torch.cuda.get_device_capability(device)),
         "torch": str(torch.__version__),
+        "loadavg_start": loadavg_start,
+        "loadavg_end": list(os.getloadavg()),
         "loadavg": list(os.getloadavg()),
         "selected_circuits": circuit_names,
         "llm_shapes": llm_rows,

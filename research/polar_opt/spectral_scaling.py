@@ -155,6 +155,21 @@ def power_iteration(op: Callable[[Tensor], Tensor], v: Tensor, steps: int):
     return lam.squeeze(-1).squeeze(-1), v, align, residual.squeeze(-1).squeeze(-1)
 
 
+def _safe_qr_double(X: Tensor) -> tuple[Tensor, Tensor]:
+    """Reduced QR in float64 with per-batch finite masking so one NaN slice never poisons others."""
+    ok = torch.isfinite(X).flatten(-2).all(-1)
+    m, k = X.shape[-2], min(X.shape[-2], X.shape[-1])
+    if not ok.any():
+        eye = torch.eye(m, k, dtype=torch.float64, device=X.device)
+        return eye.expand(*X.shape[:-2], m, k).clone(), ok
+    clean = torch.where(ok[..., None, None], X.double(), 0.0)
+    try:
+        return torch.linalg.qr(clean)[0], ok
+    except torch.linalg.LinAlgError:
+        eye = torch.eye(m, k, dtype=torch.float64, device=X.device)
+        return eye.expand(*X.shape[:-2], m, k).clone(), torch.zeros_like(ok)
+
+
 def block_krylov(op: Callable[[Tensor], Tensor], V: Tensor, depth: int):
     """Rayleigh-Ritz on the block Krylov space ``[V, A V, ..., A^depth V]``.
 
@@ -163,24 +178,40 @@ def block_krylov(op: Callable[[Tensor], Tensor], V: Tensor, depth: int):
     ``lambda_max`` in exact arithmetic (Cauchy interlacing). A random probe has
     overlap ~1/sqrt(n) with any fixed direction, so a hidden spike that is
     ``r`` times larger is amplified by ``r^(2 depth)`` and found quickly.
+    Non-finite slices are isolated per batch element and return ``lam = 0``.
     """
-    blocks = [V]
-    Q = torch.linalg.qr(V.double())[0].to(V.dtype)
+    Q0, ok = _safe_qr_double(V)
+    Q = Q0.to(V.dtype)
+    blocks = [torch.where(ok[..., None, None], V, 0.0)]
     for _ in range(depth):
-        Q = torch.linalg.qr(op(Q).double())[0].to(V.dtype)
+        Q_d, ok_step = _safe_qr_double(op(Q))
+        ok = ok & ok_step
+        Q = Q_d.to(V.dtype)
         blocks.append(Q)
-    K = torch.linalg.qr(torch.cat(blocks, dim=-1).double())[0]
+    K, ok_k = _safe_qr_double(torch.cat(blocks, dim=-1))
+    ok = ok & ok_k
     AK = op(K.to(V.dtype)).double()
+    ok = ok & torch.isfinite(AK).flatten(-2).all(-1)
     T = K.mT @ AK
     T_sym = (T + T.mT) / 2
-    if not torch.isfinite(T_sym).all():
-        return power_iteration(op, V[..., :1], 1)[:2]
+    ok = ok & torch.isfinite(T_sym).flatten(-2).all(-1)
+    if not ok.any():
+        return torch.zeros(V.shape[:-2], dtype=V.dtype, device=V.device), _unit(V[..., :1])
+    kdim = T_sym.shape[-1]
+    eye_k = torch.eye(kdim, dtype=torch.float64, device=T_sym.device)
+    T_clean = torch.where(ok[..., None, None], T_sym, eye_k)
     try:
-        theta, Y = torch.linalg.eigh(T_sym)
+        theta, Y = torch.linalg.eigh(T_clean)
     except torch.linalg.LinAlgError:
-        return power_iteration(op, V[..., :1], max(1, depth))[:2]
-    v = (K @ Y[..., -1:]).to(V.dtype)
-    return theta[..., -1].clamp_min(0).to(V.dtype), _unit(v)
+        lam_fb, v_fb = power_iteration(op, V[..., :1], max(1, depth))[:2]
+        lam_safe = torch.where(torch.isfinite(lam_fb), lam_fb.clamp_min(0), torch.zeros_like(lam_fb))
+        return lam_safe, v_fb
+    lam_out = torch.where(
+        ok, theta[..., -1].clamp_min(0).to(V.dtype), torch.zeros(V.shape[:-2], dtype=V.dtype, device=V.device)
+    )
+    v_raw = (K @ Y[..., -1:]).to(V.dtype)
+    v_out = torch.where(ok[..., None, None], v_raw, V[..., :1])
+    return lam_out, _unit(v_out)
 
 
 # --------------------------------------------------------------------------------------
@@ -215,6 +246,7 @@ class EstimatorConfig:
     cold_probes: int = 4
     cold_depth: int = 8
     krylov_gamma: float = KRYLOV_GAMMA
+    u_safe: float | None = 1.10
     defer_escalation: bool = True
 
     @property
@@ -298,6 +330,7 @@ class WarmSpectralEstimator:
         lam_lo, lam_hi = op.bounds(A2)
         deferred = None
         if self.vector is None or self._key != key:
+            self._pending.clear()
             V = torch.cat([op.random(1, gen), op.random(cfg.cold_probes, gen)], dim=-1)
             lam_p, v = block_krylov(op, V, cfg.cold_depth)
             escalated = torch.ones_like(lam_p, dtype=torch.bool)
@@ -362,7 +395,11 @@ class WarmSpectralEstimator:
         sigma_p = lam_p.sqrt()
         lower, upper = lam_lo.sqrt(), lam_hi.sqrt()
         gamma = torch.where(escalated, cfg.krylov_gamma, cfg.margin)
-        sigma = torch.minimum(upper, torch.maximum(lower, gamma * sigma_p))
+        est_term = torch.where(torch.isfinite(sigma_p), gamma * sigma_p, torch.zeros_like(sigma_p))
+        lo_term = torch.where(torch.isfinite(lower), lower, torch.zeros_like(lower))
+        sigma = torch.minimum(upper, torch.maximum(lo_term, est_term))
+        if cfg.u_safe is not None:
+            sigma = torch.where(torch.isfinite(upper), torch.maximum(sigma, upper / cfg.u_safe), sigma)
         if deferred is not None:
             sigma = torch.where(deferred, upper, sigma)
         if deferred is not None:

@@ -2,8 +2,8 @@
   "program": "Autonomous Verifiable AI Research",
   "repo": "https://github.com/domainus/ai",
   "cycle": 1,
-  "phase": "pending_adversarial_audit",
-  "last_updated": "2026-11-25T10:52:30-07:00",
+  "phase": "cycle1_audited_remediated",
+  "last_updated": "2026-11-25T12:14:00-07:00",
   "fleet": {
     "bazzite": {
       "environment_id": "6fb39dcd-f3b7-4929-a1d5-637d67eb79bb",
@@ -15,62 +15,155 @@
       "environment_id": "fbc39183-5d33-4276-af14-3cb027511e92",
       "hardware": "macOS arm64 | Apple M5 Max (40 GPU cores, 128 GiB unified, MLX 0.32.5)",
       "status": "online",
-      "role": "Apple Silicon MLX/MPS benchmarks (PS3_55 MLX 2.191 ms, 1.53x vs PolarExpress MLX)"
+      "role": "Apple Silicon MLX/MPS FP32 benchmarks (PS3_55 MLX 2.191 ms / 1.52x vs PE at 1024x4096; -14% at 2048x2048)"
     },
     "macbook_air": {
       "environment_id": "01096d9f-87f1-432f-b1d9-49c309d1458f",
       "hardware": "macOS arm64 | Apple Silicon",
       "status": "blocked",
-      "role": "MLX/MPS benchmarks (blocked by ~/Documents TCC permissions & project lookup error after clone)"
+      "role": "Blocked by ~/Documents TCC permissions & T3 project lookup error after cloning to ~/.t3/projects/ai"
     }
   },
   "kpis": {
     "experiments_run": 8,
-    "verified_wins": 0,
-    "best_speedup_vs_pe": "2.61x (ps3_55_blackwell 2048x8192) / +27.8% Tier-2 LM tok/s",
-    "best_speedup_vs_ps": "1.94x (ps3_55_blackwell 4096x4096) / 1.92x (117-case Tier-1)",
-    "tests_passing": 550,
-    "audits_completed": 0
+    "verified_wins": 2,
+    "best_speedup_vs_pe": 2.61,
+    "best_speedup_vs_ps": 2.1,
+    "tests_passing": 531,
+    "audits_completed": 4
   },
   "completed": [
-    "Public repo domainus/ai + Blackwell sm_120 stack (PyTorch 2.14.1+cu130, Triton 3.8.0) verified",
-    "SOTA baselines + 19.2M LM momentum harvest (median eff-rank 3.19x, right overlap 0.937, max d_sigma 31.82%)",
-    "Blackwell sm_120 triton_syrk (1.69-2.02x vs cuBLAS) & PolarSwitch PS2/PS3_55 (0.304-0.307 ms Tier-1; 2.61x at 2048x8192; 0/117 div)",
-    "Tier-2 19.2M LM (72 runs, 0 div): muon_ps3_blackwell hits 2.8669 wall-clock val loss @ 162.4k tok/s (+27.8% tok/s, -0.224 loss vs PE)",
-    "Stateless Schatten-8 scaling (scaling='schatten8'): 0/72 Tier-2 divergence, S1-k4+5-lo0.002 achieves 0.2800 max harvested error (best overall)",
-    "Apple M5 Max MLX/MPS benchmark: PS3_55 MLX 2.191 ms at 1024x4096 (1.53x faster & 34% lower error than PolarExpress MLX)",
-    "Negative discovery caught: polar_express_fp8x2_bf16 diverged on 9% of Tier-1 adversarial cases (max sigma = 44,205)",
-    "Negative discovery caught: heuristic warm-power scaling drifted to true/sigma=1.191 at LM step 11 without 1-step jump triggers"
+    "Public repo domainus/ai + RTX 5080 Blackwell sm_120 stack verified (531/531 tests passing)",
+    "VERIFIED SYSTEMS WIN — ps2/ps3_55_blackwell_fp16 (Du & Su circuit): 0.304/0.307 ms Tier-1 (1.90x/1.89x vs eager PS; 1.41x vs PE), 1.42-2.10x wall & 1.41-1.94x CUDA-graph GPU speedup across LLM shapes, 0/117 div",
+    "triton_syrk (sm_120): 1.13-2.02x vs cuBLAS (1.63-2.02x N>=1024); Tier-2 like-for-like muon_ps2_blackwell +9.4% fixed-token tok/s vs eager PS2 (0/72 div)",
+    "Caveated Tier-2 wall-clock: muon_ps3_blackwell 2.8669 loss @ 162.4k tok/s (+27.7% vs PE eager; synthetic 2048-tok/step motif, confounded BF16/FP32 foreach, boundary LR)",
+    "Apple M5 Max MLX FP32 (warmups=1, repeats=5): 15/15 finite, beats MPS 14/15; PS3_55 2.191 ms (1.52x vs PE MLX, -34% err) at 1024x4096, but -14% at 2048x2048",
+    "Negative discoveries & P0 fixes: FP8 PE 68.75% uniform_mp div -> fp8_steps=1; warm-power step-11 drop -> u_safe=1.10 & schatten8 default; FP16 _square prescaled; BF16_SAFE_CIRCUITS restricted; fixed data_ptr(), torch.compile & N==1 (4096^2 10.46 ms)"
   ],
   "wip": [
-    "GATE-1: Mandatory 4-model adversarial audit (Claude Opus 5.5, Claude Fable 5.2, GPT 6.2 Astra, Gemini 4 Neon at high)",
-    "Cycle 2 prep: Zero-overshoot u=1.005 Schatten-8 Polar Switch fused onto _symprod_kernel"
+    "Cycle 2 P1 (T1-04): _symprod_kernel-native 2/3-buffer Schatten-8 circuits with fewer squarings & u>=1.05 FP16 / >=1.15 BF16 headroom",
+    "Cycle 2 P2 (T3-01): Multi-seed (>=3-5), LR-bracketed 50M-120M FineWeb/WikiText LM pretraining with PS3_55 eager & torch.compile controls"
   ],
   "blockers": [
-    "MacBook Air blocked: ~/Documents clone failed ('Operation not permitted') and t3_project_read/delegate_task on ~/.t3/projects/ai returned 'The project was not found.'",
-    "polar_express_fp8x2_bf16 unsafe on adversarial ill-conditioned spectra (9% divergence rate; max sigma 44,205)",
-    "Heuristic warm-power scaling vulnerable to slow multi-step drift; replaced with stateless rigorous Schatten-8 scaling"
+    "MacBook Air blocked: ~/Documents TCC failure & T3 project lookup miss on ~/.t3/projects/ai (using M5 Max cleanly)",
+    "FP8 polar_express (fp8_steps=2) & fp8_sketch=True de-prioritized (68.75% uniform_mp div / +18-23% error for <=3.7% ceiling)"
   ],
   "audits": [
-    {"auditor": "Claude Opus 5.5 (high)", "status": "PENDING", "target": "Blackwell SYRK/FP8/PolarSwitch kernels & Tier-1/Tier-2 claims"},
-    {"auditor": "Claude Fable 5.2 (high)", "status": "PENDING", "target": "Spectral bounds, Schatten-8 & circuit search math"},
-    {"auditor": "GPT 6.2 Astra (high)", "status": "PENDING", "target": "GPU timing methodology, L2 flushing & Tier-2 LM fairness"},
-    {"auditor": "Gemini 4 Neon (high)", "status": "PENDING", "target": "Late-2026 SOTA comparison, caveats & Cycle 2 roadmap"}
+    {
+      "auditor": "Claude Opus 5.5 (high)",
+      "verdict": "PASS_WITH_CAVEATS -> P0_REMEDIATED",
+      "status": "DONE",
+      "report": "audits/AUDIT_cycle1_claude_opus.md",
+      "target": "Blackwell SYRK/FP8/PolarSwitch kernels & Tier-1/Tier-2 claims"
+    },
+    {
+      "auditor": "Claude Fable 5.2 (high)",
+      "verdict": "FAIL -> P0_REMEDIATED",
+      "status": "DONE",
+      "report": "audits/AUDIT_cycle1_claude_fable.md",
+      "target": "Spectral bounds, Schatten-8 & circuit search math"
+    },
+    {
+      "auditor": "GPT 6.2 Astra (high)",
+      "verdict": "FAIL -> P0_REMEDIATED",
+      "status": "DONE",
+      "report": "audits/AUDIT_cycle1_gpt62_astra.md",
+      "target": "GPU timing methodology, L2 flushing & Tier-2 LM fairness"
+    },
+    {
+      "auditor": "Gemini 4 Neon (high)",
+      "verdict": "PASS_WITH_CAVEATS -> P0_REMEDIATED",
+      "status": "DONE",
+      "report": "audits/AUDIT_cycle1_gemini_neon.md",
+      "target": "Late-2026 SOTA comparison, caveats & Cycle 2 roadmap"
+    }
   ],
   "leaderboard": [
-    {"method": "ps3_55_blackwell_fp16", "tier1_ms": 0.307, "harvested_med_err": 0.0624, "harvested_max_err": 0.3208, "tier2_wall_loss": 2.8669, "tier2_tps": 162448, "status": "PENDING_AUDIT"},
-    {"method": "ps2_55_blackwell_fp16", "tier1_ms": 0.304, "harvested_med_err": 0.0800, "harvested_max_err": 0.3317, "tier2_wall_loss": 2.8753, "tier2_tps": 163194, "status": "PENDING_AUDIT"},
-    {"method": "PS3_55 (eager)", "tier1_ms": 0.581, "harvested_med_err": 0.0624, "harvested_max_err": 0.3208, "tier2_wall_loss": null, "tier2_tps": null, "status": "BASELINE"},
-    {"method": "PS2_55 (eager)", "tier1_ms": 0.578, "harvested_med_err": 0.0800, "harvested_max_err": 0.3318, "tier2_wall_loss": 2.9440, "tier2_tps": 149840, "status": "BASELINE"},
-    {"method": "polar_express_triton_bf16", "tier1_ms": 0.635, "harvested_med_err": 0.0893, "harvested_max_err": 0.3471, "tier2_wall_loss": 3.0266, "tier2_tps": 140778, "status": "PENDING_AUDIT"},
-    {"method": "S1-k3+4-lo0.005_schatten8", "tier1_ms": 1.185, "harvested_med_err": 0.0724, "harvested_max_err": 0.4310, "tier2_wall_loss": 3.1158, "tier2_tps": 128560, "status": "PENDING_AUDIT"},
-    {"method": "S1-k4+5-lo0.002_schatten8", "tier1_ms": 1.378, "harvested_med_err": 0.0629, "harvested_max_err": 0.2800, "tier2_wall_loss": 3.1312, "tier2_tps": 121789, "status": "PENDING_AUDIT"},
-    {"method": "polar_express (eager)", "tier1_ms": 0.433, "harvested_med_err": 0.0958, "harvested_max_err": 0.3484, "tier2_wall_loss": 3.0910, "tier2_tps": 127212, "status": "BASELINE"}
+    {
+      "method": "ps3_55_blackwell_fp16",
+      "case": "RTX 5080 · 117-case Tier-1 latency vs 45-case harvested error",
+      "tier1_ms": 0.307,
+      "harvested_med_err": 0.0624,
+      "harvested_max_err": 0.3208,
+      "tier2_wall_loss": 2.8669,
+      "tier2_tps": 162448,
+      "status": "VERIFIED"
+    },
+    {
+      "method": "ps2_55_blackwell_fp16",
+      "case": "RTX 5080 · 117-case Tier-1 latency vs 45-case harvested error",
+      "tier1_ms": 0.304,
+      "harvested_med_err": 0.0800,
+      "harvested_max_err": 0.3317,
+      "tier2_wall_loss": 2.8753,
+      "tier2_tps": 163194,
+      "status": "VERIFIED"
+    },
+    {
+      "method": "PS3_55 (eager)",
+      "case": "RTX 5080 · 117-case Tier-1 latency vs 45-case harvested error",
+      "tier1_ms": 0.581,
+      "harvested_med_err": 0.0624,
+      "harvested_max_err": 0.3208,
+      "tier2_wall_loss": null,
+      "tier2_tps": null,
+      "status": "BASELINE"
+    },
+    {
+      "method": "PS2_55 (eager)",
+      "case": "RTX 5080 · 117-case Tier-1 latency vs 45-case harvested error",
+      "tier1_ms": 0.578,
+      "harvested_med_err": 0.0800,
+      "harvested_max_err": 0.3318,
+      "tier2_wall_loss": 2.9440,
+      "tier2_tps": 149840,
+      "status": "BASELINE"
+    },
+    {
+      "method": "polar_express (eager)",
+      "case": "RTX 5080 · 117-case Tier-1 latency vs 45-case harvested error",
+      "tier1_ms": 0.433,
+      "harvested_med_err": 0.0958,
+      "harvested_max_err": 0.3484,
+      "tier2_wall_loss": 3.0910,
+      "tier2_tps": 127212,
+      "status": "BASELINE"
+    },
+    {
+      "method": "polar_express_triton_bf16",
+      "case": "RTX 5080 · 117-case Tier-1 latency vs 45-case harvested error",
+      "tier1_ms": 0.635,
+      "harvested_med_err": 0.0893,
+      "harvested_max_err": 0.3471,
+      "tier2_wall_loss": 3.0266,
+      "tier2_tps": 140778,
+      "status": "CAVEATED"
+    },
+    {
+      "method": "S1-k3+4-lo0.005_schatten8",
+      "case": "RTX 5080 · 117-case Tier-1 latency vs 45-case harvested error",
+      "tier1_ms": 1.185,
+      "harvested_med_err": 0.0724,
+      "harvested_max_err": 0.4310,
+      "tier2_wall_loss": 3.1158,
+      "tier2_tps": 128560,
+      "status": "CAVEATED"
+    },
+    {
+      "method": "S1-k4+5-lo0.002_schatten8",
+      "case": "RTX 5080 · 117-case Tier-1 latency vs 45-case harvested error",
+      "tier1_ms": 1.378,
+      "harvested_med_err": 0.0629,
+      "harvested_max_err": 0.2800,
+      "tier2_wall_loss": 3.1312,
+      "tier2_tps": 121789,
+      "status": "CAVEATED"
+    }
   ],
   "next_queue": [
-    "Complete 4-model adversarial audit (Opus 5.5, Fable 5.2, GPT 6.2 Astra, Gemini 4 Neon) and remediate findings",
-    "Promote surviving Cycle 1 discoveries to VERIFIED and publish Cycle 1 README leaderboard",
-    "Cycle 2: Zero-overshoot u=1.005 Schatten-8 Polar Switch fused onto _symprod_kernel",
-    "Schedule 4-hour autonomous sprint & daily 08:00 infographic tasks and render Day 0 infographic"
+    "Cycle 2 P1 (T1-04): Register-minimal _symprod_kernel-native 2/3-buffer Schatten-8 circuits (fewer squarings than PS3_55, u>=1.05 FP16 / >=1.15 BF16 headroom)",
+    "Cycle 2 P2 (T3-01): Multi-seed LR-bracketed 50M-120M FineWeb-Edu/WikiText-103 pretraining with PS3_55 eager, torch.compile & matched contiguous FP32 updates",
+    "Cycle 2 P3 (T2-02): Apple M5 Max BF16/FP16 MLX suite (warmup>=5, iters>=20) + Metal triangular SYRK kernel to fix square 2048x2048 regression",
+    "Cycle 3 (T4-01, T5-01): uP width-transfer coordinate checks & Blackwell NVFP4/2-bit micro-rotated PTQ"
   ]
 }

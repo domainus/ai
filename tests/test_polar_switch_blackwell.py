@@ -282,3 +282,35 @@ def test_empty_and_invalid_inputs():
         polar_switch_blackwell(G.cpu())
     with pytest.raises(ValueError):
         gram_ns_blackwell(G[0])
+
+
+@pytest.mark.parametrize("shape", [(1, 1), (1, 7), (7, 1), (64, 1)], ids=str)
+def test_min_dim_one_shapes_supported(shape):
+    G = rand(shape, seed=11)
+    for variant in VARIANTS:
+        Q = polar_switch_blackwell(G, variant)
+        check_output(Q, G)
+        assert rel(Q, polar_switch(G, variant)) < EAGER_TOL["polar_switch"]
+    Qg = gram_ns_blackwell(G)
+    check_output(Qg, G)
+    assert rel(Qg, gram_ns(G)) < EAGER_TOL["gram_ns"]
+
+
+def test_torch_compile_does_not_poison_launch_cache():
+    from research.polar_opt.polar_switch_blackwell import _PLANS
+
+    polar_switch_blackwell(rand((256, 1024), seed=12), "PS2_55")
+    G = rand((128, 512), seed=13)
+    compiled_out = torch.compile(lambda x: polar_switch_blackwell(x, "PS2_55"))(G)
+    torch._dynamo.reset()
+    eager_out = polar_switch_blackwell(G, "PS2_55")
+    check_output(eager_out, G)
+    assert torch.equal(compiled_out, eager_out)
+    assert all(plan[0] is not None and hasattr(plan[0], "__getitem__") for plan in _PLANS.values())
+
+
+def test_fp8_sketch_huge_scale_returns_zero_not_nan():
+    G = rand((64, 128), seed=14) * 1e25
+    Q = polar_switch_blackwell(G, "PS2_55", fp8_sketch=True)
+    check_output(Q, G)
+    assert Q.abs().max().item() == 0.0

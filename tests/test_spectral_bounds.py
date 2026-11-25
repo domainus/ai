@@ -12,6 +12,7 @@ import torch
 
 from research.polar_opt.baselines import PS2_55, PS3_55, POLAR_EXPRESS_COEFFICIENTS, svd_polar_fp64
 from research.polar_opt.circuits import (
+    BF16_SAFE_CIRCUITS,
     CAP,
     CIRCUITS,
     FP16_ONLY_CIRCUITS,
@@ -37,10 +38,9 @@ DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 SLACK = {"fp16": 0.02, "bf16": 0.05}
 ALL = {**CIRCUITS, **FP16_ONLY_CIRCUITS}
 NAMES = sorted(ALL)
-# (circuit, dtype) pairs whose scalar-rounded basin is claimed: BF16-safe circuits in both
-# precisions, FP16-only circuits (e.g. the recommended S1-k4+5) in FP16.
-CASES = [(n, dt) for n in sorted(CIRCUITS) for dt in ("fp16", "bf16")] + \
-        [(n, "fp16") for n in sorted(FP16_ONLY_CIRCUITS)]
+# (circuit, dtype) pairs verified by coherent-matrix sweeps: BF16_SAFE_CIRCUITS in both precisions,
+# remaining circuits in FP16 only.
+CASES = [(n, "fp16") for n in sorted(ALL)] + [(n, "bf16") for n in sorted(BF16_SAFE_CIRCUITS)]
 
 
 def spectral(n, m, s, seed=0):
@@ -344,9 +344,13 @@ def test_block_krylov_nonfinite_guard():
 
 
 def test_fp16_only_circuits_refuse_bf16():
-    for name in FP16_ONLY_CIRCUITS:
-        with pytest.raises(ValueError):
+    for name in sorted(ALL):
+        if name in BF16_SAFE_CIRCUITS:
             SpectralPrescaledPolar(name, dtype=torch.bfloat16)
+        else:
+            with pytest.raises(ValueError):
+                SpectralPrescaledPolar(name, dtype=torch.bfloat16)
+            SpectralPrescaledPolar(name, dtype=torch.bfloat16, allow_unsafe_bf16=True)
 
 
 def test_recommended_circuit_beats_ps2_on_trajectories():
@@ -363,3 +367,102 @@ def test_recommended_circuit_beats_ps2_on_trajectories():
         ours.append(rel(polar(p["current"], key=0), P))
         ps2.append(rel(polar_switch(p["current"], "PS2_55"), P))
     assert np.median(ours) < np.median(ps2) and np.quantile(ours, 0.9) < np.quantile(ps2, 0.9)
+
+
+def test_schatten8_fp16_prescaled_on_identity_plus_constant():
+    """Fable R1: identity+constant matrices must stay finite & bounded under FP16 schatten8."""
+    circ = CIRCUITS["S1-k3+4-lo0.005"]
+
+    def _make_mat(n, rs=0.246):
+        s1 = 1 / np.sqrt(1 + (n - 1) * rs * rs)
+        p = rs * s1
+        c = (s1 - p) / n
+        G = torch.full((n, n), c, dtype=torch.float32)
+        G.diagonal().add_(p)
+        return G
+
+    Y_cpu = run_circuit(_make_mat(1024), circ, dtype=torch.float16, schatten8=True)
+    assert torch.isfinite(Y_cpu).all()
+    assert torch.linalg.svdvals(Y_cpu.double()).max().item() <= CAP
+    if CUDA:
+        Y_cuda = run_circuit(_make_mat(4096).cuda(), circ, dtype=torch.float16, schatten8=True, use_triton_syrk=True)
+        assert torch.isfinite(Y_cuda).all()
+        assert torch.linalg.svdvals(Y_cuda.double().cpu()).max().item() <= CAP
+
+
+def test_bf16_safe_circuits_coherent_rank1_matrix_sweep():
+    """Fable R2: BF16_SAFE_CIRCUITS stay <= 1.25 on coherent rank-1 sign matrices."""
+    g = torch.Generator().manual_seed(1)
+    u = (torch.randint(2, (128,), generator=g) * 2 - 1).float()
+    v = (torch.randint(2, (128,), generator=g) * 2 - 1).float()
+    G = u[:, None] * v[None, :]
+    for name in sorted(BF16_SAFE_CIRCUITS):
+        circ = CIRCUITS[name]
+        for x in (0.54, 0.75, 0.90, 0.99):
+            Y = run_circuit(G, circ, dtype=torch.bfloat16, sigma=torch.tensor(128.0 / x))
+            assert torch.isfinite(Y).all()
+            assert torch.linalg.matrix_norm(Y.double(), ord=2).item() <= CAP
+
+
+def test_tiny_inputs_no_nan_all_scaling_modes():
+    """Fable R3: sub-normal tiny scales map cleanly to 0 with zero NaNs."""
+    g = torch.Generator().manual_seed(2)
+    base = torch.randn(64, 128, generator=g)
+    for mult in (1e-25, 1e-30, 1e-38):
+        Gt = base * mult
+        for scaling in ("schatten8", "spectral", "frobenius"):
+            pol = SpectralPrescaledPolar("S1-k3+4-lo0.005", scaling=scaling)
+            Yt = pol(Gt, key="tiny")
+            assert torch.isfinite(Yt).all() and Yt.abs().max().item() == 0.0
+
+
+def test_batched_block_krylov_isolates_nan_member():
+    """Fable R4: one NaN member in a batch must not degrade a healthy member's spectral estimate."""
+    g = torch.Generator().manual_seed(1)
+    W = torch.randn(256, 1024, generator=g) / 32
+    A = W @ W.T
+    A = A / A.diagonal().sum()
+    B = A.clone()
+    B[0, 0] = float("nan")
+    true = torch.linalg.eigvalsh(A.double())[-1].sqrt().item()
+    est = WarmSpectralEstimator().estimate(torch.stack([A, B]), gram=True, A2=torch.stack([A @ A, B @ B]))
+    assert torch.isfinite(est.sigma[0])
+    assert true / est.sigma[0].item() <= 1.01
+
+
+def test_estimator_clears_pending_on_shape_change_and_enforces_u_safe():
+    """Fable C2 + L3: u_safe certificate clamp holds and shape change clears queued trigger flags."""
+    def _gram(M):
+        W = M / M.norm(dim=(-2, -1), keepdim=True)
+        R = W @ W.mT
+        return R, R @ R, torch.linalg.matrix_norm(W.double(), ord=2)
+
+    est = WarmSpectralEstimator(EstimatorConfig(u_safe=1.10, jump_tol=0.0, align_tol=1.1, defer_escalation=True))
+    R0, R02, _ = _gram(torch.randn(2, 32, 64))
+    _ = est.estimate(R0, gram=True, A2=R02)
+    R1, R12, true1 = _gram(torch.randn(2, 32, 64) * 5.0)
+    out1 = est.estimate(R1, gram=True, A2=R12)
+    assert out1.sigma.shape == (2,)
+    assert (out1.sigma >= out1.upper / 1.10 - 1e-6).all()
+    assert (out1.sigma.double() >= true1 / 1.10 - 1e-6).all()
+    # Now change batch size (triggers _key mismatch and must clear _pending cleanly)
+    R2, R22, _ = _gram(torch.randn(3, 32, 64))
+    out2 = est.estimate(R2, gram=True, A2=R22)
+    assert out2.sigma.shape == (3,) and torch.isfinite(out2.sigma).all()
+
+
+@pytest.mark.skipif(not CUDA, reason="CUDA required")
+def test_h2h_spectral_wrapper_immune_to_cuda_address_reuse():
+    """Astra CRITICAL: freed CUDA data_ptr reuse must never return stale scaler state."""
+    from research.polar_opt.run_cycle1_head_to_head import _make_spectral_wrapper
+
+    wrapper = _make_spectral_wrapper("S1-k3+4-lo0.005", dtype=torch.float16, use_triton=True)
+    cur = torch.randn(48, 96, device="cuda")
+    p1 = torch.randn(48, 96, device="cuda")
+    _ = wrapper(cur, p1)
+    del p1
+    p2 = torch.randn(48, 96, device="cuda") * 100.0
+    p2[0, 0] = 5000.0
+    cached_out = wrapper(cur, p2)
+    fresh_out = _make_spectral_wrapper("S1-k3+4-lo0.005", dtype=torch.float16, use_triton=True)(cur, p2)
+    assert torch.equal(cached_out, fresh_out)

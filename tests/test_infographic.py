@@ -49,9 +49,10 @@ def verify(path):
     assert {"script", "iframe", "link", "img"}.isdisjoint(doc.tags)
     text = "".join(doc.text)
     for label in ("domainus/ai", "Experiments Run", "Verified Wins", "Best Speedup vs SOTA",
-                  "Tests & Dual Audits", "Benchmark Comparison & Pareto Chart", "Status Board",
+                  "Tests & 4-Model Audits", "Benchmark Comparison & Pareto Chart", "Status Board",
                   "Fleet Hardware & Multi-Model Adversarial Audit Ledger", "Next Autonomous Sprint Queue",
-                  "Completed", "Work In Progress", "Blockers & Risks", "Claude Opus 5.5", "GPT 6.2 Sol",
+                  "Completed", "Work In Progress", "Blockers & Risks", "Claude Opus 5.5",
+                  "Claude Fable 5.2", "GPT 6.2 Astra", "Gemini 4 Neon",
                   "bazzite", "MacBook Pro", "MacBook Air"):
         assert label in text
     css = "".join(doc.css).lower()
@@ -70,9 +71,14 @@ def test_live_state_cli(tmp_path):
     output = tmp_path / "custom/report.html"
     subprocess.run([sys.executable, str(ROOT / "reports/generate_infographic.py"),
                     "--output", str(output)], cwd=tmp_path, check=True)
-    _, text = verify(output)
+    doc, text = verify(output)
     state = json.loads((ROOT / "state/RESEARCH_STATE.json").read_text())
     assert f'Cycle {state["cycle"]}' in text and state["last_updated"] in text
+    assert len(doc.charts) >= 1
+    assert "Awaiting paired" not in text
+    h2h = ROOT / f'results/cycle{state["cycle"]}_head_to_head.json'
+    if h2h.is_file():
+        assert "polar_express_fp8x2_bf16" in text
 
 
 @pytest.mark.parametrize("source", ["leaderboard", "results", "tier1", "empty"])
@@ -80,7 +86,9 @@ def test_report_from_snapshot(tmp_path, source):
     state = {
         "cycle": 1, "last_updated": "2026-11-25T07:00:00Z",
         "audits": [{"model": "Claude Opus 5.5", "verdict": "Conditional pass"},
-                   {"reviewer": "GPT 6.2 Sol", "verdict": "Recheck variance"}],
+                   {"auditor": "Claude Fable 5.2 (high)", "verdict": "Pass after fix"},
+                   {"reviewer": "GPT 6.2 Astra", "verdict": "Recheck variance"},
+                   {"auditor": "Gemini 4 Neon (high)", "verdict": "Pass with caveats"}],
         "next_queue": ["Repeat slow case"], "blockers": ["<script>untrusted</script>"],
         "kpis": {"experiments_run": 5, "best_speedup_vs_pe": 1.25},
     }
@@ -104,7 +112,8 @@ def test_report_from_snapshot(tmp_path, source):
     subprocess.run([sys.executable, str(ROOT / "reports/generate_infographic.py"), "--repo-root",
                     str(tmp_path), "--date", "2026-11-25"], check=True)
     doc, text = verify(tmp_path / "reports/daily/2026-11-25.html")
-    assert "Conditional pass" in text and "Recheck variance" in text
+    assert "Conditional pass" in text and "Pass after fix" in text
+    assert "Recheck variance" in text and "Pass with caveats" in text
     assert "1.25× PE" in text and "Fleet initialized" in text
     assert "<script>untrusted</script>" in text
     if source == "empty":

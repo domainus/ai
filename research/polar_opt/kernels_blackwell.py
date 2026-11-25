@@ -10,12 +10,12 @@ Contents
                                  one rounding on output).
 * ``polar_express_triton``      full Gram-form PolarExpress circuit built from the two kernels
                                  plus one cuBLAS ``baddbmm`` for ``a*X + B@X``.
-* ``polar_express_fp8``         FP8-early / BF16-late (or FP16-late) circuit.  The first
-                                 ``fp8_steps`` steps run their three GEMMs through
-                                 ``torch._scaled_mm`` (e4m3, per-tensor dynamic scale
-                                 ``amax / 448``); the remaining steps use the Triton bf16/fp16
-                                 kernels.  Falls back (or zero-pads) when ``_scaled_mm`` alignment
-                                 (all dims % 16 == 0) is violated, and returns diagnostics.
+* ``polar_express_fp8``         Experimental FP8-early / BF16-late (or FP16-late) circuit
+                                 (default ``fp8_steps=1``). NOTE: ``fp8_steps >= 2`` (including
+                                 with ``on_misaligned="pad"``) diverges on benign small-``n``
+                                 (``n <= 256``) uniform/Gaussian spectra (``sigma_max`` up to
+                                 ``114,600``), and even when stable FP8 PE is 20-77% slower than
+                                 FP16 ``polar_switch_blackwell`` on LLM shapes.
 * ``polar_express_torch``       plain-PyTorch reference of the same circuit (cuBLAS baseline,
                                  also used in fp64 as the algorithmic reference).
 * ``polar_svd_fp64``            exact polar factor ``U V^T`` in fp64.
@@ -31,22 +31,15 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from research.polar_opt.baselines import _AMSEL_COEFFICIENTS
+
 # --------------------------------------------------------------------------------------
 # Polar Express coefficients (Amsel et al. 2025, l = 1e-3, degree-5 odd polynomials).
-# Safety factor 1.01 on every step but the last, as in the reference implementation.
+# Matched verbatim to baselines._AMSEL_COEFFICIENTS (cushion=0.02, safety_factor_eps=0.01)
+# so polar_express_triton and baselines.polar_express share the exact polynomial table.
 # --------------------------------------------------------------------------------------
-_PE_RAW = [
-    (8.28721201814563, -23.595886519098837, 17.300387312530933),
-    (4.107059111542203, -2.9478499167379106, 0.5448431082926601),
-    (3.9486908534822946, -2.908902115962949, 0.5518191394370137),
-    (3.3184196573706015, -2.488488024314874, 0.51004894012372),
-    (2.300652019954817, -1.6689039845747493, 0.4188073119525673),
-    (1.891301407787398, -1.2679958271945868, 0.37680408948524835),
-    (1.8750014808534479, -1.2500016453999487, 0.3750001645474248),
-    (1.875, -1.25, 0.375),
-]
 SAFETY = 1.01
-POLAR_EXPRESS_COEFFS = [(a / SAFETY, b / SAFETY**3, c / SAFETY**5) for a, b, c in _PE_RAW[:-1]] + [_PE_RAW[-1]]
+POLAR_EXPRESS_COEFFS = list(_AMSEL_COEFFICIENTS)
 
 FP8_MAX = 448.0  # largest finite float8_e4m3fn
 _FP8 = torch.float8_e4m3fn
@@ -72,16 +65,17 @@ _CONFIGS = [
 @triton.jit
 def _tri_tile(pid, T):
     """Linear index in a row-major walk of the upper triangle of a TxT tile grid -> (i, j), i <= j."""
-    Tf = T.to(tl.float32)
+    T_i32 = T + tl.zeros((), dtype=tl.int32)
+    Tf = T_i32.to(tl.float32)
     t = pid.to(tl.float32)
     disc = (2.0 * Tf + 1.0) * (2.0 * Tf + 1.0) - 8.0 * t
     i = tl.floor(((2.0 * Tf + 1.0) - tl.sqrt(tl.maximum(disc, 0.0))) * 0.5).to(tl.int32)
     # row i starts at i*T - i*(i-1)/2 and holds T-i tiles; fix any fp32 rounding by +-1.
-    start = i * T - (i * (i - 1)) // 2
+    start = i * T_i32 - (i * (i - 1)) // 2
     i = tl.where(pid < start, i - 1, i)
-    start = i * T - (i * (i - 1)) // 2
-    i = tl.where(pid >= start + (T - i), i + 1, i)
-    start = i * T - (i * (i - 1)) // 2
+    start = i * T_i32 - (i * (i - 1)) // 2
+    i = tl.where(pid >= start + (T_i32 - i), i + 1, i)
+    start = i * T_i32 - (i * (i - 1)) // 2
     return i, i + (pid - start)
 
 
@@ -96,9 +90,9 @@ def _store_sym(out_ptr, val, i, j, N, BLOCK: tl.constexpr):
     rn = j * BLOCK + tl.arange(0, BLOCK)
     v = val.to(out_ptr.dtype.element_ty)
     upper = (rm[:, None] < N) & (rn[None, :] < N) & (rm[:, None] <= rn[None, :])
-    tl.store(out_ptr + rm[:, None] * N + rn[None, :], v, mask=upper)
+    tl.store(out_ptr + rm[:, None].to(tl.int64) * N + rn[None, :], v, mask=upper)
     lower = (rn[:, None] < N) & (rm[None, :] < N) & (rm[None, :] < rn[:, None])
-    tl.store(out_ptr + rn[:, None] * N + rm[None, :], tl.trans(v), mask=lower)
+    tl.store(out_ptr + rn[:, None].to(tl.int64) * N + rm[None, :], tl.trans(v), mask=lower)
 
 
 @triton.autotune(configs=_CONFIGS, key=["N", "K"])
@@ -116,8 +110,8 @@ def _syrk_kernel(
     rn = j * BLOCK + tl.arange(0, BLOCK)
     rk = tl.arange(0, BK)
     x_base = x_ptr + bidx * sxb
-    a_ptrs = x_base + rm[:, None] * sxn + rk[None, :] * sxk  # X[rm, k]
-    b_ptrs = x_base + rk[:, None] * sxk + rn[None, :] * sxn  # X[rn, k]^T
+    a_ptrs = x_base + rm[:, None].to(tl.int64) * sxn + rk[None, :] * sxk  # X[rm, k]
+    b_ptrs = x_base + rk[:, None] * sxk + rn[None, :].to(tl.int64) * sxn  # X[rn, k]^T
     acc = tl.zeros((BLOCK, BLOCK), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BK)):
         kmask = rk < K - k * BK
@@ -145,8 +139,8 @@ def _poly_kernel(
     rn = j * BLOCK + tl.arange(0, BLOCK)
     rk = tl.arange(0, BK)
     base = a_ptr + bidx * N * N
-    l_ptrs = base + rm[:, None] * N + rk[None, :]  # A[rm, k]
-    r_ptrs = base + rk[:, None] * N + rn[None, :]  # A[k, rn]
+    l_ptrs = base + rm[:, None].to(tl.int64) * N + rk[None, :]  # A[rm, k]
+    r_ptrs = base + rk[:, None].to(tl.int64) * N + rn[None, :]  # A[k, rn]
     acc = tl.zeros((BLOCK, BLOCK), dtype=tl.float32)
     for k in range(0, tl.cdiv(N, BK)):
         kmask = rk < N - k * BK
@@ -157,7 +151,7 @@ def _poly_kernel(
         r_ptrs += BK * N
 
     tile_mask = (rm[:, None] < N) & (rn[None, :] < N)
-    a_tile = tl.load(base + rm[:, None] * N + rn[None, :], mask=tile_mask, other=0.0).to(tl.float32)
+    a_tile = tl.load(base + rm[:, None].to(tl.int64) * N + rn[None, :], mask=tile_mask, other=0.0).to(tl.float32)
     out = beta * acc + alpha * a_tile + gamma * (rm[:, None] == rn[None, :]).to(tl.float32)
     _store_sym(o_ptr + bidx * N * N, out, i, j, N, BLOCK)
 
@@ -243,8 +237,12 @@ def triton_gram_poly_step(A: torch.Tensor, b: float, c: float, a: float = 0.0) -
 # Circuits
 # --------------------------------------------------------------------------------------
 def _normalize(X: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Frobenius-normalize in fp32 (sigma_max <= 1/1.01), then cast to the working dtype."""
-    Xf = X.float()
+    """Frobenius-normalize in fp32 (or fp64 when ``dtype==float64``), then cast to ``dtype``.
+
+    Note: ``polar_express_triton`` intentionally normalizes in FP32, whereas
+    ``baselines.polar_express`` matches upstream BF16 normalization.
+    """
+    Xf = X.double() if dtype == torch.float64 else X.float()
     nrm = Xf.norm(dim=(-2, -1), keepdim=True) * SAFETY + 1e-7
     return (Xf / nrm).to(dtype)
 
@@ -333,21 +331,24 @@ def _fp8_gram_step(X: torch.Tensor, a: float, b: float, c: float) -> torch.Tenso
 def polar_express_fp8(
     X: torch.Tensor,
     steps: int = 5,
-    fp8_steps: int = 2,
+    fp8_steps: int = 1,
     dtype: torch.dtype | None = None,
     on_misaligned: str = "fallback",
     return_meta: bool = False,
 ):
-    """FP8-early / BF16-late (or FP16-late) PolarExpress.
+    """Experimental FP8-early / BF16-late (or FP16-late) PolarExpress.
 
     Steps ``[0, fp8_steps)`` run their GEMMs in e4m3 through ``torch._scaled_mm`` with per-tensor
     dynamic scaling; the other steps use the Triton fp16/bf16 kernels with fp32 accumulation.
     ``_scaled_mm`` is unbatched, so batched inputs loop over the batch (each matrix has its own scale).
 
+    Default ``fp8_steps=1`` keeps benign small-``n`` (``n <= 256``) uniform/Gaussian spectra bounded;
+    ``fp8_steps >= 2`` (including with ``on_misaligned="pad"``) diverges on those inputs because e4m3
+    error at step 1 pushes ``sigma_max`` past the polynomial stability basin.
+
     ``_scaled_mm`` requires both matrix dims to be multiples of 16.  If they are not:
       * ``on_misaligned="fallback"`` (default): run the whole circuit on the Triton bf16/fp16 path;
-      * ``on_misaligned="pad"``: zero-pad rows/cols up to a multiple of 16 (exact for the polar factor)
-        and crop the result.
+      * ``on_misaligned="pad"``: zero-pad rows/cols up to a multiple of 16 and crop the result.
     ``meta`` (when ``return_meta``) records which path actually ran and why.
     """
     dtype = dtype or X.dtype

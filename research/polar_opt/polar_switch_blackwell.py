@@ -8,10 +8,14 @@ operands, FP32 accumulation, and one rounding per matrix operation. The work is 
                            update and every Gram-space product of Gram Newton-Schulz.
 * ``Q @ X``                cuBLAS. The last product writes FP32 directly, without a cast pass.
 
-``fp8_sketch=True`` computes only the first Gram matrix from FP8 (e4m3) operands and rescales it to
-the exact trace. See ``_gram`` for why this is the one sound place for FP8.
+``fp8_sketch=True`` is **experimental and not promoted**: it computes only the first Gram
+matrix from FP8 (e4m3) operands and rescales it to the exact trace. Although trace rescaling
+bounds ``sigma_max``, quantization noise breaks commutation between ``poly(A_sketch)`` and
+``X @ X.mT``, increasing median Tier-1 polar error by +18-23% and causing large rotation
+errors on rank-deficient inputs (40-161% on rank-1).
 
-Inputs have shape ``(..., rows, columns)``. Tall, wide, square, and odd sizes are supported.
+Inputs have shape ``(..., rows, columns)``. Tall, wide, square, and odd sizes (including ``min==1``)
+are supported.
 
 Run the benchmark:
     PYTHONPATH=. .venv/bin/python research/polar_opt/polar_switch_blackwell.py --bench
@@ -62,8 +66,8 @@ def _symprod_kernel(
     rm = i * BLOCK + tl.arange(0, BLOCK)
     rn = j * BLOCK + tl.arange(0, BLOCK)
     rk = tl.arange(0, BK)
-    l_ptrs = a_ptr + offset + rm[:, None] * N + rk[None, :]
-    r_ptrs = b_ptr + offset + rk[:, None] * N + rn[None, :]
+    l_ptrs = a_ptr + offset + rm[:, None].to(tl.int64) * N + rk[None, :]
+    r_ptrs = b_ptr + offset + rk[:, None].to(tl.int64) * N + rn[None, :]
     acc = tl.zeros((BLOCK, BLOCK), dtype=tl.float32)
     for k in range(0, tl.cdiv(N, BK)):
         kmask = rk < N - k * BK
@@ -73,7 +77,7 @@ def _symprod_kernel(
         l_ptrs += BK
         r_ptrs += BK * N
     tile = (rm[:, None] < N) & (rn[None, :] < N)
-    c = tl.load(c_ptr + offset + rm[:, None] * N + rn[None, :], mask=tile, other=0.0)
+    c = tl.load(c_ptr + offset + rm[:, None].to(tl.int64) * N + rn[None, :], mask=tile, other=0.0)
     out = alpha * acc + beta * c.to(tl.float32) + gamma * (rm[:, None] == rn[None, :]).to(tl.float32)
     _store_sym(o_ptr + offset, out, i, j, N, BLOCK)
 
@@ -87,7 +91,7 @@ def _normalize_kernel(x_ptr, norm_ptr, o_ptr, size, eps, BLOCK: tl.constexpr):
     ``size`` is the element count of one matrix.
     """
     matrix = tl.program_id(1).to(tl.int64)
-    local = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    local = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = local < size
     x = tl.load(x_ptr + matrix * size + local, mask=mask, other=0.0).to(tl.float32)
     y = x / (tl.load(norm_ptr + matrix) + eps)
@@ -95,6 +99,15 @@ def _normalize_kernel(x_ptr, norm_ptr, o_ptr, size, eps, BLOCK: tl.constexpr):
 
 
 _PLANS: dict = {}
+
+
+def _autotune_key(kernel, args) -> tuple:
+    nargs = dict(zip(kernel.arg_names, args))
+    key = [nargs[k] for k in kernel.keys if k in nargs]
+    for arg in nargs.values():
+        if hasattr(arg, "dtype"):
+            key.append(str(arg.dtype))
+    return tuple(key)
 
 
 def _launch(kernel, grid, *args):
@@ -105,6 +118,9 @@ def _launch(kernel, grid, *args):
     otherwise dominates small matrices. The key holds everything Triton specializes on: integer
     values, dtypes, and 16-byte pointer alignment. Float arguments never specialize.
     """
+    if torch.compiler.is_compiling():
+        kernel[grid](*args)
+        return
     key = (kernel, args[0].device, *[
         (a.dtype, a.data_ptr() % 16) if isinstance(a, Tensor) else None if isinstance(a, float) else a
         for a in args
@@ -112,7 +128,13 @@ def _launch(kernel, grid, *args):
     plan = _PLANS.get(key)
     if plan is None:
         compiled = kernel[grid](*args)
-        config = kernel.best_config.kwargs
+        if compiled is None or not hasattr(compiled, "__getitem__"):
+            return
+        if len(kernel.configs) > 1:
+            autotune_config = kernel.cache.get(_autotune_key(kernel, args), kernel.best_config)
+        else:
+            autotune_config = kernel.configs[0]
+        config = autotune_config.kwargs
         _PLANS[key] = compiled, config, tuple(config[n] for n in kernel.arg_names if n in config)
     else:
         compiled, config, constants = plan
@@ -148,15 +170,11 @@ def _prepare(G: Tensor, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
 def _gram(X: Tensor, out: Tensor, sketch_norm: Tensor | None = None) -> None:
     """Write the Gram matrix of the short side of ``X`` (batch, rows, columns) into ``out``.
 
-    With ``sketch_norm`` (the ||G||_F that normalized X), use an FP8 sketch: quantize X to e4m3,
-    accumulate the Gram matrix in FP32, and rescale it to the exact trace ||X||_F². FP8
-    tensor-core operands run about 1.8 times faster than FP16 on sm_120.
-
-    The sketch is sound because the Gram matrix only selects the symmetric multiplier Q in
-    X <- Q @ X. X itself stays in FP16, so quantization noise changes Q but adds no noise to the
-    row space of X. The trace rescale is required: it bounds every eigenvalue by ||X||_F² <= 1.
-    The Polar Switch polynomial grows from 0.25 at eigenvalue 1.0 to 1000 at 1.05, and FP8
-    rounding can otherwise bias the largest eigenvalue up by 13 percent.
+    With ``sketch_norm`` (the ||G||_F that normalized X), use an **experimental** FP8 sketch:
+    quantize X to e4m3, accumulate the Gram matrix in FP32, and rescale it to the exact trace
+    ||X||_F^2. Although trace rescaling keeps sigma_max bounded, ``poly(A_sketch)`` does not
+    commute with the true ``X @ X.mT``, increasing median Tier-1 error by +18-23% and rotating
+    left singular vectors on rank-deficient matrices (do not promote over exact FP16 Gram).
     """
     target = out
     if sketch_norm is not None:
@@ -166,7 +184,11 @@ def _gram(X: Tensor, out: Tensor, sketch_norm: Tensor | None = None) -> None:
     batch, n, k = view.shape
     _launch(_syrk_kernel, _triangle_grid(n, batch), view, out, n, k, *view.stride())
     if sketch_norm is not None:
-        energy = (sketch_norm / (sketch_norm + _EPS)).square_()
+        energy = torch.where(
+            torch.isfinite(sketch_norm),
+            (sketch_norm / (sketch_norm + _EPS)).square(),
+            torch.zeros_like(sketch_norm),
+        )
         trace = out.diagonal(dim1=-2, dim2=-1).sum(-1).clamp_min_(torch.finfo(torch.float32).tiny)
         torch.mul(out, (energy / trace)[:, None, None], out=target)
 
@@ -195,6 +217,7 @@ def _apply(Q: Tensor, X: Tensor, beta: float, out_dtype: torch.dtype) -> Tensor:
     return out.to(out_dtype)
 
 
+@torch.compiler.disable
 @torch.no_grad()
 def polar_switch_blackwell(G: Tensor, variant: str = "PS2_55", *,
                            dtype: torch.dtype = torch.float16, fp8_sketch: bool = False) -> Tensor:
@@ -222,6 +245,7 @@ def polar_switch_blackwell(G: Tensor, variant: str = "PS2_55", *,
     return X.reshape(G.shape)
 
 
+@torch.compiler.disable
 @torch.no_grad()
 def gram_ns_blackwell(G: Tensor, steps: int = 5, reset_iterations=(2,), *,
                       dtype: torch.dtype = torch.float16, fp8_sketch: bool = False) -> Tensor:
@@ -313,8 +337,9 @@ def _time(calls: dict, G: Tensor, flush: Tensor, warmup: int, iters: int, seed: 
     """Time every method with a flushed L2 cache, in a new random order each round.
 
     ``gpu``: CUDA events around the call. The flush runs first on the stream and the host does
-    not wait for it, so the launches are already queued and the interval is GPU execution time.
-    ``wall``: host clock between two synchronizes, so the interval includes launch overhead.
+    not wait for it; note that small-shape event intervals still reflect host Python launch
+    latency unless captured inside a CUDA graph.
+    ``wall``: host clock between two synchronizes, after an L2 flush; includes launch overhead.
     """
     order = random.Random(seed)
     names = list(calls)
@@ -387,7 +412,7 @@ def bench(output: Path, iters: int, warmup: int, seed: int) -> None:
             "sm_count": properties.multi_processor_count, "l2_cache_bytes": properties.L2_cache_size,
             "torch": torch.__version__, "triton": triton.__version__, "cuda": torch.version.cuda,
             "python": platform.python_version(), "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            # A busy host inflates the wall clock. The GPU clock is not affected.
+            # Host CPU load affects launch-bound host clocks and small-shape event intervals.
             "host_cpus": os.cpu_count(), "host_load_start": os.getloadavg()[0],
         },
         "settings": {
