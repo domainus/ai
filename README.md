@@ -84,10 +84,10 @@ PYTHONPATH=. .venv/bin/python research/polar_opt/polar_switch_blackwell.py --ben
 PYTHONPATH=. .venv/bin/python research/polar_opt/kernels_mlx.py --bench --backend mlx
 ```
 
-## Active Blocker & Cycle 2 Roadmap
+## Fleet & Cycle 2 Launch
 
-- **Blocked host:** `Ryan's MacBook Air` (TCC permission error on `~/Documents` and T3 project lookup miss on `~/.t3/projects/ai`); all Apple Silicon runs operate cleanly on M5 Max (`Ryan's MacBook Pro`).
-- **Cycle 2 priorities ([`state/BACKLOG.md`](state/BACKLOG.md)):**
+- **Active fleet:** `bazzite` (RTX 5080 `sm_120`) and `Ryan's MacBook Pro` (Apple M5 Max, 128 GiB unified). Work previously slated for `Ryan's MacBook Air` has been consolidated onto `MacBook Pro` (MacBook Air retired from the active fleet; MacBook Pro benchmark runs automatically once its relay reconnects).
+- **Cycle 2 priorities ([`state/BACKLOG.md`](state/BACKLOG.md), In Progress):**
   1. `T1-04`: `_symprod_kernel`-native 2/3-buffer Schatten-8 circuits with fewer squarings than `PS3_55` and verified segment-2 headroom (`u >= 1.05` FP16 / `>= 1.15` BF16).
-  2. `T3-01`: Multi-seed LR-bracketed 50M–120M FineWeb-Edu/WikiText-103 LM pretraining on RTX 5080 with `PS3_55` eager & `torch.compile` controls.
+  2. `T3-01`: Multi-seed LR-bracketed 50M–120M FineWeb-Edu/WikiText-103 LM pretraining on RTX 5080 with `PS3_55` eager, `torch.compile`, and matched contiguous FP32 update controls.
   3. `T2-02`: Apple M5 Max BF16/FP16 MLX suite + custom Metal triangular `SYRK` kernel.

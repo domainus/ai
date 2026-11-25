@@ -1,9 +1,9 @@
 {
   "program": "Autonomous Verifiable AI Research",
   "repo": "https://github.com/domainus/ai",
-  "cycle": 1,
-  "phase": "cycle1_audited_remediated",
-  "last_updated": "2026-11-25T12:14:00-07:00",
+  "cycle": 2,
+  "phase": "cycle2_in_progress",
+  "last_updated": "2026-11-25T14:38:00-07:00",
   "fleet": {
     "bazzite": {
       "environment_id": "6fb39dcd-f3b7-4929-a1d5-637d67eb79bb",
@@ -14,14 +14,14 @@
     "macbook_pro": {
       "environment_id": "fbc39183-5d33-4276-af14-3cb027511e92",
       "hardware": "macOS arm64 | Apple M5 Max (40 GPU cores, 128 GiB unified, MLX 0.32.5)",
-      "status": "online",
-      "role": "Apple Silicon MLX/MPS FP32 benchmarks (PS3_55 MLX 2.191 ms / 1.52x vs PE at 1024x4096; -14% at 2048x2048)"
+      "status": "offline_transient",
+      "role": "Sole Apple Silicon host — owns all MLX/MPS BF16/FP16 & custom Metal triangular SYRK tracks (consolidated from MacBook Air)."
     },
     "macbook_air": {
       "environment_id": "01096d9f-87f1-432f-b1d9-49c309d1458f",
       "hardware": "macOS arm64 | Apple Silicon",
-      "status": "blocked",
-      "role": "Blocked by ~/Documents TCC permissions & T3 project lookup error after cloning to ~/.t3/projects/ai"
+      "status": "retired",
+      "role": "Work consolidated onto Ryan's MacBook Pro (M5 Max); removed from active fleet."
     }
   },
   "kpis": {
@@ -41,11 +41,12 @@
     "Negative discoveries & P0 fixes: FP8 PE 68.75% uniform_mp div -> fp8_steps=1; warm-power step-11 drop -> u_safe=1.10 & schatten8 default; FP16 _square prescaled; BF16_SAFE_CIRCUITS restricted; fixed data_ptr(), torch.compile & N==1 (4096^2 10.46 ms)"
   ],
   "wip": [
-    "Cycle 2 P1 (T1-04): _symprod_kernel-native 2/3-buffer Schatten-8 circuits with fewer squarings & u>=1.05 FP16 / >=1.15 BF16 headroom",
-    "Cycle 2 P2 (T3-01): Multi-seed (>=3-5), LR-bracketed 50M-120M FineWeb/WikiText LM pretraining with PS3_55 eager & torch.compile controls"
+    "Cycle 2 T1-04 (Claude Fable 5.2, high): _symprod_kernel-native 2/3-buffer Schatten-8 circuits with fewer squarings & u>=1.05 FP16 / >=1.15 BF16 headroom",
+    "Cycle 2 T3-01 (Claude Opus 5.5, high): Real-text 50M-120M FineWeb-Edu/WikiText-103 LM harness, matched FP32 _foreach_add_ & CUDA-graph timing harness",
+    "Cycle 2 T2-02 (GPT 6.2 Astra, high): Apple M5 Max MLX BF16/FP16 & custom Metal triangular SYRK (implementing on bazzite; MacBook Pro queued once relay reconnects)"
   ],
   "blockers": [
-    "MacBook Air blocked: ~/Documents TCC failure & T3 project lookup miss on ~/.t3/projects/ai (using M5 Max cleanly)",
+    "Ryan's MacBook Pro currently unreachable on relay — Cycle 2 T2-02 MLX/Metal implementation proceeding on bazzite and queued for live M5 Max benchmark once Pro wakes.",
     "FP8 polar_express (fp8_steps=2) & fp8_sketch=True de-prioritized (68.75% uniform_mp div / +18-23% error for <=3.7% ceiling)"
   ],
   "audits": [

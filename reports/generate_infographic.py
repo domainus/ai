@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REVIEWERS = ("Claude Opus 5.5", "Claude Fable 5.2", "GPT 6.2 Astra", "Gemini 4 Neon")
-HOSTS = {"bazzite": "bazzite", "macbook_pro": "MacBook Pro", "macbook_air": "MacBook Air"}
+HOSTS = {"bazzite": "bazzite", "macbook_pro": "MacBook Pro"}
 
 CSS = """
 * { box-sizing: border-box }
@@ -28,7 +28,7 @@ time, .note, dt, figcaption { color: var(--muted-foreground); font-size: .8rem }
 .kpis > div { background: var(--card); padding: 12px 14px; border-radius: var(--radius) }
 .kpis dd { font-size: 1.12rem; font-weight: 650; font-variant-numeric: tabular-nums }
 .board { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; font-size: .88rem }
-.hosts { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px }
+.hosts { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px }
 .done { color: var(--success) } .wip { color: var(--info) } .risk { color: var(--destructive) } .warn { color: var(--warning) }
 ul, ol { padding-inline-start: 1.15rem } li + li { margin-top: .28rem }
 .host { margin-bottom: 4px } .pill { border: 1px solid var(--border); border-radius: 1em; padding: 1px 7px; font-size: .74rem; white-space: nowrap }

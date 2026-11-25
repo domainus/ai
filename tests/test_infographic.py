@@ -53,7 +53,7 @@ def verify(path):
                   "Fleet Hardware & Multi-Model Adversarial Audit Ledger", "Next Autonomous Sprint Queue",
                   "Completed", "Work In Progress", "Blockers & Risks", "Claude Opus 5.5",
                   "Claude Fable 5.2", "GPT 6.2 Astra", "Gemini 4 Neon",
-                  "bazzite", "MacBook Pro", "MacBook Air"):
+                  "bazzite", "MacBook Pro"):
         assert label in text
     css = "".join(doc.css).lower()
     assert not re.search(r"(?:\d|\.)vh\b", content, re.IGNORECASE)
