@@ -1,0 +1,279 @@
+{
+  "backend": "cpu",
+  "library": "numpy",
+  "library_version": "2.5.5",
+  "thread_environment": {
+    "OPENBLAS_NUM_THREADS": "3"
+  },
+  "hardware": {
+    "machine": "x86_64",
+    "system": "Linux",
+    "release": "7.2.15-ogc1.1.fc45.x86_64",
+    "hostname": "bazzite"
+  },
+  "quick": false,
+  "seed": 0,
+  "created_at": "2026-11-25T15:10:15.682441+00:00",
+  "dtype": "float32",
+  "reference": "numpy_float64_svd",
+  "error_metric": "relative_frobenius",
+  "warmups": 1,
+  "repeats": 5,
+  "results": [
+    {
+      "method": "jordan_ns5",
+      "shape": [
+        512,
+        2048
+      ],
+      "latency_ms": 68.996132,
+      "samples_ms": [
+        68.434668,
+        71.739509,
+        67.958816,
+        68.996132,
+        72.079831
+      ],
+      "polar_error": 0.1457518308364251,
+      "finite": true
+    },
+    {
+      "method": "polar_express",
+      "shape": [
+        512,
+        2048
+      ],
+      "latency_ms": 65.771982,
+      "samples_ms": [
+        70.878364,
+        65.771982,
+        34.763753,
+        35.040994,
+        72.301243
+      ],
+      "polar_error": 0.08758220827053877,
+      "finite": true
+    },
+    {
+      "method": "gram_ns",
+      "shape": [
+        512,
+        2048
+      ],
+      "latency_ms": 46.797206,
+      "samples_ms": [
+        49.653554,
+        49.561393,
+        46.797206,
+        30.124045,
+        24.404929
+      ],
+      "polar_error": 0.09317091932860934,
+      "finite": true
+    },
+    {
+      "method": "PS2_55",
+      "shape": [
+        512,
+        2048
+      ],
+      "latency_ms": 21.478421,
+      "samples_ms": [
+        21.939614,
+        22.220506,
+        21.478421,
+        20.830008,
+        20.662226
+      ],
+      "polar_error": 0.06785804300682005,
+      "finite": true
+    },
+    {
+      "method": "PS3_55",
+      "shape": [
+        512,
+        2048
+      ],
+      "latency_ms": 20.683577,
+      "samples_ms": [
+        20.504605,
+        20.504155,
+        20.909108,
+        20.683577,
+        21.27799
+      ],
+      "polar_error": 0.06362300614817856,
+      "finite": true
+    },
+    {
+      "method": "jordan_ns5",
+      "shape": [
+        1024,
+        4096
+      ],
+      "latency_ms": 292.981833,
+      "samples_ms": [
+        292.981833,
+        350.172002,
+        241.746069,
+        246.90395,
+        319.284583
+      ],
+      "polar_error": 0.16027042769813382,
+      "finite": true
+    },
+    {
+      "method": "polar_express",
+      "shape": [
+        1024,
+        4096
+      ],
+      "latency_ms": 247.908907,
+      "samples_ms": [
+        247.908907,
+        332.212162,
+        247.636105,
+        247.167902,
+        390.352498
+      ],
+      "polar_error": 0.09489265973495724,
+      "finite": true
+    },
+    {
+      "method": "gram_ns",
+      "shape": [
+        1024,
+        4096
+      ],
+      "latency_ms": 454.45922,
+      "samples_ms": [
+        524.288547,
+        425.685064,
+        454.45922,
+        496.733538,
+        436.509971
+      ],
+      "polar_error": 0.10109672497792195,
+      "finite": true
+    },
+    {
+      "method": "PS2_55",
+      "shape": [
+        1024,
+        4096
+      ],
+      "latency_ms": 185.383194,
+      "samples_ms": [
+        287.74098,
+        244.001932,
+        185.383194,
+        171.100917,
+        170.891085
+      ],
+      "polar_error": 0.06182464734599382,
+      "finite": true
+    },
+    {
+      "method": "PS3_55",
+      "shape": [
+        1024,
+        4096
+      ],
+      "latency_ms": 182.069764,
+      "samples_ms": [
+        182.069764,
+        165.15766,
+        166.328328,
+        192.537587,
+        198.421484
+      ],
+      "polar_error": 0.06474838207473455,
+      "finite": true
+    },
+    {
+      "method": "jordan_ns5",
+      "shape": [
+        2048,
+        2048
+      ],
+      "latency_ms": 766.133797,
+      "samples_ms": [
+        986.702646,
+        766.133797,
+        749.718866,
+        755.365511,
+        830.35093
+      ],
+      "polar_error": 0.22358737445203938,
+      "finite": true
+    },
+    {
+      "method": "polar_express",
+      "shape": [
+        2048,
+        2048
+      ],
+      "latency_ms": 1128.935516,
+      "samples_ms": [
+        890.87637,
+        925.946124,
+        1128.935516,
+        1140.074314,
+        1368.293411
+      ],
+      "polar_error": 0.13774634011508427,
+      "finite": true
+    },
+    {
+      "method": "gram_ns",
+      "shape": [
+        2048,
+        2048
+      ],
+      "latency_ms": 755.884374,
+      "samples_ms": [
+        1267.483494,
+        777.826408,
+        755.15904,
+        755.884374,
+        744.474524
+      ],
+      "polar_error": 0.14716429037897014,
+      "finite": true
+    },
+    {
+      "method": "PS2_55",
+      "shape": [
+        2048,
+        2048
+      ],
+      "latency_ms": 646.213153,
+      "samples_ms": [
+        655.113058,
+        627.73112,
+        646.213153,
+        636.670644,
+        652.23483
+      ],
+      "polar_error": 0.12189819947750988,
+      "finite": true
+    },
+    {
+      "method": "PS3_55",
+      "shape": [
+        2048,
+        2048
+      ],
+      "latency_ms": 656.925969,
+      "samples_ms": [
+        658.596939,
+        631.941786,
+        667.704415,
+        651.755387,
+        656.925969
+      ],
+      "polar_error": 0.11466259480974271,
+      "finite": true
+    }
+  ]
+}

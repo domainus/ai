@@ -2,52 +2,59 @@
   "program": "Autonomous Verifiable AI Research",
   "repo": "https://github.com/domainus/ai",
   "cycle": 1,
-  "phase": "initializing",
-  "last_updated": "2026-11-25T07:58:00-07:00",
+  "phase": "active_discovery",
+  "last_updated": "2026-11-25T08:38:30-07:00",
   "fleet": {
     "bazzite": {
       "environment_id": "6fb39dcd-f3b7-4929-a1d5-637d67eb79bb",
       "hardware": "Linux x64 | RTX 5080 16GB (sm_120) | Ryzen 7 5800X3D",
       "status": "online",
-      "role": "CUDA/Triton kernels, gradient harvesting, Tier-1/Tier-2 RTX 5080 verification"
+      "role": "CUDA/Triton kernels, gradient harvesting, circuit search, Tier-1/Tier-2 RTX 5080 verification"
     },
     "macbook_pro": {
       "environment_id": "fbc39183-5d33-4276-af14-3cb027511e92",
       "hardware": "macOS arm64 | Apple Silicon",
-      "status": "pending_clone",
-      "role": "Spectral upper-bound theory, polynomial circuit search, MLX experiments"
+      "status": "unreachable",
+      "role": "Spectral upper-bound theory, polynomial circuit search, MLX experiments (offline mid-Cycle 1)"
     },
     "macbook_air": {
       "environment_id": "01096d9f-87f1-432f-b1d9-49c309d1458f",
       "hardware": "macOS arm64 | Apple Silicon",
-      "status": "pending_check",
-      "role": "Infographic generator, MLX/MPS benchmarks"
+      "status": "blocked",
+      "role": "MLX/MPS benchmarks (blocked by ~/Documents TCC permissions & project lookup error after clone)"
     }
   },
   "kpis": {
-    "experiments_run": 0,
+    "experiments_run": 5,
     "verified_wins": 0,
-    "best_speedup_vs_pe": null,
-    "best_speedup_vs_ps": null,
-    "tests_passing": 0,
+    "best_speedup_vs_pe": "1.63x (FP8-early 4096x4096) / 1.90x (triton_syrk vs cuBLAS)",
+    "best_speedup_vs_ps": "pending unified Cycle 1 benchmark",
+    "tests_passing": 199,
     "audits_completed": 0
   },
-  "completed": [],
-  "wip": [
-    "Bootstrap domainus/ai public GitHub repository and fleet clones",
-    "Configure Blackwell sm_120 PyTorch + Triton environment on bazzite",
-    "Implement late-2026 SOTA polar baselines (Jordan, PolarExpress, GramNS, PolarSwitch) & real LM gradient harvesting",
-    "Search ultra-short circuits with warm-started spectral pre-scaling",
-    "Develop Blackwell sm_120 Triton SYRK & FP8-early/BF16-late kernels",
-    "Build automated HTML infographic generator & Apple Silicon MLX benchmark"
+  "completed": [
+    "Public GitHub repo domainus/ai bootstrapped & PyTorch 2.14.1+cu130 + Triton 3.8.0 verified on RTX 5080 (sm_120)",
+    "SOTA baselines (svd_polar_fp64, jordan_ns5, polar_express, gram_ns, polar_switch PS2_55/PS3_55) + Tier-1 (87 cases) & Tier-2 LM harness (74/74 tests)",
+    "Real 19.2M Transformer momentum harvest: 45 trajectory pairs; median eff-rank 3.19x, median right overlap 0.937 (min 0.165), max sigma_max jump 31.82%",
+    "Blackwell sm_120 triton_syrk (1.69-2.02x vs cuBLAS) and FP8-early/BF16-late PolarExpress (1.46-1.63x at >=2048) with 114/114 tests",
+    "Responsive T3-themed Daily Infographic Engine + Apple Silicon/CPU kernel reference (11/11 tests, 199/199 total suite passing)"
   ],
-  "blockers": [],
+  "wip": [
+    "Delegate 2R (Claude Opus 5.5, high): Warm-started spectral pre-scaling & 0-restart/compact polynomial circuit discovery",
+    "Delegate 5 (Claude Fable 5.2, high): Blackwell sm_120 Triton-accelerated PolarSwitch & GramNS fused circuits",
+    "Pending Phase 3: Unified solo RTX 5080 head-to-head + 4-model adversarial review (Opus 5.5, Fable 5.2, GPT 6.2 Astra, Gemini 4 Neon)"
+  ],
+  "blockers": [
+    "Ryan's MacBook Pro went unreachable mid-Cycle 1 (relay timeout at prod-b42ceea044c90d5d.t3coderelay.com); Delegate 2 cancelled and relocated to bazzite.",
+    "Ryan's MacBook Air blocked: clone to ~/Documents failed ('Operation not permitted') and t3_project_read/delegate_task on ~/.t3/projects/ai returned 'The project was not found.'",
+    "FP8-early _scaled_mm per-tensor scaling adds launch/amax overhead on small <=512x2048 matrices (only faster at >=2048)."
+  ],
   "audits": [],
   "leaderboard": [],
   "next_queue": [
-    "Complete Cycle 1 parallel experiments across fleet",
-    "Run unified RTX 5080 Tier-1 head-to-head benchmark",
-    "Execute Dual Cross-Model Adversarial Review (Claude Opus 5.5 + GPT 6.2 Sol)",
-    "Promote surviving Cycle 1 candidates to Tier-2 multi-seed LM pretraining"
+    "Complete spectral pre-scaling circuits (Opus 5.5) & Triton PolarSwitch (Fable 5.2)",
+    "Run unified solo RTX 5080 Tier-1 head-to-head + Tier-2 multi-seed LM transfer",
+    "Execute 4-model adversarial review (Opus 5.5, Fable 5.2, GPT 6.2 Astra, Gemini 4 Neon)",
+    "Schedule 4-hour autonomous sprint & daily 08:00 infographic tasks and render Day 0 report"
   ]
 }

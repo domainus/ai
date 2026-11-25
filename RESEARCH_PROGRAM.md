@@ -3,7 +3,12 @@
 ## Core Scientific Principles
 1. **Programmatic Verification First:** Every hypothesis must map to a deterministic or tightly controlled verification harness measuring both **quality/accuracy** and **guardrail metrics** (worst-case singular value bounds, NaN/divergence rate, randomized fuzz shapes, OOD/multi-seed generalization).
 2. **No Cherry-Picking / Anti-Overfitting:** Discoveries on Tier-1 synthetic/harvested matrices only promote to `VERIFIED` after passing adversarial stress tests AND Tier-2 end-to-end training checks across multiple random seeds. Negative or inconclusive results are logged honestly in `state/ledger.jsonl`.
-3. **Mandatory Dual Cross-Model Adversarial Review:** Every cycle's implementation and claims must be reviewed independently by at least two distinct frontier model families (e.g., Claude Opus 5.5 + GPT 6.2 Sol), actively trying to break assumptions, spot timing bugs, or construct mathematical counterexamples.
+3. **Mandatory Multi-Model Adversarial Review (Frontier Roster):** Every cycle's hypotheses, code, kernels, and claims must be implemented and independently adversarially reviewed across top-tier frontier models at `high` reasoning effort:
+   - **Claude Opus 5.5** (`claudeAgent` · `claude-opus-5-5` · `effort: high`)
+   - **Claude Fable 5.2** (`claudeAgent` · `claude-fable-5-2` · `effort: high`)
+   - **GPT 6.2 Astra** (`codex` · `gpt-6.2-astra` · `reasoningEffort: high`)
+   - **Gemini 4 Neon** (`antigravity` · `gemini-4-neon` · `thought_level: high`)
+   *(Reviewers actively try to break assumptions, spot GPU timing/precision flaws, and construct mathematical counterexamples before any discovery is promoted.)*
 
 ## Active Research Tracks
 

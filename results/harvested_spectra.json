@@ -1,0 +1,1639 @@
+{
+  "schema_version": 1,
+  "model": {
+    "vocab_size": 1024,
+    "width": 512,
+    "layers": 6,
+    "heads": 8,
+    "hidden": 1344,
+    "sequence_length": 128,
+    "batch_size": 16
+  },
+  "parameter_count": 19208704,
+  "device": "NVIDIA GeForce RTX 5080",
+  "torch": "2.14.1+cu130",
+  "seed": 123,
+  "steps": 300,
+  "tokens": 614400,
+  "muon_lr": 0.02,
+  "adamw_lr": 0.001,
+  "momentum_beta": 0.95,
+  "matrix_update": "Nesterov Muon with Jordan NS5; stored matrices are the pre-Nesterov EMA",
+  "selected_layers": [
+    0,
+    3,
+    5
+  ],
+  "snapshot_steps": {
+    "early": [
+      1,
+      2
+    ],
+    "mid": [
+      150,
+      151
+    ],
+    "late": [
+      299,
+      300
+    ]
+  },
+  "training_losses": [
+    {
+      "step": 1,
+      "loss": 7.0475006103515625
+    },
+    {
+      "step": 25,
+      "loss": 5.409156799316406
+    },
+    {
+      "step": 50,
+      "loss": 5.106727600097656
+    },
+    {
+      "step": 75,
+      "loss": 4.785743713378906
+    },
+    {
+      "step": 100,
+      "loss": 4.4348297119140625
+    },
+    {
+      "step": 125,
+      "loss": 3.5554771423339844
+    },
+    {
+      "step": 150,
+      "loss": 3.281696319580078
+    },
+    {
+      "step": 175,
+      "loss": 3.1298789978027344
+    },
+    {
+      "step": 200,
+      "loss": 3.033336639404297
+    },
+    {
+      "step": 225,
+      "loss": 2.915599822998047
+    },
+    {
+      "step": 250,
+      "loss": 2.7717971801757812
+    },
+    {
+      "step": 275,
+      "loss": 2.76727294921875
+    },
+    {
+      "step": 300,
+      "loss": 2.697704315185547
+    }
+  ],
+  "trajectory_count": 45,
+  "svd_dtype": "float64",
+  "svd_device": "cpu",
+  "summary": {
+    "sigma_max": {
+      "min": 0.0014369836828085855,
+      "p25": 0.0025360650296865563,
+      "median": 0.004490843000171701,
+      "p75": 0.009177921776258494,
+      "max": 0.05449925208855342
+    },
+    "sigma_min": {
+      "min": 1.6808367579005734e-09,
+      "p25": 9.259945154336409e-06,
+      "median": 1.575727211115036e-05,
+      "p75": 5.285528324773915e-05,
+      "max": 0.0007189713268231975
+    },
+    "kappa": {
+      "min": 25.987635123225367,
+      "p25": 72.04172960627054,
+      "median": 179.61238201376887,
+      "p75": 494.25450276572747,
+      "max": 1958296.8944607077
+    },
+    "effective_rank": {
+      "min": 1.6771574210460276,
+      "p25": 2.4447981885099055,
+      "median": 3.1874401173581703,
+      "p75": 3.9721790111401143,
+      "max": 5.632815874618388
+    },
+    "frobenius_spectral_ratio": {
+      "min": 1.6771574210460276,
+      "p25": 2.4447981885099055,
+      "median": 3.1874401173581703,
+      "p75": 3.9721790111401143,
+      "max": 5.632815874618388
+    },
+    "top_left_cosine": {
+      "min": 0.11676816267335742,
+      "p25": 0.7782150889197319,
+      "median": 0.8692467301684095,
+      "p75": 0.9036086167227269,
+      "max": 0.9794951487626631
+    },
+    "top_right_cosine": {
+      "min": 0.164976931304687,
+      "p25": 0.7966248946251626,
+      "median": 0.9365630298566868,
+      "p75": 0.9875205610671969,
+      "max": 0.9991382235109187
+    },
+    "relative_sigma_max_change": {
+      "min": 0.0015984847540288015,
+      "p25": 0.021903804300172556,
+      "median": 0.039163302558520005,
+      "p75": 0.05343597830076981,
+      "max": 0.31817463877430935
+    }
+  },
+  "summary_by_phase": {
+    "early": {
+      "sigma_max": {
+        "min": 0.0021893373492202803,
+        "p25": 0.0037322841828895496,
+        "median": 0.008023390678913639,
+        "p75": 0.01867609446322869,
+        "max": 0.05449925208855342
+      },
+      "sigma_min": {
+        "min": 1.390385209051452e-08,
+        "p25": 3.656706067118203e-05,
+        "median": 6.414396140071622e-05,
+        "p75": 0.00016842345668350585,
+        "max": 0.0007189713268231975
+      },
+      "kappa": {
+        "min": 25.987635123225367,
+        "p25": 41.81777317200962,
+        "median": 47.99876084420593,
+        "p75": 224.61199816786961,
+        "max": 1958296.8944607077
+      },
+      "effective_rank": {
+        "min": 2.787782490470004,
+        "p25": 3.3441680525401285,
+        "median": 3.9721790111401143,
+        "p75": 4.171924308822757,
+        "max": 5.632815874618388
+      },
+      "frobenius_spectral_ratio": {
+        "min": 2.787782490470004,
+        "p25": 3.3441680525401285,
+        "median": 3.9721790111401143,
+        "p75": 4.171924308822757,
+        "max": 5.632815874618388
+      },
+      "top_left_cosine": {
+        "min": 0.11676816267335742,
+        "p25": 0.7056545464562951,
+        "median": 0.7782150889197319,
+        "p75": 0.8853643925531844,
+        "max": 0.919884615885966
+      },
+      "top_right_cosine": {
+        "min": 0.164976931304687,
+        "p25": 0.7278431179161511,
+        "median": 0.7966248946251626,
+        "p75": 0.8334766129888032,
+        "max": 0.9065429342123736
+      },
+      "relative_sigma_max_change": {
+        "min": 0.003337737438595362,
+        "p25": 0.04598246524187747,
+        "median": 0.05488701484550402,
+        "p75": 0.07523158723897883,
+        "max": 0.2032955991601566
+      }
+    },
+    "mid": {
+      "sigma_max": {
+        "min": 0.0015609339492531947,
+        "p25": 0.0025776560617496234,
+        "median": 0.003431808278046226,
+        "p75": 0.007392982251107835,
+        "max": 0.011819357919646311
+      },
+      "sigma_min": {
+        "min": 2.4976350876767105e-09,
+        "p25": 1.1701292466139857e-05,
+        "median": 1.461161504139143e-05,
+        "p75": 3.127969968895944e-05,
+        "max": 0.00011744739148572647
+      },
+      "kappa": {
+        "min": 64.71255306051552,
+        "p25": 129.98897195002547,
+        "median": 192.25093469553795,
+        "p75": 481.714072645606,
+        "max": 624964.7744599747
+      },
+      "effective_rank": {
+        "min": 1.8424474212263626,
+        "p25": 2.3169898833143217,
+        "median": 2.959959233621227,
+        "p75": 3.597180089983616,
+        "max": 4.548084274402621
+      },
+      "frobenius_spectral_ratio": {
+        "min": 1.8424474212263626,
+        "p25": 2.3169898833143217,
+        "median": 2.959959233621227,
+        "p75": 3.597180089983616,
+        "max": 4.548084274402621
+      },
+      "top_left_cosine": {
+        "min": 0.2561735802532762,
+        "p25": 0.8978622786643721,
+        "median": 0.9061685330367488,
+        "p75": 0.9477692945024667,
+        "max": 0.9794951487626631
+      },
+      "top_right_cosine": {
+        "min": 0.3113122716403962,
+        "p25": 0.9488703070389704,
+        "median": 0.983308191443721,
+        "p75": 0.9917140253898994,
+        "max": 0.9991382235109187
+      },
+      "relative_sigma_max_change": {
+        "min": 0.0015984847540288015,
+        "p25": 0.008650724531928744,
+        "median": 0.02457762699023333,
+        "p75": 0.03193458522712978,
+        "max": 0.051491969209277386
+      }
+    },
+    "late": {
+      "sigma_max": {
+        "min": 0.0014369836828085855,
+        "p25": 0.001866215817125155,
+        "median": 0.0030814831473567413,
+        "p75": 0.0068374575179812064,
+        "max": 0.011104477686447857
+      },
+      "sigma_min": {
+        "min": 1.6808367579005734e-09,
+        "p25": 4.975025641422009e-06,
+        "median": 1.1198439197810377e-05,
+        "p75": 2.239460346270679e-05,
+        "max": 6.970457579639245e-05
+      },
+      "kappa": {
+        "min": 60.58877876732607,
+        "p25": 149.68377370569226,
+        "median": 283.8524082855116,
+        "p75": 1492.8560916277356,
+        "max": 854921.6192793348
+      },
+      "effective_rank": {
+        "min": 1.6771574210460276,
+        "p25": 1.9265870096123916,
+        "median": 2.616322501623013,
+        "p75": 3.4267882328651096,
+        "max": 4.830381036908746
+      },
+      "frobenius_spectral_ratio": {
+        "min": 1.6771574210460276,
+        "p25": 1.9265870096123916,
+        "median": 2.616322501623013,
+        "p75": 3.4267882328651096,
+        "max": 4.830381036908746
+      },
+      "top_left_cosine": {
+        "min": 0.33390398016737,
+        "p25": 0.800888311022681,
+        "median": 0.8595457372697501,
+        "p75": 0.8773500783641064,
+        "max": 0.892157061312909
+      },
+      "top_right_cosine": {
+        "min": 0.3080987585269186,
+        "p25": 0.869566709213293,
+        "median": 0.9638354917419529,
+        "p75": 0.9890987333593659,
+        "max": 0.9964981710968395
+      },
+      "relative_sigma_max_change": {
+        "min": 0.005339158959351195,
+        "p25": 0.027141228280113224,
+        "median": 0.04442718588401955,
+        "p75": 0.052363473663118686,
+        "max": 0.31817463877430935
+      }
+    }
+  },
+  "records": [
+    {
+      "phase": "early",
+      "parameter": "blocks.0.qkv.weight",
+      "steps": [
+        1,
+        2
+      ],
+      "shape": [
+        1536,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.01578132141560248,
+        "sigma_min": 5.817541406379112e-05,
+        "kappa": 271.27132087616565,
+        "effective_rank": 2.9557643636064106,
+        "frobenius_spectral_ratio": 2.9557643636064106
+      },
+      "current": {
+        "sigma_max": 0.01652464189006683,
+        "sigma_min": 0.00018955444637170445,
+        "kappa": 87.17622934395871,
+        "effective_rank": 3.8222176421905587,
+        "frobenius_spectral_ratio": 3.8222176421905587
+      },
+      "top_left_cosine": 0.8808878401355626,
+      "top_right_cosine": 0.828532580750639,
+      "relative_sigma_max_change": 0.047101282262045026
+    },
+    {
+      "phase": "early",
+      "parameter": "blocks.0.out.weight",
+      "steps": [
+        1,
+        2
+      ],
+      "shape": [
+        512,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.05468176546435228,
+        "sigma_min": 2.5702040307774653e-06,
+        "kappa": 21275.26251206271,
+        "effective_rank": 2.6216088952474244,
+        "frobenius_spectral_ratio": 2.6216088952474244
+      },
+      "current": {
+        "sigma_max": 0.05449925208855342,
+        "sigma_min": 4.698423195103796e-06,
+        "kappa": 11599.47706399603,
+        "effective_rank": 3.500895987722086,
+        "frobenius_spectral_ratio": 3.500895987722086
+      },
+      "top_left_cosine": 0.9056063233394815,
+      "top_right_cosine": 0.9065429342123736,
+      "relative_sigma_max_change": 0.003337737438595362
+    },
+    {
+      "phase": "early",
+      "parameter": "blocks.0.gate.weight",
+      "steps": [
+        1,
+        2
+      ],
+      "shape": [
+        1344,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.004233568826322616,
+        "sigma_min": 8.893996978077987e-05,
+        "kappa": 47.60029530881963,
+        "effective_rank": 4.508192259080229,
+        "frobenius_spectral_ratio": 4.508192259080229
+      },
+      "current": {
+        "sigma_max": 0.004490843000171701,
+        "sigma_min": 0.00017280691293676802,
+        "kappa": 25.987635123225367,
+        "effective_rank": 5.632815874618388,
+        "frobenius_spectral_ratio": 5.632815874618388
+      },
+      "top_left_cosine": 0.7208949464676023,
+      "top_right_cosine": 0.7812982140248836,
+      "relative_sigma_max_change": 0.06077004636123024
+    },
+    {
+      "phase": "early",
+      "parameter": "blocks.0.up.weight",
+      "steps": [
+        1,
+        2
+      ],
+      "shape": [
+        1344,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.00475262376620238,
+        "sigma_min": 8.751005808565195e-05,
+        "kappa": 54.30945733747165,
+        "effective_rank": 4.075251027449424,
+        "frobenius_spectral_ratio": 4.075251027449424
+      },
+      "current": {
+        "sigma_max": 0.0050065848666448936,
+        "sigma_min": 0.00016404000043024369,
+        "kappa": 30.520512396449863,
+        "effective_rank": 5.103667243979933,
+        "frobenius_spectral_ratio": 5.103667243979933
+      },
+      "top_left_cosine": 0.8274693199324369,
+      "top_right_cosine": 0.8864872257499621,
+      "relative_sigma_max_change": 0.05343597830076981
+    },
+    {
+      "phase": "early",
+      "parameter": "blocks.0.down.weight",
+      "steps": [
+        1,
+        2
+      ],
+      "shape": [
+        512,
+        1344
+      ],
+      "previous": {
+        "sigma_max": 0.020528487208706345,
+        "sigma_min": 0.00040089938073657765,
+        "kappa": 51.206083608782556,
+        "effective_rank": 3.2726527547217,
+        "frobenius_spectral_ratio": 3.2726527547217
+      },
+      "current": {
+        "sigma_max": 0.020827547036390552,
+        "sigma_min": 0.0007189713268231975,
+        "kappa": 28.968536378798124,
+        "effective_rank": 4.257726879474811,
+        "frobenius_spectral_ratio": 4.257726879474811
+      },
+      "top_left_cosine": 0.919884615885966,
+      "top_right_cosine": 0.9000958575428135,
+      "relative_sigma_max_change": 0.014568040238121995
+    },
+    {
+      "phase": "early",
+      "parameter": "blocks.3.qkv.weight",
+      "steps": [
+        1,
+        2
+      ],
+      "shape": [
+        1536,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.008801336032103885,
+        "sigma_min": 2.633375452165991e-05,
+        "kappa": 334.22260486497106,
+        "effective_rank": 2.6143724930368073,
+        "frobenius_spectral_ratio": 2.6143724930368073
+      },
+      "current": {
+        "sigma_max": 0.009493463326138882,
+        "sigma_min": 5.285528324773915e-05,
+        "kappa": 179.61238201376887,
+        "effective_rank": 3.1874401173581703,
+        "frobenius_spectral_ratio": 3.1874401173581703
+      },
+      "top_left_cosine": 0.8522202978036267,
+      "top_right_cosine": 0.8337764859011156,
+      "relative_sigma_max_change": 0.07863888976746063
+    },
+    {
+      "phase": "early",
+      "parameter": "blocks.3.out.weight",
+      "steps": [
+        1,
+        2
+      ],
+      "shape": [
+        512,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.030334771380573666,
+        "sigma_min": 8.02927513566267e-08,
+        "kappa": 377802.11623138114,
+        "effective_rank": 2.53850015154281,
+        "frobenius_spectral_ratio": 2.53850015154281
+      },
+      "current": {
+        "sigma_max": 0.03378331831276692,
+        "sigma_min": 2.1139359634221278e-07,
+        "kappa": 159812.40159270045,
+        "effective_rank": 2.9949789417460977,
+        "frobenius_spectral_ratio": 2.9949789417460977
+      },
+      "top_left_cosine": 0.7099081832189351,
+      "top_right_cosine": 0.7183322180750741,
+      "relative_sigma_max_change": 0.11368297090254981
+    },
+    {
+      "phase": "early",
+      "parameter": "blocks.3.gate.weight",
+      "steps": [
+        1,
+        2
+      ],
+      "shape": [
+        1344,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.002663874413726862,
+        "sigma_min": 3.691032377955747e-05,
+        "kappa": 72.1715265798408,
+        "effective_rank": 3.3696090833125325,
+        "frobenius_spectral_ratio": 3.3696090833125325
+      },
+      "current": {
+        "sigma_max": 0.0027848195878266797,
+        "sigma_min": 6.550293843679534e-05,
+        "kappa": 42.51442231883672,
+        "effective_rank": 4.251306024774559,
+        "frobenius_spectral_ratio": 4.251306024774559
+      },
+      "top_left_cosine": 0.6142087446893754,
+      "top_right_cosine": 0.6420060804862946,
+      "relative_sigma_max_change": 0.04540198046746914
+    },
+    {
+      "phase": "early",
+      "parameter": "blocks.3.up.weight",
+      "steps": [
+        1,
+        2
+      ],
+      "shape": [
+        1344,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.0028616535613659577,
+        "sigma_min": 3.4480648737469494e-05,
+        "kappa": 82.99303134213513,
+        "effective_rank": 3.166270524568194,
+        "frobenius_spectral_ratio": 3.166270524568194
+      },
+      "current": {
+        "sigma_max": 0.002973725365607399,
+        "sigma_min": 6.414396140071622e-05,
+        "kappa": 46.360176401175536,
+        "effective_rank": 3.9721790111401143,
+        "frobenius_spectral_ratio": 3.9721790111401143
+      },
+      "top_left_cosine": 0.7782150889197319,
+      "top_right_cosine": 0.8331767400764907,
+      "relative_sigma_max_change": 0.039163302558520005
+    },
+    {
+      "phase": "early",
+      "parameter": "blocks.3.down.weight",
+      "steps": [
+        1,
+        2
+      ],
+      "shape": [
+        512,
+        1344
+      ],
+      "previous": {
+        "sigma_max": 0.00967200286462163,
+        "sigma_min": 0.00012078461552039972,
+        "kappa": 80.07644701231088,
+        "effective_rank": 3.1847562363594717,
+        "frobenius_spectral_ratio": 3.1847562363594717
+      },
+      "current": {
+        "sigma_max": 0.01012235985056438,
+        "sigma_min": 0.00024615960994561965,
+        "kappa": 41.12112402518253,
+        "effective_rank": 4.0032198614813845,
+        "frobenius_spectral_ratio": 4.0032198614813845
+      },
+      "top_left_cosine": 0.8898409449708062,
+      "top_right_cosine": 0.8247864679049449,
+      "relative_sigma_max_change": 0.0465629500162858
+    },
+    {
+      "phase": "early",
+      "parameter": "blocks.5.qkv.weight",
+      "steps": [
+        1,
+        2
+      ],
+      "shape": [
+        1536,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.00629278223127071,
+        "sigma_min": 1.3841801591144397e-05,
+        "kappa": 454.6216177016046,
+        "effective_rank": 2.646500082546236,
+        "frobenius_spectral_ratio": 2.646500082546236
+      },
+      "current": {
+        "sigma_max": 0.007408241548846154,
+        "sigma_min": 2.7477457035657327e-05,
+        "kappa": 269.61161432197036,
+        "effective_rank": 2.9584353522521125,
+        "frobenius_spectral_ratio": 2.9584353522521125
+      },
+      "top_left_cosine": 0.7712829220583524,
+      "top_right_cosine": 0.7373540177572282,
+      "relative_sigma_max_change": 0.17726011747751155
+    },
+    {
+      "phase": "early",
+      "parameter": "blocks.5.out.weight",
+      "steps": [
+        1,
+        2
+      ],
+      "shape": [
+        512,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.02262774865037267,
+        "sigma_min": 1.1618263809004965e-07,
+        "kappa": 194760.15541009308,
+        "effective_rank": 2.5224492845697837,
+        "frobenius_spectral_ratio": 2.5224492845697837
+      },
+      "current": {
+        "sigma_max": 0.027227870369895605,
+        "sigma_min": 1.390385209051452e-08,
+        "kappa": 1958296.8944607077,
+        "effective_rank": 2.787782490470004,
+        "frobenius_spectral_ratio": 2.787782490470004
+      },
+      "top_left_cosine": 0.7014009096936552,
+      "top_right_cosine": 0.670838919034817,
+      "relative_sigma_max_change": 0.2032955991601566
+    },
+    {
+      "phase": "early",
+      "parameter": "blocks.5.gate.weight",
+      "steps": [
+        1,
+        2
+      ],
+      "shape": [
+        1344,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.0021287865382326396,
+        "sigma_min": 2.6066109971783315e-05,
+        "kappa": 81.6687469107228,
+        "effective_rank": 3.2790740068813737,
+        "frobenius_spectral_ratio": 3.2790740068813737
+      },
+      "current": {
+        "sigma_max": 0.002281685108642534,
+        "sigma_min": 4.75363336159534e-05,
+        "kappa": 47.99876084420593,
+        "effective_rank": 3.9936340993268593,
+        "frobenius_spectral_ratio": 3.9936340993268593
+      },
+      "top_left_cosine": 0.6861165157158925,
+      "top_right_cosine": 0.7708815984683531,
+      "relative_sigma_max_change": 0.07182428471049704
+    },
+    {
+      "phase": "early",
+      "parameter": "blocks.5.up.weight",
+      "steps": [
+        1,
+        2
+      ],
+      "shape": [
+        1344,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.002075423546227768,
+        "sigma_min": 2.4736492504407985e-05,
+        "kappa": 83.90128656509941,
+        "effective_rank": 3.312082608894418,
+        "frobenius_spectral_ratio": 3.312082608894418
+      },
+      "current": {
+        "sigma_max": 0.0021893373492202803,
+        "sigma_min": 4.5656664306706735e-05,
+        "kappa": 47.95219673765518,
+        "effective_rank": 4.092542592870956,
+        "frobenius_spectral_ratio": 4.092542592870956
+      },
+      "top_left_cosine": 0.11676816267335742,
+      "top_right_cosine": 0.164976931304687,
+      "relative_sigma_max_change": 0.05488701484550402
+    },
+    {
+      "phase": "early",
+      "parameter": "blocks.5.down.weight",
+      "steps": [
+        1,
+        2
+      ],
+      "shape": [
+        512,
+        1344
+      ],
+      "previous": {
+        "sigma_max": 0.0076011121449121345,
+        "sigma_min": 4.1513726121798404e-05,
+        "kappa": 183.09876888937882,
+        "effective_rank": 3.1457044749823475,
+        "frobenius_spectral_ratio": 3.1457044749823475
+      },
+      "current": {
+        "sigma_max": 0.008023390678913639,
+        "sigma_min": 0.00011137143323409716,
+        "kappa": 72.04172960627054,
+        "effective_rank": 3.8799737396858265,
+        "frobenius_spectral_ratio": 3.8799737396858265
+      },
+      "top_left_cosine": 0.892243787393094,
+      "top_right_cosine": 0.7966248946251626,
+      "relative_sigma_max_change": 0.05555483539131308
+    },
+    {
+      "phase": "mid",
+      "parameter": "blocks.0.qkv.weight",
+      "steps": [
+        150,
+        151
+      ],
+      "shape": [
+        1536,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.007943589889921384,
+        "sigma_min": 0.00012060931960386739,
+        "kappa": 65.86215655648778,
+        "effective_rank": 3.6146611327045104,
+        "frobenius_spectral_ratio": 3.6146611327045104
+      },
+      "current": {
+        "sigma_max": 0.007930579850065895,
+        "sigma_min": 0.00011744739148572647,
+        "kappa": 67.52452949139962,
+        "effective_rank": 3.578341096751412,
+        "frobenius_spectral_ratio": 3.578341096751412
+      },
+      "top_left_cosine": 0.2561735802532762,
+      "top_right_cosine": 0.3113122716403962,
+      "relative_sigma_max_change": 0.0016378035668729945
+    },
+    {
+      "phase": "mid",
+      "parameter": "blocks.0.out.weight",
+      "steps": [
+        150,
+        151
+      ],
+      "shape": [
+        512,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.011614608677966883,
+        "sigma_min": 2.428155493416976e-07,
+        "kappa": 47833.05150537309,
+        "effective_rank": 2.6241456237119816,
+        "frobenius_spectral_ratio": 2.6241456237119816
+      },
+      "current": {
+        "sigma_max": 0.011675093850516849,
+        "sigma_min": 1.016897613325959e-07,
+        "kappa": 114810.90817325465,
+        "effective_rank": 2.5755620698714337,
+        "frobenius_spectral_ratio": 2.5755620698714337
+      },
+      "top_left_cosine": 0.8563390635635235,
+      "top_right_cosine": 0.9538674103878153,
+      "relative_sigma_max_change": 0.0052076806224826
+    },
+    {
+      "phase": "mid",
+      "parameter": "blocks.0.gate.weight",
+      "steps": [
+        150,
+        151
+      ],
+      "shape": [
+        1344,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.006773467899824216,
+        "sigma_min": 1.4755779574466794e-05,
+        "kappa": 459.0382951738406,
+        "effective_rank": 2.2786631799264265,
+        "frobenius_spectral_ratio": 2.2786631799264265
+      },
+      "current": {
+        "sigma_max": 0.006855384652149776,
+        "sigma_min": 1.461161504139143e-05,
+        "kappa": 469.1736425254845,
+        "effective_rank": 2.234908075014232,
+        "frobenius_spectral_ratio": 2.234908075014232
+      },
+      "top_left_cosine": 0.9036086167227269,
+      "top_right_cosine": 0.9886323977855711,
+      "relative_sigma_max_change": 0.012093768441374888
+    },
+    {
+      "phase": "mid",
+      "parameter": "blocks.0.up.weight",
+      "steps": [
+        150,
+        151
+      ],
+      "shape": [
+        1344,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.006288078483319517,
+        "sigma_min": 1.3346430303758316e-05,
+        "kappa": 471.1430952101711,
+        "effective_rank": 2.276250211276125,
+        "frobenius_spectral_ratio": 2.276250211276125
+      },
+      "current": {
+        "sigma_max": 0.006278027085731794,
+        "sigma_min": 1.2702012931802316e-05,
+        "kappa": 494.25450276572747,
+        "effective_rank": 2.248695176401851,
+        "frobenius_spectral_ratio": 2.248695176401851
+      },
+      "top_left_cosine": 0.89931038071558,
+      "top_right_cosine": 0.9916791521756692,
+      "relative_sigma_max_change": 0.0015984847540288015
+    },
+    {
+      "phase": "mid",
+      "parameter": "blocks.0.down.weight",
+      "steps": [
+        150,
+        151
+      ],
+      "shape": [
+        512,
+        1344
+      ],
+      "previous": {
+        "sigma_max": 0.011049367636264474,
+        "sigma_min": 9.492897514463214e-05,
+        "kappa": 116.39615427670897,
+        "effective_rank": 3.671377175706994,
+        "frobenius_spectral_ratio": 3.671377175706994
+      },
+      "current": {
+        "sigma_max": 0.011025903740091766,
+        "sigma_min": 9.645386401514457e-05,
+        "kappa": 114.31272196996223,
+        "effective_rank": 3.595961086113309,
+        "frobenius_spectral_ratio": 3.595961086113309
+      },
+      "top_left_cosine": 0.9061685330367488,
+      "top_right_cosine": 0.9438732036901254,
+      "relative_sigma_max_change": 0.0021235510433827097
+    },
+    {
+      "phase": "mid",
+      "parameter": "blocks.3.qkv.weight",
+      "steps": [
+        150,
+        151
+      ],
+      "shape": [
+        1536,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.01217959103982957,
+        "sigma_min": 3.470603325625505e-05,
+        "kappa": 350.9358430535834,
+        "effective_rank": 1.8500985584528806,
+        "frobenius_spectral_ratio": 1.8500985584528806
+      },
+      "current": {
+        "sigma_max": 0.011819357919646311,
+        "sigma_min": 3.452347042943919e-05,
+        "kappa": 342.3571782507587,
+        "effective_rank": 1.8424474212263626,
+        "frobenius_spectral_ratio": 1.8424474212263626
+      },
+      "top_left_cosine": 0.9794951487626631,
+      "top_right_cosine": 0.9991382235109187,
+      "relative_sigma_max_change": 0.029576782915389226
+    },
+    {
+      "phase": "mid",
+      "parameter": "blocks.3.out.weight",
+      "steps": [
+        150,
+        151
+      ],
+      "shape": [
+        512,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.0035363336141262763,
+        "sigma_min": 9.291872974054523e-08,
+        "kappa": 38058.35081905119,
+        "effective_rank": 2.915189570475369,
+        "frobenius_spectral_ratio": 2.915189570475369
+      },
+      "current": {
+        "sigma_max": 0.003431808278046226,
+        "sigma_min": 5.5717090786265524e-08,
+        "kappa": 61593.45776345128,
+        "effective_rank": 2.9667351320810926,
+        "frobenius_spectral_ratio": 2.9667351320810926
+      },
+      "top_left_cosine": 0.9046327114340154,
+      "top_right_cosine": 0.9422346811507067,
+      "relative_sigma_max_change": 0.029557543910029394
+    },
+    {
+      "phase": "mid",
+      "parameter": "blocks.3.gate.weight",
+      "steps": [
+        150,
+        151
+      ],
+      "shape": [
+        1344,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.00318311665187048,
+        "sigma_min": 1.5439961703101485e-05,
+        "kappa": 206.16091626905234,
+        "effective_rank": 2.2233844866703127,
+        "frobenius_spectral_ratio": 2.2233844866703127
+      },
+      "current": {
+        "sigma_max": 0.003068960134073749,
+        "sigma_min": 1.5641070118108224e-05,
+        "kappa": 196.21164734251172,
+        "effective_rank": 2.2657609904973834,
+        "frobenius_spectral_ratio": 2.2657609904973834
+      },
+      "top_left_cosine": 0.9352672057122718,
+      "top_right_cosine": 0.9929131772706563,
+      "relative_sigma_max_change": 0.03586312733140013
+    },
+    {
+      "phase": "mid",
+      "parameter": "blocks.3.up.weight",
+      "steps": [
+        150,
+        151
+      ],
+      "shape": [
+        1344,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.002867086367969267,
+        "sigma_min": 1.420924265366444e-05,
+        "kappa": 201.77615639703853,
+        "effective_rank": 2.265199117295672,
+        "frobenius_spectral_ratio": 2.265199117295672
+      },
+      "current": {
+        "sigma_max": 0.0027194544449894546,
+        "sigma_min": 1.4145337963095852e-05,
+        "kappa": 192.25093469553795,
+        "effective_rank": 2.3682187761312603,
+        "frobenius_spectral_ratio": 2.3682187761312603
+      },
+      "top_left_cosine": 0.8964141766131641,
+      "top_right_cosine": 0.9917488986041296,
+      "relative_sigma_max_change": 0.051491969209277386
+    },
+    {
+      "phase": "mid",
+      "parameter": "blocks.3.down.weight",
+      "steps": [
+        150,
+        151
+      ],
+      "shape": [
+        512,
+        1344
+      ],
+      "previous": {
+        "sigma_max": 0.00237742618454913,
+        "sigma_min": 3.853118619803973e-05,
+        "kappa": 61.70134945573208,
+        "effective_rank": 4.220349253333839,
+        "frobenius_spectral_ratio": 4.220349253333839
+      },
+      "current": {
+        "sigma_max": 0.0024358576785097922,
+        "sigma_min": 3.764119267913778e-05,
+        "kappa": 64.71255306051552,
+        "effective_rank": 4.100748176862535,
+        "frobenius_spectral_ratio": 4.100748176862535
+      },
+      "top_left_cosine": 0.8042132607103971,
+      "top_right_cosine": 0.7939555551302597,
+      "relative_sigma_max_change": 0.02457762699023333
+    },
+    {
+      "phase": "mid",
+      "parameter": "blocks.5.qkv.weight",
+      "steps": [
+        150,
+        151
+      ],
+      "shape": [
+        1536,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.002974530971076226,
+        "sigma_min": 1.6024674216045343e-05,
+        "kappa": 185.62193096555177,
+        "effective_rank": 2.4979645021064223,
+        "frobenius_spectral_ratio": 2.4979645021064223
+      },
+      "current": {
+        "sigma_max": 0.0028725272022697076,
+        "sigma_min": 1.575727211115036e-05,
+        "kappa": 182.29850839708567,
+        "effective_rank": 2.5188127750151734,
+        "frobenius_spectral_ratio": 2.5188127750151734
+      },
+      "top_left_cosine": 0.9716844457616477,
+      "top_right_cosine": 0.9975304698178633,
+      "relative_sigma_max_change": 0.03429238753887034
+    },
+    {
+      "phase": "mid",
+      "parameter": "blocks.5.out.weight",
+      "steps": [
+        150,
+        151
+      ],
+      "shape": [
+        512,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.0015956205896525838,
+        "sigma_min": 9.857369294473398e-08,
+        "kappa": 16187.083409233532,
+        "effective_rank": 2.947768078001336,
+        "frobenius_spectral_ratio": 2.947768078001336
+      },
+      "current": {
+        "sigma_max": 0.0015609339492531947,
+        "sigma_min": 2.4976350876767105e-09,
+        "kappa": 624964.7744599747,
+        "effective_rank": 2.959959233621227,
+        "frobenius_spectral_ratio": 2.959959233621227
+      },
+      "top_left_cosine": 0.9641381657036051,
+      "top_right_cosine": 0.9897108152887372,
+      "relative_sigma_max_change": 0.021738651797506194
+    },
+    {
+      "phase": "mid",
+      "parameter": "blocks.5.gate.weight",
+      "steps": [
+        150,
+        151
+      ],
+      "shape": [
+        1344,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.0016965608861801008,
+        "sigma_min": 1.2130348505984619e-05,
+        "kappa": 139.86085274821963,
+        "effective_rank": 3.514967308216188,
+        "frobenius_spectral_ratio": 3.514967308216188
+      },
+      "current": {
+        "sigma_max": 0.0016309180975915577,
+        "sigma_min": 1.2058979123601889e-05,
+        "kappa": 135.2451215708233,
+        "effective_rank": 3.685439493604657,
+        "frobenius_spectral_ratio": 3.685439493604657
+      },
+      "top_left_cosine": 0.9146738024989609,
+      "top_right_cosine": 0.9655176934559482,
+      "relative_sigma_max_change": 0.03869167863249599
+    },
+    {
+      "phase": "mid",
+      "parameter": "blocks.5.up.weight",
+      "steps": [
+        150,
+        151
+      ],
+      "shape": [
+        1344,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.0016441311223990421,
+        "sigma_min": 1.1152412043648771e-05,
+        "kappa": 147.42381432502438,
+        "effective_rank": 3.4601553256410753,
+        "frobenius_spectral_ratio": 3.4601553256410753
+      },
+      "current": {
+        "sigma_max": 0.0015969251988570904,
+        "sigma_min": 1.1343605808677823e-05,
+        "kappa": 140.77756454084889,
+        "effective_rank": 3.598399093853923,
+        "frobenius_spectral_ratio": 3.598399093853923
+      },
+      "top_left_cosine": 0.9469586511692206,
+      "top_right_cosine": 0.983308191443721,
+      "relative_sigma_max_change": 0.028711775416714304
+    },
+    {
+      "phase": "mid",
+      "parameter": "blocks.5.down.weight",
+      "steps": [
+        150,
+        151
+      ],
+      "shape": [
+        512,
+        1344
+      ],
+      "previous": {
+        "sigma_max": 0.003547321064383127,
+        "sigma_min": 2.7662072382678726e-05,
+        "kappa": 128.2377189716403,
+        "effective_rank": 4.385598497688935,
+        "frobenius_spectral_ratio": 4.385598497688935
+      },
+      "current": {
+        "sigma_max": 0.003497000544365567,
+        "sigma_min": 2.8035928948479688e-05,
+        "kappa": 124.73282232922764,
+        "effective_rank": 4.548084274402621,
+        "frobenius_spectral_ratio": 4.548084274402621
+      },
+      "top_left_cosine": 0.9485799378357127,
+      "top_right_cosine": 0.962922937056126,
+      "relative_sigma_max_change": 0.014185499170854005
+    },
+    {
+      "phase": "late",
+      "parameter": "blocks.0.qkv.weight",
+      "steps": [
+        299,
+        300
+      ],
+      "shape": [
+        1536,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.005916414046103903,
+        "sigma_min": 7.022497297975538e-05,
+        "kappa": 84.24943143530294,
+        "effective_rank": 3.507799915512367,
+        "frobenius_spectral_ratio": 3.507799915512367
+      },
+      "current": {
+        "sigma_max": 0.006188839259797271,
+        "sigma_min": 6.970457579639245e-05,
+        "kappa": 88.78669999907773,
+        "effective_rank": 3.4785786027182297,
+        "frobenius_spectral_ratio": 3.4785786027182297
+      },
+      "top_left_cosine": 0.7198446166740089,
+      "top_right_cosine": 0.8432464797306031,
+      "relative_sigma_max_change": 0.04604566407463769
+    },
+    {
+      "phase": "late",
+      "parameter": "blocks.0.out.weight",
+      "steps": [
+        299,
+        300
+      ],
+      "shape": [
+        512,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.01059444193694388,
+        "sigma_min": 1.343896203549545e-07,
+        "kappa": 78833.78127686851,
+        "effective_rank": 2.1557881639462693,
+        "frobenius_spectral_ratio": 2.1557881639462693
+      },
+      "current": {
+        "sigma_max": 0.011104477686447857,
+        "sigma_min": 8.979945568047914e-08,
+        "kappa": 123658.63024781985,
+        "effective_rank": 2.1383731221004503,
+        "frobenius_spectral_ratio": 2.1383731221004503
+      },
+      "top_left_cosine": 0.8595457372697501,
+      "top_right_cosine": 0.9804285650606035,
+      "relative_sigma_max_change": 0.04814182309361961
+    },
+    {
+      "phase": "late",
+      "parameter": "blocks.0.gate.weight",
+      "steps": [
+        299,
+        300
+      ],
+      "shape": [
+        1344,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.007231497154014507,
+        "sigma_min": 5.3384322465736275e-06,
+        "kappa": 1354.6106459730584,
+        "effective_rank": 1.711957670478661,
+        "frobenius_spectral_ratio": 1.711957670478661
+      },
+      "current": {
+        "sigma_max": 0.00778392063434753,
+        "sigma_min": 5.3683646145118145e-06,
+        "kappa": 1449.96124393376,
+        "effective_rank": 1.6771574210460276,
+        "frobenius_spectral_ratio": 1.6771574210460276
+      },
+      "top_left_cosine": 0.8692467301684095,
+      "top_right_cosine": 0.990676905651535,
+      "relative_sigma_max_change": 0.07639130163058279
+    },
+    {
+      "phase": "late",
+      "parameter": "blocks.0.up.weight",
+      "steps": [
+        299,
+        300
+      ],
+      "shape": [
+        1344,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.006689146612154473,
+        "sigma_min": 4.804537384551418e-06,
+        "kappa": 1392.2561272314908,
+        "effective_rank": 1.708122461096437,
+        "frobenius_spectral_ratio": 1.708122461096437
+      },
+      "current": {
+        "sigma_max": 0.007036329604568943,
+        "sigma_min": 4.581686668332202e-06,
+        "kappa": 1535.7509393217115,
+        "effective_rank": 1.6916998538898393,
+        "frobenius_spectral_ratio": 1.6916998538898393
+      },
+      "top_left_cosine": 0.8708794950381913,
+      "top_right_cosine": 0.991086543993325,
+      "relative_sigma_max_change": 0.05190243427818177
+    },
+    {
+      "phase": "late",
+      "parameter": "blocks.0.down.weight",
+      "steps": [
+        299,
+        300
+      ],
+      "shape": [
+        512,
+        1344
+      ],
+      "previous": {
+        "sigma_max": 0.006962599268934871,
+        "sigma_min": 4.851710800250855e-05,
+        "kappa": 143.50812642367046,
+        "effective_rank": 3.5020652942483683,
+        "frobenius_spectral_ratio": 3.5020652942483683
+      },
+      "current": {
+        "sigma_max": 0.009177921776258494,
+        "sigma_min": 4.772229706316315e-05,
+        "kappa": 192.31936308746825,
+        "effective_rank": 2.8109405348896677,
+        "frobenius_spectral_ratio": 2.8109405348896677
+      },
+      "top_left_cosine": 0.8063212858132023,
+      "top_right_cosine": 0.8304124520723855,
+      "relative_sigma_max_change": 0.31817463877430935
+    },
+    {
+      "phase": "late",
+      "parameter": "blocks.3.qkv.weight",
+      "steps": [
+        299,
+        300
+      ],
+      "shape": [
+        1536,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.006674220153723908,
+        "sigma_min": 1.7563924469713527e-05,
+        "kappa": 379.99594938093963,
+        "effective_rank": 1.8023620554465525,
+        "frobenius_spectral_ratio": 1.8023620554465525
+      },
+      "current": {
+        "sigma_max": 0.006638585431393471,
+        "sigma_min": 1.72743984796993e-05,
+        "kappa": 384.3019737674264,
+        "effective_rank": 1.9000957767206446,
+        "frobenius_spectral_ratio": 1.9000957767206446
+      },
+      "top_left_cosine": 0.8611801001886168,
+      "top_right_cosine": 0.9875205610671969,
+      "relative_sigma_max_change": 0.005339158959351195
+    },
+    {
+      "phase": "late",
+      "parameter": "blocks.3.out.weight",
+      "steps": [
+        299,
+        300
+      ],
+      "shape": [
+        512,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.0029504049578607298,
+        "sigma_min": 4.341041640768259e-09,
+        "kappa": 679653.6872976366,
+        "effective_rank": 2.4838962287110893,
+        "frobenius_spectral_ratio": 2.4838962287110893
+      },
+      "current": {
+        "sigma_max": 0.0030814831473567413,
+        "sigma_min": 1.8010313704036575e-08,
+        "kappa": 171095.4732935108,
+        "effective_rank": 2.4447981885099055,
+        "frobenius_spectral_ratio": 2.4447981885099055
+      },
+      "top_left_cosine": 0.7954553362321597,
+      "top_right_cosine": 0.952485588703727,
+      "relative_sigma_max_change": 0.04442718588401955
+    },
+    {
+      "phase": "late",
+      "parameter": "blocks.3.gate.weight",
+      "steps": [
+        299,
+        300
+      ],
+      "shape": [
+        1344,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.003090916772730771,
+        "sigma_min": 1.1183373873650544e-05,
+        "kappa": 276.3849986284877,
+        "effective_rank": 1.9281170948004398,
+        "frobenius_spectral_ratio": 1.9281170948004398
+      },
+      "current": {
+        "sigma_max": 0.0032197294985186636,
+        "sigma_min": 1.1342970517551902e-05,
+        "kappa": 283.8524082855116,
+        "effective_rank": 1.9527717225269356,
+        "frobenius_spectral_ratio": 1.9527717225269356
+      },
+      "top_left_cosine": 0.8916748970995685,
+      "top_right_cosine": 0.9935597412744075,
+      "relative_sigma_max_change": 0.04167460182827536
+    },
+    {
+      "phase": "late",
+      "parameter": "blocks.3.up.weight",
+      "steps": [
+        299,
+        300
+      ],
+      "shape": [
+        1344,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.0026428055699289706,
+        "sigma_min": 9.391582437660178e-06,
+        "kappa": 281.4015196556588,
+        "effective_rank": 1.8651946574579163,
+        "frobenius_spectral_ratio": 1.8651946574579163
+      },
+      "current": {
+        "sigma_max": 0.0027065523607510042,
+        "sigma_min": 9.259945154336409e-06,
+        "kappa": 292.2860033877774,
+        "effective_rank": 1.9004022966978475,
+        "frobenius_spectral_ratio": 1.9004022966978475
+      },
+      "top_left_cosine": 0.892157061312909,
+      "top_right_cosine": 0.9964981710968395,
+      "relative_sigma_max_change": 0.024120878034832868
+    },
+    {
+      "phase": "late",
+      "parameter": "blocks.3.down.weight",
+      "steps": [
+        299,
+        300
+      ],
+      "shape": [
+        512,
+        1344
+      ],
+      "previous": {
+        "sigma_max": 0.0015978071721989373,
+        "sigma_min": 2.7121730581202784e-05,
+        "kappa": 58.91243434540741,
+        "effective_rank": 4.284848893150339,
+        "frobenius_spectral_ratio": 4.284848893150339
+      },
+      "current": {
+        "sigma_max": 0.001682210558015037,
+        "sigma_min": 2.7764391232823604e-05,
+        "kappa": 60.58877876732607,
+        "effective_rank": 4.170687388245992,
+        "frobenius_spectral_ratio": 4.170687388245992
+      },
+      "top_left_cosine": 0.33390398016737,
+      "top_right_cosine": 0.3080987585269186,
+      "relative_sigma_max_change": 0.052824513048055605
+    },
+    {
+      "phase": "late",
+      "parameter": "blocks.5.qkv.weight",
+      "steps": [
+        299,
+        300
+      ],
+      "shape": [
+        1536,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.0017927659521674852,
+        "sigma_min": 1.2798213029523704e-05,
+        "kappa": 140.07939608692422,
+        "effective_rank": 3.1346731493986475,
+        "frobenius_spectral_ratio": 3.1346731493986475
+      },
+      "current": {
+        "sigma_max": 0.0019670819499034305,
+        "sigma_min": 1.3037279017496821e-05,
+        "kappa": 150.88132633070802,
+        "effective_rank": 2.9800456153322106,
+        "frobenius_spectral_ratio": 2.9800456153322106
+      },
+      "top_left_cosine": 0.8341071611940192,
+      "top_right_cosine": 0.9669205712161819,
+      "relative_sigma_max_change": 0.09723299213999138
+    },
+    {
+      "phase": "late",
+      "parameter": "blocks.5.out.weight",
+      "steps": [
+        299,
+        300
+      ],
+      "shape": [
+        512,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.0013829918890078032,
+        "sigma_min": 1.7298356812064007e-08,
+        "kappa": 79949.32143169195,
+        "effective_rank": 2.670058993325405,
+        "frobenius_spectral_ratio": 2.670058993325405
+      },
+      "current": {
+        "sigma_max": 0.0014369836828085855,
+        "sigma_min": 1.6808367579005734e-09,
+        "kappa": 854921.6192793348,
+        "effective_rank": 2.616322501623013,
+        "frobenius_spectral_ratio": 2.616322501623013
+      },
+      "top_left_cosine": 0.846423291096577,
+      "top_right_cosine": 0.9638354917419529,
+      "relative_sigma_max_change": 0.0390398484835059
+    },
+    {
+      "phase": "late",
+      "parameter": "blocks.5.gate.weight",
+      "steps": [
+        299,
+        300
+      ],
+      "shape": [
+        1344,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.0016490766054795452,
+        "sigma_min": 1.1411588912340875e-05,
+        "kappa": 144.5089389520664,
+        "effective_rank": 3.5752003333839095,
+        "frobenius_spectral_ratio": 3.5752003333839095
+      },
+      "current": {
+        "sigma_max": 0.001662813918484585,
+        "sigma_min": 1.1198439197810377e-05,
+        "kappa": 148.48622108067647,
+        "effective_rank": 3.6222099489707253,
+        "frobenius_spectral_ratio": 3.6222099489707253
+      },
+      "top_left_cosine": 0.40780797538371905,
+      "top_right_cosine": 0.4635220682943626,
+      "relative_sigma_max_change": 0.008330306160061673
+    },
+    {
+      "phase": "late",
+      "parameter": "blocks.5.up.weight",
+      "steps": [
+        299,
+        300
+      ],
+      "shape": [
+        1344,
+        512
+      ],
+      "previous": {
+        "sigma_max": 0.0017275106295898748,
+        "sigma_min": 1.0346193979862076e-05,
+        "kappa": 166.97063992346528,
+        "effective_rank": 3.3714044673430004,
+        "frobenius_spectral_ratio": 3.3714044673430004
+      },
+      "current": {
+        "sigma_max": 0.0017653496843468793,
+        "sigma_min": 1.027546959841133e-05,
+        "kappa": 171.80233637398103,
+        "effective_rank": 3.374997863011989,
+        "frobenius_spectral_ratio": 3.374997863011989
+      },
+      "top_left_cosine": 0.887515010628366,
+      "top_right_cosine": 0.9365630298566868,
+      "relative_sigma_max_change": 0.021903804300172556
+    },
+    {
+      "phase": "late",
+      "parameter": "blocks.5.down.weight",
+      "steps": [
+        299,
+        300
+      ],
+      "shape": [
+        512,
+        1344
+      ],
+      "previous": {
+        "sigma_max": 0.0026149356155951787,
+        "sigma_min": 2.7944427566578736e-05,
+        "kappa": 93.57628133068707,
+        "effective_rank": 4.665224606687248,
+        "frobenius_spectral_ratio": 4.665224606687248
+      },
+      "current": {
+        "sigma_max": 0.0025360650296865563,
+        "sigma_min": 2.7514808445714275e-05,
+        "kappa": 92.1709135169929,
+        "effective_rank": 4.830381036908746,
+        "frobenius_spectral_ratio": 4.830381036908746
+      },
+      "top_left_cosine": 0.8838206616900215,
+      "top_right_cosine": 0.8958869386959831,
+      "relative_sigma_max_change": 0.03016157852539358
+    }
+  ]
+}

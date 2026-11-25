@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>domainus/ai daily research · 2026-11-25</title><style>
+* { box-sizing: border-box }
+body { margin: 0; color: var(--foreground); font: 15px/1.45 var(--font-sans), sans-serif }
+main { width: 100%; overflow-wrap: anywhere }
+section + section { margin-top: 24px; border-top: 1px solid var(--border); padding-top: 16px }
+h1, h2, h3, p, dl, dd, ol, ul, figure { margin: 0 }
+h1 { font-size: 1.05rem } h2 { font-size: 1.16rem; margin-bottom: 10px }
+h3 { font-size: .95rem; margin-bottom: 6px }
+.meta, .pills { display: flex; align-items: baseline; gap: 5px 12px; flex-wrap: wrap }
+.meta { margin-bottom: 10px } .meta time { margin-left: auto }
+time, .note, dt, figcaption { color: var(--muted-foreground); font-size: .82rem }
+.kpis, .board { display: grid; gap: 8px; grid-template-columns: repeat(4, minmax(0, 1fr)) }
+.kpis > div { background: var(--card); padding: 16px; border-radius: var(--radius) }
+.kpis dd { font-size: 1.3rem; font-weight: 650; font-variant-numeric: tabular-nums }
+.board { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px }
+.done { color: var(--success) } .wip { color: var(--info) } .risk { color: var(--destructive) }
+ul, ol { padding-inline-start: 1.25rem } li + li { margin-top: .3rem }
+.host { margin-bottom: 8px } .pill { border: 1px solid var(--border); border-radius: 1em; padding: 1px 8px; font-size: .78rem }
+details, figure + figure, .subhead { margin-top: 12px } summary { cursor: pointer }
+svg { display: block; width: 100%; color: var(--muted-foreground) }
+svg text { fill: currentColor; font: 12px var(--font-sans), sans-serif }
+.axis { fill: none; stroke: var(--border) } .front { stroke: var(--primary); fill: none; stroke-dasharray: 4 3 }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; font-size: .85rem }
+th, td { padding: 4px 0; text-align: right; border-bottom: 1px solid var(--border) }
+th:first-child, td:first-child { text-align: left }
+@media (max-width: 580px) {
+  .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)) }
+  .board { grid-template-columns: 1fr } .meta time { margin-left: 0 }
+}
+</style></head>
+<body><main>
+<section aria-label="Research overview"><header class="meta"><h1>domainus/ai</h1><strong>Cycle 1</strong>
+<time datetime="2026-11-25T07:58:00-07:00">2026-11-25T07:58:00-07:00</time></header><dl class="kpis"><div><dt>Experiments Run</dt><dd>0</dd></div><div><dt>Verified Wins</dt><dd>0</dd></div><div><dt>Best Speedup vs SOTA</dt><dd>Pending</dd></div><div><dt>Tests &amp; Dual Audits</dt><dd>0 tests · 0 audits</dd></div></dl></section>
+<section><h2>Benchmark Comparison &amp; Pareto Chart</h2><p class="note">Awaiting paired latency and polar error measurements.</p></section>
+<section><h2>Status Board</h2><div class="board"><div><h3 class="done">Completed</h3><p class="note">No completions recorded.</p></div><div><h3 class="wip">Work In Progress</h3><ul><li>Bootstrap domainus/ai public GitHub repository and fleet clones</li><li>Configure Blackwell sm_120 PyTorch + Triton environment on bazzite</li><li>Implement late-2026 SOTA polar baselines (Jordan, PolarExpress, GramNS, PolarSwitch) &amp; real LM gradient harvesting</li><li>Search ultra-short circuits with warm-started spectral pre-scaling</li><li>Develop Blackwell sm_120 Triton SYRK &amp; FP8-early/BF16-late kernels</li><li>Build automated HTML infographic generator &amp; Apple Silicon MLX benchmark</li></ul></div><div><h3 class="risk">Blockers &amp; Risks</h3><p class="note">No blockers recorded.</p></div></div></section>
+<section><h2>Fleet Hardware &amp; Multi-Model Adversarial Audit Ledger</h2><div class="host"><div class="pills"><strong>bazzite</strong><span class="pill">online</span></div><p class="note">Linux x64 | RTX 5080 16GB (sm_120) | Ryzen 7 5800X3D</p></div><div class="host"><div class="pills"><strong>MacBook Pro</strong><span class="pill">pending clone</span></div><p class="note">macOS arm64 | Apple Silicon</p></div><div class="host"><div class="pills"><strong>MacBook Air</strong><span class="pill">pending check</span></div><p class="note">macOS arm64 | Apple Silicon</p></div><h3 class="subhead">Adversarial audit verdicts</h3><ul><li><strong>Claude Opus 5.5</strong> · Pending</li><li><strong>GPT 6.2 Sol</strong> · Pending</li></ul><details><summary>Recent research ledger entries</summary><ul><li>Initialized domainus/ai research program targeting verifiable low-precision polar orthogonalization and Blackwell/Apple Silicon kernels.</li></ul></details><details><summary>Device benchmark records</summary><ul><li>bazzite · cpu · full · 15/15 finite outputs (cpu_reference_cycle1.json)</li></ul></details></section>
+<section><h2>Next Autonomous Sprint Queue</h2><ol><li>Complete Cycle 1 parallel experiments across fleet</li><li>Run unified RTX 5080 Tier-1 head-to-head benchmark</li><li>Execute Dual Cross-Model Adversarial Review (Claude Opus 5.5 + GPT 6.2 Sol)</li><li>Promote surviving Cycle 1 candidates to Tier-2 multi-seed LM pretraining</li></ol></section>
+</main></body></html>
