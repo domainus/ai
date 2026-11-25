@@ -179,26 +179,20 @@ def test_quality_detects_finite_and_nonfinite_divergence():
     assert row["diverged"] and not row["finite"] and row["sigma_max"] is None
 
 
-def test_metal_tile_contract():
-    for source in (kernels._METAL_SYRK_SOURCE, kernels._METAL_SYMPROD_SOURCE):
-        assert "const uint row = tile - col * (col + 1) / 2" in source
-        assert "r < n && h < k" in source and "c < n && h < k" in source
-        assert "threadgroup float left" in source and "threadgroup_barrier" in source
-        assert "simdgroup_float8x8 acc" in source and "simdgroup_multiply_accumulate" in source
-        assert "r < n && c < n && r <= c" in source
-        assert "out[r * n + c] = value" in source and "if (r != c) out[c * n + r] = value" in source
-    for n, k in ((1, 1), (33, 17), (2048, 2048), (4096, 4096)):
-        # Capture the actual MLX dispatch geometry even on Linux.
+@pytest.mark.parametrize("tile_size", [32, 64])
+def test_metal_tile_contract(tile_size):
+    for n, k in ((1, 1), (33, 17), (67, 35), (2048, 2048), (4096, 4096)):
         core = SimpleNamespace(gpu=object())
         def kernel(**kwargs):
-            group_count, rem = divmod(kwargs["grid"][0], kwargs["threadgroup"][0])
-            assert rem == 0 and kwargs["threadgroup"] == (128, 1, 1)
-            tiles = (n + 31) // 32
-            assert group_count == tiles * (tiles + 1) // 2
+            tiles = (n + tile_size - 1) // tile_size
+            assert kwargs["grid"] == (128 * tiles * (tiles + 1) // 2, 1, 1)
+            assert kwargs["threadgroup"] == (128, 1, 1)
             assert kwargs["output_shapes"] == [(n, n)]
+            assert dict(kwargs["template"]) == {"T": "T", "B": tile_size}
             return ["tile launch"]
         with patch.dict(sys.modules, {"mlx": SimpleNamespace(core=core), "mlx.core": core}):
-            assert kernels._launch_metal(kernel, SimpleNamespace(shape=(n, k), dtype="T")) == "tile launch"
+            x = SimpleNamespace(shape=(n, k), dtype="T")
+            assert kernels._launch_metal(kernel, x, tile_size=tile_size) == "tile launch"
 
 
 def test_lazy_metal_compile_failure_falls_back_once(monkeypatch):
@@ -212,7 +206,7 @@ def test_lazy_metal_compile_failure_falls_back_once(monkeypatch):
     x = np.arange(15, dtype=np.float32).reshape(3, 5)
     gram = x @ x.T
     bias = np.eye(3, dtype=np.float32)
-    monkeypatch.setattr(kernels, "_launch_metal", lambda *args: "probe")
+    monkeypatch.setattr(kernels, "_launch_metal", lambda *args, **kwargs: kwargs["tile_size"])
     kernels._metal_kernel.cache_clear()
     try:
         with patch.dict(sys.modules, {"mlx": SimpleNamespace(core=core), "mlx.core": core}):
@@ -221,7 +215,7 @@ def test_lazy_metal_compile_failure_falls_back_once(monkeypatch):
             np.testing.assert_array_equal(kernels.metal_syrk(x), gram)
             with pytest.warns(RuntimeWarning, match="symprod unavailable"):
                 np.testing.assert_array_equal(kernels.metal_symprod(x, bias, 1, 2, 3), gram + 5 * bias)
-            assert probes == ["probe", "probe"]
+            assert probes == [64, 32, 64, 32]
     finally:
         kernels._metal_kernel.cache_clear()
 
@@ -232,9 +226,9 @@ def test_live_metal_syrk_and_fused_symprod(dtype):
     import mlx.core as mx
     fmt = getattr(mx, dtype)
     # Fail if these calls fall back. Dense matmul can also produce exact symmetry.
-    assert kernels._metal_kernel(fmt, False) is not None
-    assert kernels._metal_kernel(fmt, True) is not None
-    for shape in ((1, 1), (32, 32), (67, 35)):
+    for shape in ((1, 1), (32, 32), (33, 17), (67, 35)):
+        for fused in (False, True):
+            assert kernels._metal_kernel(fmt, fused, np.prod(shape) < 8) is not None
         # Transposed input also checks the custom kernel's row-contiguous copy.
         x = mx.array(np.random.default_rng(4).normal(size=shape[::-1]).astype(np.float32)).astype(fmt).T
         xf = kernels.as_numpy(x).astype(np.float64)
@@ -247,3 +241,19 @@ def test_live_metal_syrk_and_fused_symprod(dtype):
             assert mx.max(mx.abs(actual - actual.T)).item() == 0
             tol = {"float32": 5e-5, "float16": 1e-3, "bfloat16": 5e-3}[dtype]
             np.testing.assert_allclose(kernels.as_numpy(actual), target, rtol=tol, atol=tol)
+
+    # Repeated integer-valued rows give an exact, inexpensive FP64 oracle
+    # for every output element, including the bottom-right tile.
+    for n in (2048, 4096):
+        basis = np.random.default_rng(n).integers(-1, 2, size=(19, n)).astype(np.float64)
+        gram = mx.array((basis @ basis.T).astype(np.float32))
+        indices = mx.arange(n) % len(basis)
+        x = mx.array(basis.astype(np.float32)).astype(fmt)[indices]
+        reference = gram[indices[:, None], indices[None, :]]
+        eye = mx.eye(n)
+        for actual, target in (
+            (kernels.metal_syrk(x), reference),
+            (kernels.metal_symprod(x, eye.astype(fmt), -.5, 2., -.25), -.5 * reference + 1.75 * eye),
+        ):
+            assert mx.max(mx.abs(actual - actual.T)).item() == 0
+            assert mx.all(actual == target.astype(fmt)).item()

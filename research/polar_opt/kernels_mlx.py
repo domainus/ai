@@ -145,16 +145,40 @@ def hardware_metadata():
 
 DTYPES = ("float32", "float16", "bfloat16")
 
-# A 128-thread group computes one upper 32x32 tile. Each Apple SIMD group
-# accumulates four 8x8 blocks. Only the epilogue differs between PS and SYRK.
-_METAL_TILE_SOURCE = """
+# Each threadgroup owns one upper tile and writes both halves from the same value.
+_METAL_TILE_INDEX = """
     const uint n = x_shape[0], k = x_shape[1];
     const uint tile = threadgroup_position_in_grid.x;
     uint col = uint((sqrt(8.0f * float(tile) + 1.0f) - 1.0f) * 0.5f);
-    // Correct rounding at triangular-number boundaries.
     if (col * (col + 1) / 2 > tile) --col;
     if ((col + 1) * (col + 2) / 2 <= tile) ++col;
     const uint row = tile - col * (col + 1) / 2;
+"""
+
+# Metal 4 reads bounded tensor slices in native precision and holds the result
+# in an FP32 cooperative tensor through the affine epilogue.
+_METAL_TENSOR_SOURCE = _METAL_TILE_INDEX + """
+    using namespace mpp::tensor_ops;
+    using dims = dextents<int, 2>;
+    // MPP requires a mutable tensor type even for its read-only operands.
+    tensor<device T, dims, tensor_inline> matrix(const_cast<device T*>(x), dims(k, n));
+    auto left = matrix.slice(0, row * B);
+    auto right = matrix.slice(0, col * B);
+    constexpr auto desc = matmul2d_descriptor(B, B, int(dynamic_extent), false, true, false);
+    matmul2d<desc, execution_simdgroups<4>> op;
+    auto acc = op.template get_destination_cooperative_tensor<decltype(left), decltype(right), float>();
+    op.run(left, right, acc);
+    #pragma clang loop unroll(full)
+    for (ushort i = 0; i < acc.get_capacity(); ++i) {
+        if (!acc.is_valid_element(i)) continue;
+        auto xy = acc.get_multidimensional_index(i);
+        const uint r = row * B + xy[1], c = col * B + xy[0];
+        if (r < n && c < n && r <= c) {
+            const float product = acc[i];
+"""
+
+# Earlier Metal implementations use the 32x32 SIMD-group kernel.
+_METAL_SIMDGROUP_SOURCE = _METAL_TILE_INDEX + """
     const uint tid = thread_position_in_threadgroup.x;
     const uint subgroup = simdgroup_index_in_threadgroup;
     const uint sr = (subgroup / 2) * 16, sc = (subgroup % 2) * 16;
@@ -190,6 +214,7 @@ _METAL_TILE_SOURCE = """
     for (uint t = tid; t < 32 * 32; t += 128) {
         const uint r = row * 32 + t / 32, c = col * 32 + t % 32;
         if (r < n && c < n && r <= c) {
+            const float product = result[t];
 """
 
 _METAL_MIRROR = """
@@ -198,50 +223,59 @@ _METAL_MIRROR = """
         }
     }
 """
-_METAL_SYRK_SOURCE = _METAL_TILE_SOURCE + "const T value = T(result[t]);" + _METAL_MIRROR
-_METAL_SYMPROD_SOURCE = _METAL_TILE_SOURCE + """
-            const T value = T(coeff[0] * result[t] + coeff[1] * float(addend[r * n + c])
+_METAL_AFFINE = """
+            const T value = T(coeff[0] * product + coeff[1] * float(addend[r * n + c])
                               + (r == c ? coeff[2] : 0.0f));
-""" + _METAL_MIRROR
+"""
 
 
-def _launch_metal(kernel, x, *extra):
+def _launch_metal(kernel, x, *extra, tile_size):
     import mlx.core as mx
     n = x.shape[0]
-    tiles = (n + 31) // 32
-    return kernel(inputs=[x, *extra], template=[("T", x.dtype)],
+    tiles = (n + tile_size - 1) // tile_size
+    return kernel(inputs=[x, *extra], template=[("T", x.dtype), ("B", tile_size)],
                   grid=(128 * (tiles * (tiles + 1) // 2), 1, 1),
                   threadgroup=(128, 1, 1), output_shapes=[(n, n)],
                   output_dtypes=[x.dtype], stream=mx.gpu)[0]
 
 
 @lru_cache(maxsize=None)
-def _metal_kernel(dtype, fused):
-    """Compile and evaluate once per specialization, before any timed launches."""
+def _metal_kernel(dtype, fused, tiny=False):
+    """Probe the Metal 4 kernel, then the portable SIMD-group implementation."""
     import mlx.core as mx
-    try:
-        kernel = mx.fast.metal_kernel(
-            name="polar_symprod" if fused else "polar_syrk",
-            input_names=["x", "addend", "coeff"] if fused else ["x"],
-            output_names=["out"], ensure_row_contiguous=True,
-            header="#include <metal_simdgroup_matrix>\nusing namespace metal;",
-            source=_METAL_SYMPROD_SOURCE if fused else _METAL_SYRK_SOURCE)
-        probe = mx.ones((32, 32), dtype=dtype)
-        extra = (probe, mx.ones((3,))) if fused else ()
-        mx.eval(_launch_metal(kernel, probe, *extra))
-    except (RuntimeError, ValueError, AttributeError) as exc:
-        warnings.warn(f"Metal {'symprod' if fused else 'SYRK'} unavailable for {dtype}, "
-                      f"using dense matmul ({exc})", RuntimeWarning, stacklevel=2)
-        return None
-    return kernel
+    name = "symprod" if fused else "syrk"
+    epilogue = _METAL_AFFINE if fused else "const T value = T(product);"
+    for tile_size, header, body in (
+        (64, "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>", _METAL_TENSOR_SOURCE),
+        (32, "#include <metal_simdgroup_matrix>", _METAL_SIMDGROUP_SOURCE),
+    ):
+        # MLX binds inputs with fewer than eight elements in constant memory.
+        # The SIMD-group shader can read either address space.
+        if tiny and tile_size == 64:
+            continue
+        try:
+            kernel = mx.fast.metal_kernel(
+                name=f"polar_{name}_{tile_size}", input_names=["x", "addend", "coeff"] if fused else ["x"],
+                output_names=["out"], ensure_row_contiguous=True,
+                header=header + "\nusing namespace metal;", source=body + epilogue + _METAL_MIRROR)
+            launch = partial(_launch_metal, kernel, tile_size=tile_size)
+            probe = mx.ones((1, 1) if tiny else (tile_size, tile_size), dtype=dtype)
+            extra = (probe, mx.ones((3,))) if fused else ()
+            mx.eval(launch(probe, *extra))
+            return launch
+        except (RuntimeError, ValueError, AttributeError) as exc:
+            if tile_size == 32:
+                warnings.warn(f"Metal {'symprod' if fused else 'SYRK'} unavailable for {dtype}, "
+                              f"using dense matmul ({exc})", RuntimeWarning, stacklevel=2)
+    return None
 
 
 def metal_syrk(x):
     """Row Gram on MLX GPU. Use native matmul if the shader cannot compile."""
     if x.ndim != 2 or min(x.shape) == 0:
         raise ValueError("Expected a nonempty 2-D Metal input")
-    kernel = _metal_kernel(x.dtype, False)
-    return _launch_metal(kernel, x) if kernel is not None else x @ x.T
+    kernel = _metal_kernel(x.dtype, False, x.size < 8)
+    return kernel(x) if kernel is not None else x @ x.T
 
 
 @lru_cache(maxsize=32)
@@ -258,9 +292,9 @@ def metal_symprod(x, addend, a, b, c):
     import mlx.core as mx
     if x.ndim != 2 or min(x.shape) == 0 or addend.shape != (x.shape[0], x.shape[0]):
         raise ValueError("Expected a nonempty matrix and a square addend matching its row count")
-    kernel = _metal_kernel(x.dtype, True)
+    kernel = _metal_kernel(x.dtype, True, x.size < 8)
     if kernel is not None:
-        return _launch_metal(kernel, x, addend, _metal_coefficients(a, b, c))
+        return kernel(x, addend, _metal_coefficients(a, b, c))
     return (a * (x @ x.T).astype(mx.float32) + b * addend.astype(mx.float32)
             + c * mx.eye(x.shape[0])).astype(x.dtype)
 
@@ -458,8 +492,8 @@ def _measure(x, reference, backend, dtype, requested, rng, warmups, repeats):
     if requested and backend == "mlx":
         import mlx.core as mx
         work_dtype = getattr(mx, dtype)
-        syrk = _metal_kernel(work_dtype, False) is not None
-        symprod = _metal_kernel(work_dtype, True) is not None
+        syrk = _metal_kernel(work_dtype, False, x.size < 8) is not None
+        symprod = _metal_kernel(work_dtype, True, min(x.shape) ** 2 < 8) is not None
     for block in _block_orders(rng, warmups):
         for name in block:
             synchronize(calls[name](), backend)
@@ -535,6 +569,7 @@ def benchmark(*, backend="auto", quick=False, warmups=5, repeats=20, seed=0, see
             "dtype": dtypes[0] if len(dtypes) == 1 else list(dtypes), "dtypes": list(dtypes),
             "input_dtype": "float32", "use_metal_syrk_requested": use_metal_syrk,
             "use_metal_syrk": any(r["use_metal_syrk"] for r in rows),
+            "use_metal_symprod": any(r["use_metal_symprod"] for r in rows),
             "reference": f"numpy_{reference_dtype}_svd", "error_metric": "relative_frobenius",
             "divergence_limit": 2.0, "divergences": sum(r["diverged"] for r in rows),
             "warmups": warmups, "repeats": repeats, "method_order": orders, "results": rows}
