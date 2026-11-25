@@ -1,0 +1,280 @@
+{
+  "backend": "mlx",
+  "library": "mlx",
+  "library_version": "0.32.5",
+  "thread_environment": {},
+  "hardware": {
+    "machine": "arm64",
+    "system": "Darwin",
+    "release": "27.2.0",
+    "hostname": "Ryans-MacBook-Pro.local",
+    "machdep.cpu.brand_string": "Apple M5 Max",
+    "hw.model": "Mac17,7",
+    "hw.memsize": "137438953472"
+  },
+  "quick": false,
+  "seed": 0,
+  "created_at": "2026-11-25T16:53:55.261801+00:00",
+  "dtype": "float32",
+  "reference": "numpy_float64_svd",
+  "error_metric": "relative_frobenius",
+  "warmups": 1,
+  "repeats": 5,
+  "results": [
+    {
+      "method": "jordan_ns5",
+      "shape": [
+        512,
+        2048
+      ],
+      "latency_ms": 1.410542,
+      "samples_ms": [
+        2.9105,
+        2.597458,
+        1.410542,
+        1.402625,
+        1.31525
+      ],
+      "polar_error": 0.1456195005325318,
+      "finite": true
+    },
+    {
+      "method": "polar_express",
+      "shape": [
+        512,
+        2048
+      ],
+      "latency_ms": 1.081959,
+      "samples_ms": [
+        1.289375,
+        1.053917,
+        1.092875,
+        1.056791,
+        1.081959
+      ],
+      "polar_error": 0.08778786667737173,
+      "finite": true
+    },
+    {
+      "method": "gram_ns",
+      "shape": [
+        512,
+        2048
+      ],
+      "latency_ms": 2.050084,
+      "samples_ms": [
+        2.165291,
+        2.076708,
+        2.050084,
+        1.146,
+        0.999167
+      ],
+      "polar_error": 0.09456159510390202,
+      "finite": true
+    },
+    {
+      "method": "PS2_55",
+      "shape": [
+        512,
+        2048
+      ],
+      "latency_ms": 1.031,
+      "samples_ms": [
+        1.035667,
+        1.041209,
+        1.021792,
+        1.013334,
+        1.031
+      ],
+      "polar_error": 0.06854825896523453,
+      "finite": true
+    },
+    {
+      "method": "PS3_55",
+      "shape": [
+        512,
+        2048
+      ],
+      "latency_ms": 1.027209,
+      "samples_ms": [
+        1.103667,
+        1.027209,
+        1.028,
+        0.995334,
+        1.019167
+      ],
+      "polar_error": 0.06177459224957659,
+      "finite": true
+    },
+    {
+      "method": "jordan_ns5",
+      "shape": [
+        1024,
+        4096
+      ],
+      "latency_ms": 3.35575,
+      "samples_ms": [
+        4.755125,
+        3.535792,
+        3.2925,
+        3.308916,
+        3.35575
+      ],
+      "polar_error": 0.16012095813909408,
+      "finite": true
+    },
+    {
+      "method": "polar_express",
+      "shape": [
+        1024,
+        4096
+      ],
+      "latency_ms": 3.3415,
+      "samples_ms": [
+        3.380166,
+        3.3395,
+        3.327791,
+        3.365958,
+        3.3415
+      ],
+      "polar_error": 0.09493757438804931,
+      "finite": true
+    },
+    {
+      "method": "gram_ns",
+      "shape": [
+        1024,
+        4096
+      ],
+      "latency_ms": 2.294416,
+      "samples_ms": [
+        2.316583,
+        2.301917,
+        2.294416,
+        2.292583,
+        2.280292
+      ],
+      "polar_error": 0.10297573702035413,
+      "finite": true
+    },
+    {
+      "method": "PS2_55",
+      "shape": [
+        1024,
+        4096
+      ],
+      "latency_ms": 2.276292,
+      "samples_ms": [
+        2.276292,
+        2.276125,
+        2.204542,
+        2.289,
+        2.304292
+      ],
+      "polar_error": 0.062248730675474616,
+      "finite": true
+    },
+    {
+      "method": "PS3_55",
+      "shape": [
+        1024,
+        4096
+      ],
+      "latency_ms": 2.19125,
+      "samples_ms": [
+        2.206375,
+        2.172792,
+        2.1825,
+        2.213958,
+        2.19125
+      ],
+      "polar_error": 0.06263213835623001,
+      "finite": true
+    },
+    {
+      "method": "jordan_ns5",
+      "shape": [
+        2048,
+        2048
+      ],
+      "latency_ms": 6.744125,
+      "samples_ms": [
+        6.744125,
+        6.817542,
+        6.704708,
+        6.727917,
+        6.774333
+      ],
+      "polar_error": 0.22334616394154058,
+      "finite": true
+    },
+    {
+      "method": "polar_express",
+      "shape": [
+        2048,
+        2048
+      ],
+      "latency_ms": 6.747,
+      "samples_ms": [
+        6.792333,
+        6.686,
+        6.751083,
+        6.743291,
+        6.747
+      ],
+      "polar_error": 0.13767678124715202,
+      "finite": true
+    },
+    {
+      "method": "gram_ns",
+      "shape": [
+        2048,
+        2048
+      ],
+      "latency_ms": 6.75825,
+      "samples_ms": [
+        6.765584,
+        6.711334,
+        6.75825,
+        6.725125,
+        6.777875
+      ],
+      "polar_error": 0.1472732512515298,
+      "finite": true
+    },
+    {
+      "method": "PS2_55",
+      "shape": [
+        2048,
+        2048
+      ],
+      "latency_ms": 7.652541,
+      "samples_ms": [
+        7.652541,
+        7.642375,
+        7.689125,
+        7.663209,
+        7.644958
+      ],
+      "polar_error": 0.12248944779209785,
+      "finite": true
+    },
+    {
+      "method": "PS3_55",
+      "shape": [
+        2048,
+        2048
+      ],
+      "latency_ms": 7.703584,
+      "samples_ms": [
+        7.717625,
+        7.703584,
+        7.693208,
+        7.724292,
+        7.699959
+      ],
+      "polar_error": 0.11454181030417966,
+      "finite": true
+    }
+  ]
+}
