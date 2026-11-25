@@ -1,0 +1,53 @@
+{
+  "program": "Autonomous Verifiable AI Research",
+  "repo": "https://github.com/domainus/ai",
+  "cycle": 1,
+  "phase": "initializing",
+  "last_updated": "2026-11-25T07:58:00-07:00",
+  "fleet": {
+    "bazzite": {
+      "environment_id": "6fb39dcd-f3b7-4929-a1d5-637d67eb79bb",
+      "hardware": "Linux x64 | RTX 5080 16GB (sm_120) | Ryzen 7 5800X3D",
+      "status": "online",
+      "role": "CUDA/Triton kernels, gradient harvesting, Tier-1/Tier-2 RTX 5080 verification"
+    },
+    "macbook_pro": {
+      "environment_id": "fbc39183-5d33-4276-af14-3cb027511e92",
+      "hardware": "macOS arm64 | Apple Silicon",
+      "status": "pending_clone",
+      "role": "Spectral upper-bound theory, polynomial circuit search, MLX experiments"
+    },
+    "macbook_air": {
+      "environment_id": "01096d9f-87f1-432f-b1d9-49c309d1458f",
+      "hardware": "macOS arm64 | Apple Silicon",
+      "status": "pending_check",
+      "role": "Infographic generator, MLX/MPS benchmarks"
+    }
+  },
+  "kpis": {
+    "experiments_run": 0,
+    "verified_wins": 0,
+    "best_speedup_vs_pe": null,
+    "best_speedup_vs_ps": null,
+    "tests_passing": 0,
+    "audits_completed": 0
+  },
+  "completed": [],
+  "wip": [
+    "Bootstrap domainus/ai public GitHub repository and fleet clones",
+    "Configure Blackwell sm_120 PyTorch + Triton environment on bazzite",
+    "Implement late-2026 SOTA polar baselines (Jordan, PolarExpress, GramNS, PolarSwitch) & real LM gradient harvesting",
+    "Search ultra-short circuits with warm-started spectral pre-scaling",
+    "Develop Blackwell sm_120 Triton SYRK & FP8-early/BF16-late kernels",
+    "Build automated HTML infographic generator & Apple Silicon MLX benchmark"
+  ],
+  "blockers": [],
+  "audits": [],
+  "leaderboard": [],
+  "next_queue": [
+    "Complete Cycle 1 parallel experiments across fleet",
+    "Run unified RTX 5080 Tier-1 head-to-head benchmark",
+    "Execute Dual Cross-Model Adversarial Review (Claude Opus 5.5 + GPT 6.2 Sol)",
+    "Promote surviving Cycle 1 candidates to Tier-2 multi-seed LM pretraining"
+  ]
+}

@@ -1,0 +1,30 @@
+# Environments & Caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.DS_Store
+
+# Model weights, large tensors, datasets & scratch artifacts
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.ckpt
+*.npy
+*.npz
+artifacts/
+data/
+checkpoints/
+logs/
+*.log
+
+# Build artifacts
+build/
+dist/
+*.so
