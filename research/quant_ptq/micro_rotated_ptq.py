@@ -143,8 +143,11 @@ def to_e4m3(x: Tensor) -> Tensor:
     return x.clamp(max=E4M3_MAX).to(torch.float8_e4m3fn).to(x.dtype)
 
 
+FP16_MAX = float(torch.finfo(torch.float16).max)
+
+
 def to_fp16(x: Tensor) -> Tensor:
-    return x.to(torch.float16).to(x.dtype)
+    return x.clamp(-FP16_MAX, FP16_MAX).to(torch.float16).to(x.dtype)
 
 
 def e2m1_codes(x: Tensor) -> Tensor:
@@ -596,17 +599,20 @@ def quantized_linears(model) -> dict[str, torch.nn.Linear]:
 
 
 @torch.no_grad()
-def collect_hessians(model, windows: np.ndarray, batch: int, device: torch.device) -> dict[str, Tensor]:
-    """H = X^T X / N (FP64) of the input of every quantized linear, from forward hooks."""
+def collect_hessians(model, windows: np.ndarray, batch: int, device: torch.device,
+                     *, autocast: bool | None = None) -> dict[str, Tensor]:
+    """H = X^T X / N (FP64, strictly PSD) of the input of every quantized linear, from forward hooks."""
     linears = quantized_linears(model)
     sums = {name: torch.zeros(m.in_features, m.in_features, dtype=torch.float64, device=device)
             for name, m in linears.items()}
     count = {"tokens": 0}
+    use_autocast = (device.type == "cuda") if autocast is None else autocast
 
     def hook(name):
         def accumulate(module, inputs):
-            x = inputs[0].detach().reshape(-1, module.in_features).float()
-            sums[name].add_((x.T @ x).double())
+            with torch.autocast(device_type=device.type, enabled=False):
+                x = inputs[0].detach().reshape(-1, module.in_features).double()
+                sums[name].add_(x.T @ x)
         return accumulate
 
     handles = [m.register_forward_pre_hook(hook(name)) for name, m in linears.items()]
@@ -615,19 +621,19 @@ def collect_hessians(model, windows: np.ndarray, batch: int, device: torch.devic
         for first in range(0, len(windows), batch):
             x = torch.from_numpy(windows[first:first + batch]).to(device)
             count["tokens"] += x.numel()
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_autocast):
                 model(x)
     finally:
         for handle in handles:
             handle.remove()
-    return {name: s / count["tokens"] for name, s in sums.items()}
+    return {name: 0.5 * (s + s.T) / count["tokens"] for name, s in sums.items()}
 
 
 # ======================================================================================
 # Methods
 # ======================================================================================
 METHODS = ("rtn", "hadamard_b16_rtn", "hadamard_b64_rtn", "rand_hadamard_b64_rtn", "adaptive_butterfly_b16_rtn",
-           "gptq", "hadamard_b64_gptq", "rand_hadamard_b64_gptq", "adaptive_butterfly_b16_gptq")
+           "gptq", "hadamard_b16_gptq", "hadamard_b64_gptq", "rand_hadamard_b64_gptq", "adaptive_butterfly_b16_gptq")
 
 
 def parse_method(method: str) -> tuple[str, str]:
@@ -798,7 +804,8 @@ def _nvfp4_mm(a: dict, b: dict):
     return lambda: torch._scaled_mm(A4, B4.t(), sa, sb, out_dtype=torch.bfloat16) * scale
 
 
-def _williams_latency(functions: dict, rounds: int, iterations: int, warmup: int = 5) -> dict:
+def _williams_latency(functions: dict, rounds: int, iterations: int, warmup: int = 5,
+                      flush: Tensor | None = None) -> dict:
     """CUDA-event milliseconds per call. Two treatments, Williams (AB/BA) balanced round order."""
     names = list(functions)
     samples = {name: [] for name in names}
@@ -807,19 +814,23 @@ def _williams_latency(functions: dict, rounds: int, iterations: int, warmup: int
             fn = functions[name]
             for _ in range(warmup):
                 fn()
-            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             torch.cuda.synchronize()
-            start.record()
+            pairs = []
             for _ in range(iterations):
+                if flush is not None:
+                    flush.zero_()
+                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                start.record()
                 fn()
-            end.record()
+                end.record()
+                pairs.append((start, end))
             torch.cuda.synchronize()
-            samples[name].append(start.elapsed_time(end) / iterations)
+            samples[name].append(sum(s.elapsed_time(e) for s, e in pairs) / iterations)
     return samples
 
 
 def probe_native_fp4_gemm(device: torch.device, *, shapes=((1024, 4096), (2048, 8192)), rounds: int = 10,
-                          iterations: int = 50, seed: int = 0) -> dict:
+                          iterations: int = 10, seed: int = 0) -> dict:
     """Is native FP4 GEMM available through ``scaled_mm`` here, is it right, and how fast is it?"""
     result = {"torch": torch.__version__, "float4_e2m1fn_x2_dtype": hasattr(torch, "float4_e2m1fn_x2"),
               "float8_e8m0fnu_dtype": hasattr(torch, "float8_e8m0fnu"),
@@ -871,6 +882,8 @@ def probe_native_fp4_gemm(device: torch.device, *, shapes=((1024, 4096), (2048, 
     if not result["nvfp4"].get("verified"):
         result["status"] = "native NVFP4 GEMM not available or not verified; no latency is reported"
         return result
+    flush = torch.empty(4 * torch.cuda.get_device_properties(device).L2_cache_size,
+                        dtype=torch.uint8, device=device)
     latency = []
     for M, K in shapes:
         N = K
@@ -882,10 +895,12 @@ def probe_native_fp4_gemm(device: torch.device, *, shapes=((1024, 4096), (2048, 
         shape_error = ((fp4().float() - check).norm() / check.norm()).item()
         del check
         functions = {"bf16_cublas": lambda x=x, w=w: x @ w.T, "nvfp4_scaled_mm": fp4}
-        samples = _williams_latency(functions, rounds, iterations)
+        samples = _williams_latency(functions, rounds, iterations, flush=flush)
         flops = 2.0 * M * N * K
         row = {"m": M, "n": N, "k": K, "rounds": rounds, "iterations_per_round": iterations,
-               "design": "Williams AB/BA balanced rounds; CUDA events; operands pre-quantized (GEMM only)",
+               "l2_flush_bytes": flush.numel(),
+               "design": "Williams AB/BA balanced rounds; CUDA events; 4x L2 flush before every sample; "
+                         "operands pre-quantized (GEMM only; excludes online activation quantization and rotation)",
                "nvfp4_relative_error_vs_fp32_dequant": shape_error}
         for name, values in samples.items():
             row[name] = {"median_ms": median(values), "min_ms": min(values), "max_ms": max(values),
@@ -894,6 +909,7 @@ def probe_native_fp4_gemm(device: torch.device, *, shapes=((1024, 4096), (2048, 
         row["speedup_bf16_over_nvfp4"] = {"median": median(ratios), "min": min(ratios), "max": max(ratios)}
         latency.append(row)
         del x, w, ex, ew, fp4, functions
+    del flush
     result["latency"] = latency
     result["status"] = "native NVFP4 GEMM verified on this device"
     return result
@@ -1143,7 +1159,9 @@ def summarize(models: dict) -> dict:
                                        "muon_test_ppl": a[f][m]["test_ppl"], "adamw_test_ppl": b[f][m]["test_ppl"]})
     return {"per_model": tables, "muon_vs_adamw_quantizability": comparison,
             "note": "delta = quantized minus the same model in BF16 on the same held-out test tokens. "
-                    "A negative muon_minus_adamw_delta_nll means the Muon model lost less."}
+                    "A negative muon_minus_adamw_delta_nll means the Muon model lost less. "
+                    "Caveat: compares iso-token (320-step, single-seed) checkpoints with unequal baseline PPL "
+                    "(Muon vs undertrained AdamW), not iso-loss quality-matched checkpoints."}
 
 
 def environment(device: torch.device) -> dict:
@@ -1248,6 +1266,10 @@ def run_experiment(args) -> dict:
     return payload
 
 
+CANONICAL_OUTPUT = ROOT / "results" / "cycle3_t5_01_nvfp4_ptq.json"
+QUICK_OUTPUT = ROOT / "results" / "cycle3_t5_01_nvfp4_ptq_quick.json"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1266,12 +1288,49 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-verify", action="store_true", help="skip SHA-256 checks (synthetic shards only)")
     parser.add_argument("--quick", action="store_true", help="tiny model, few steps, short evaluation")
     parser.add_argument("--silent", action="store_true")
-    parser.add_argument("--output", type=Path, default=ROOT / "results" / "cycle3_t5_01_nvfp4_ptq.json")
+    parser.add_argument("--output", type=Path, default=None)
     return parser
 
 
+def _is_canonical_args(args: argparse.Namespace) -> bool:
+    return (
+        not args.quick
+        and not args.no_verify
+        and args.preset == "50m"
+        and args.steps == 320
+        and args.warmup_steps == 32
+        and args.seed == 1
+        and args.calibration_sequences == 128
+        and args.calibration_seed == 20261126
+        and args.val_check_sequences == 32
+        and args.max_eval_windows is None
+        and args.harness_eval_tokens == (1 << 20)
+        and args.butterfly_steps == 150
+    )
+
+
+def _resolve_output(args: argparse.Namespace) -> Path:
+    canonical = _is_canonical_args(args)
+    if args.output is None:
+        if args.quick:
+            return QUICK_OUTPUT
+        if canonical:
+            return CANONICAL_OUTPUT
+        raise ValueError(
+            "Non-canonical run requires an explicit --output path to avoid "
+            f"overwriting {CANONICAL_OUTPUT.name}"
+        )
+    if args.output.resolve() == CANONICAL_OUTPUT.resolve() and not canonical:
+        raise ValueError(
+            f"Refusing to overwrite canonical {CANONICAL_OUTPUT.name} from a --quick or "
+            "non-canonical run; choose a different --output path"
+        )
+    return args.output
+
+
 def parse_args(argv: list[str] | None = None):
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     if args.data_dir is None:
         args.data_dir = default_data_dir()
     if args.quick:
@@ -1279,6 +1338,10 @@ def parse_args(argv: list[str] | None = None):
         args.calibration_sequences, args.val_check_sequences = 8, 4
         args.max_eval_windows = args.max_eval_windows or 64
         args.harness_eval_tokens, args.butterfly_steps = 4096, 10
+    try:
+        args.output = _resolve_output(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     return args
 
 

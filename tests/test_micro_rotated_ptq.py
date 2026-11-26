@@ -368,6 +368,78 @@ def test_result_schema_is_strict(quick_cpu):
         q.validate_results(missing)
 
 
+def test_collect_hessians_disables_autocast_and_stays_psd():
+    g = torch.Generator().manual_seed(21)
+    X_low_rank = torch.randn(4096, 3, generator=g) @ torch.randn(3, 64, generator=g) * 20.0
+    X_low_rank = X_low_rank + 1e-3 * torch.randn(4096, 64, generator=g)
+
+    class _DummyBlock(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qkv = torch.nn.Linear(64, 64, bias=False)
+            self.out = torch.nn.Linear(64, 64, bias=False)
+            self.gate = torch.nn.Linear(64, 64, bias=False)
+            self.up = torch.nn.Linear(64, 64, bias=False)
+            self.down = torch.nn.Linear(64, 64, bias=False)
+
+        def forward(self, hidden):
+            h_attn = self.out(self.qkv(hidden))
+            return self.down(self.gate(h_attn) * self.up(h_attn))
+
+    class _DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = torch.nn.ModuleList([_DummyBlock()])
+
+        def forward(self, token_batch):
+            return self.blocks[0](X_low_rank[:token_batch.numel()].reshape(*token_batch.shape, 64))
+
+    model = _DummyModel()
+    windows = np.zeros((4, 16), dtype=np.int64)
+    hessians = q.collect_hessians(model, windows, batch=2, device=torch.device("cpu"), autocast=True)
+    H_qkv = hessians["blocks.0.qkv"]
+    assert H_qkv.dtype == torch.float64
+    assert torch.equal(H_qkv, H_qkv.T)
+    assert torch.linalg.eigvalsh(H_qkv).min().item() >= -1e-9 * max(H_qkv.diagonal().mean().item(), 1.0)
+    W = torch.randn(1, 32, 64, generator=g) * 0.02
+    Q, info = q.gptq_quantize(W, H_qkv.unsqueeze(0), FMT["nvfp4_g16"])
+    assert info["damping_lambda"] == [0.01]
+    assert q.output_error(W, Q, H_qkv.unsqueeze(0)).item() >= 0.0
+
+
+def test_cli_output_guard_protects_canonical_artifact(tmp_path, monkeypatch):
+    def fail_run(*args, **kwargs):
+        raise AssertionError("run_experiment should not be called")
+
+    monkeypatch.setattr(q, "run_experiment", fail_run)
+    assert q.parse_args([]).output == q.CANONICAL_OUTPUT
+    assert q.parse_args(["--quick"]).output == q.QUICK_OUTPUT
+    custom = tmp_path / "sub.json"
+    assert q.parse_args(["--steps", "10", "--output", str(custom)]).output == custom
+
+    for argv in (
+        ["--max-eval-windows", "64"],
+        ["--no-verify"],
+        ["--steps", "10"],
+        ["--quick", "--output", str(q.CANONICAL_OUTPUT)],
+        ["--no-verify", "--output", str(q.CANONICAL_OUTPUT)],
+    ):
+        with pytest.raises(SystemExit) as exc:
+            q.main(argv)
+        assert exc.value.code == 2
+
+
+def test_int2_extreme_span_stays_finite_and_hadamard_b16_gptq_registered():
+    assert "hadamard_b16_gptq" in q.METHODS
+    assert q.parse_method("hadamard_b16_gptq") == ("hadamard_b16", "gptq")
+    W = torch.zeros(2, 32)
+    W[0, 0] = -1.5e5
+    W[0, 1] = 1.5e5
+    for name in ("int2_asym_g16", "int2_asym_g32"):
+        out = q.quantize_rtn(W, FMT[name])
+        assert torch.isfinite(out).all(), name
+
+
 def test_committed_result_artifact():
     if not RESULT.exists():
         pytest.skip("result artifact not generated yet")
