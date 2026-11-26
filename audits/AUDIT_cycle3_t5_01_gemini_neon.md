@@ -151,3 +151,54 @@
 4. `CUDA_VISIBLE_DEVICES="" /home/ryan/Documents/projects/ai/.venv/bin/python <scratch>/audit_inspect.py` → strict JSON (`0` dup keys), live SHA-256 of `train/val/test.bin`, full 72-row & summary recomputation (`max_err = 0.000e+00`).
 5. `CUDA_VISIBLE_DEVICES="" /home/ryan/Documents/projects/ai/.venv/bin/python <scratch>/audit_c2_compare.py` → Cycle 2 `50m` seed-1 fingerprint and baseline reconciliation.
 6. `CUDA_VISIBLE_DEVICES="" /home/ryan/Documents/projects/ai/.venv/bin/python <scratch>/audit_math_probes.py` & `audit_math_probes2.py` & `audit_math_probes3.py` → E2M1/E4M3FN/`SWIZZLE_32_4_4`/MXFP4 clipping/INT2 edge cases/Butterfly FP16/GPTQ $\kappa \in [1, 10^8]$/BF16 autocast Hessian reproduction/`hadamard_b16_gptq` stress test/BF16 output rounding floor/50M meta parameter accounting.
+
+---
+
+## Post-Remediation Verification Addendum
+
+- **Re-Check Auditor:** Gemini 4 Neon (CPU-only, `CUDA_VISIBLE_DEVICES=""`, zero GPU contact)
+- **Date:** 2026-11-26
+- **Re-Checked Branch & Commits:** `origin/exp/c3-t5-01-nvfp4-ptq` — remediation code `c710959a6b52dc17a3a660e1962d4bea5dd3efce`, regenerated artifact `89273484588994d87280b62121349f160fe6148a`.
+- **Updated Final Disposition:** **`HOLD LIFTED — READY TO MERGE`**
+
+### 1. Provenance, Strict JSON & CPU Test Suite
+- **Diff hygiene:** `git diff --stat c710959a6b52dc17a3a660e1962d4bea5dd3efce..89273484588994d87280b62121349f160fe6148a` touches **only** `results/cycle3_t5_01_nvfp4_ptq.json` (`+2659 / -2363`, 6,315 lines, 233,183 bytes).
+- **Strict JSON & metadata:** `allow_nan=False`, non-standard constant rejection, and duplicate-key check passed (`0` duplicate keys); `validate_results(data)` passed; `meta.git_sha == "c710959a6b52dc17a3a660e1962d4bea5dd3efce"`, `meta.git_dirty == false`, `sha256_verified == true` (all 3 shard SHA-256 hashes match pinned values).
+- **CPU Pytest (`CUDA_VISIBLE_DEVICES="" PYTHONPATH=. /home/ryan/Documents/projects/ai/.venv/bin/pytest tests/test_micro_rotated_ptq.py -v`):** **`37 passed, 3 skipped, 0 failed`** in `44.87s` (skipped: 3 `@needs_cuda` tests at lines 459, 486, 500). Passes `test_committed_result_artifact` and all 3 new regression tests (`test_collect_hessians_disables_autocast_and_stays_psd`, `test_cli_output_guard_protects_canonical_artifact`, `test_int2_extreme_span_stays_finite_and_hadamard_b16_gptq_registered`).
+- **Full Numerical Recomputation:** All **80/80** grid rows (`4 formats × 10 methods × 2 models`), `summary` (`per_model` + `muon_vs_adamw_quantizability` exact match to `summarize()`), `synthetic_stress` (`40` rows + `4` recovery ratios), and `native_fp4_gemm_probe` (`median/min/max ms`, `tflops_median`, `speedup_bf16_over_nvfp4`) recompute to **`0.000e+00`** maximum discrepancy. `rotation_checks.passed == True` and `gptq_synthetic_check.passed == True`.
+
+### 2. Finding-by-Finding Remediation Verification (F1–F7)
+
+| ID | Status | Verification Evidence |
+|---|---|---|
+| **F1** (`HIGH`) | **RESOLVED** | `collect_hessians` wraps the forward pre-hook in `with torch.autocast(device_type=device.type, enabled=False):`, casts `x` to `.double()` before `x.T @ x`, and returns `0.5 * (s + s.T) / count["tokens"]`. In `8927348`, **all `20/20` `adamw` GPTQ rows AND all `20/20` `muon_ss3_54` GPTQ rows (`40/40`) record `gptq_damping_max == 0.01`** (down from `0.1` on all `16/16` `adamw` rows in `23270c1`). All `80/80` rows have strictly positive finite `calibration_relative_output_error_mean` (`min = 1.437e-4`), `val_relative_output_error_mean` (`min = 1.465e-4`), `calibration_layer_output_mse_mean` (`min = 7.819e-5`), and `val_layer_output_mse_mean` (`min = 7.951e-5`), tightly correlated with end-to-end `ΔNLL` (`r = 0.9943` on `muon_ss3_54`, `r = 0.9803` on `adamw`; `r(cal, val) >= 0.99993`). |
+| **F2** (`HIGH`) | **RESOLVED** | `summary["note"]` now explicitly states: *"Caveat: compares iso-token (320-step, single-seed) checkpoints with unequal baseline PPL (Muon vs undertrained AdamW), not iso-loss quality-matched checkpoints."* Note baseline PPL gap in regenerated run is `220.14` vs `409.62` (`1.86×`, all `40/40` `muon_minus_adamw_delta_nll` remain positive: `+0.00159` to `+0.24637`). |
+| **F3** (`MEDIUM`) | **RESOLVED** | `_is_canonical_args` + `_resolve_output` route `--quick` to `results/cycle3_t5_01_nvfp4_ptq_quick.json`, reject any non-canonical run without explicit `--output` (`--max-eval-windows`, `--no-verify`, `--steps`, `--preset`, `--seed`, `--calibration-sequences`), and refuse explicit `--output` pointing to canonical `results/cycle3_t5_01_nvfp4_ptq.json` under `--quick` or non-canonical flags (verified exit code `2` before `run_experiment`). |
+| **F4** (`MEDIUM`) | **RESOLVED** | `probe_native_fp4_gemm` allocates `4 × L2_cache_size` (`l2_flush_bytes == 268435456` = 256 MiB on RTX 5080) and executes `flush.zero_()` outside per-iteration CUDA event pairs before every timed sample (`10` rounds × `10` iters). `design` note explicitly documents 4× L2 flush and GEMM-only scope (excluding online activation quantization & rotation). Exact recomputation (`0.000e+00` err): `(1024, 4096, 4096)` BF16 `100.80` TFLOPS (`0.3409 ms`) vs NVFP4 `511.78` TFLOPS (`0.0671 ms`), speedup **`5.074×`** `[5.051×, 5.107×]` (down from `5.947×` / `607.10` TFLOPS pre-L2-flush); `(2048, 8192, 8192)` BF16 `115.81` TFLOPS (`2.3735 ms`) vs NVFP4 `757.54` TFLOPS (`0.3629 ms`), speedup **`6.540×`** `[6.520×, 6.631×]` (down from `6.804×` / `782.01` TFLOPS pre-L2-flush). |
+| **F5** (`MEDIUM`) | **RESOLVED** | `hadamard_b16_gptq` added to `METHODS` across all `4` formats × `2` models (`8` grid rows) and `4` `synthetic_stress` rows. Honest ablation results reported in §4 below. |
+| **F6** (`MEDIUM`) | **NOTED (MECHANISM)** | Unchanged physical mechanism on `synthetic_stress`: unrotated NVFP4 `gptq` (`0.000773`, `6.95×` recovery) still beats all rotated NVFP4 variants (`had_b16_gptq = 0.001326`, `bfly_b16_gptq = 0.001257`, `had_b64_gptq = 0.001468`) due to E4M3FN spike-pinning; retain this nuance in reports. |
+| **F7** (`LOW`) | **RESOLVED** | `to_fp16` clamps to `[-FP16_MAX, FP16_MAX]` (`±65504.0`). Independently verified finite outputs on CPU for `int2_asym_g16` and `int2_asym_g32` at extreme spans up to `±1e30` (previously `NaN` at `±1.25e5`). |
+
+### 3. Old (`23270c1`, BF16-Autocast `H`) vs New (`8927348`, Exact FP64 `H`) Comparison
+Because `run_experiment` trains both paired `50m` checkpoints fresh on CUDA (identical `init_fingerprint = 85659cbc0ffc79c1`, `stream_fingerprint = b9f91c01f18ce738`), non-deterministic GPU training shifted baselines slightly (`muon_ss3_54`: NLL `5.39323 → 5.39428`, PPL `219.91 → 220.14`; `adamw`: NLL `6.09041 → 6.01524`, PPL `441.60 → 409.62`). Key F1 remediation effects:
+- **`adamw` (previously `damp = 0.1` on `16/16` GPTQ rows → now `0.01` on `20/20`):**
+  - `cal_err` and `val_err` **rose `+12%` to `+47%`** across all `adamw` methods (e.g., `nvfp4_g16` `gptq`: `cal 0.000113 → 0.000157`, `int2_asym_g32` `gptq`: `cal 0.002283 → 0.003351`), confirming that negative per-layer terms from indefinite BF16 Hessians had been artificially suppressing reported `adamw` layer errors.
+  - Meanwhile, end-to-end `adamw` GPTQ `ΔNLL` **improved on `14/16` shared GPTQ cells** (e.g., `nvfp4_g16` `gptq`: `+0.000512 → +0.000399`; `mxfp4_g32` `bfly_b16_gptq`: `+0.000875 → +0.000726`; `int2_asym_g16` `bfly_b16_gptq`: `+0.004245 → +0.003786`; `int2_asym_g32` `gptq`: `+0.007689 → +0.006241`; `int2_asym_g32` `bfly_b16_gptq`: `+0.006463 → +0.005649`).
+- **`muon_ss3_54` (`damp = 0.01` throughout):**
+  - Removing BF16 Hessian rounding noise reduced `cal_err` and `val_err` slightly on **all `16/16` shared GPTQ cells** (`-0.3%` to `-0.8%`, e.g. `int2_asym_g32` `gptq`: `cal 0.047161 → 0.046868`, `val 0.048709 → 0.048330`), while end-to-end `ΔNLL` remained consistent within retrain variance (`+0.0001`–`+0.0021` on GPTQ).
+
+### 4. Recomputed Post-Remediation `50m` Full-Test Summary & Honest `hadamard_b16_gptq` vs `adaptive_butterfly_b16_gptq` Ablation
+
+| Model (Baseline PPL) | Format | RTN `ΔNLL` (`ΔPPL%`) | Plain GPTQ `ΔNLL` (`ΔPPL%`) | `hadamard_b16_gptq` `ΔNLL` (`ΔPPL%`) | `hadamard_b64_gptq` `ΔNLL` | `adaptive_butterfly_b16_gptq` `ΔNLL` (`ΔPPL%`) | `bfly − had_b16` `ΔNLL` | Overall Best Method |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| **Muon `ss3_54`** (`220.14`, NLL `5.39428`) | `nvfp4_g16` | `+0.00950` (`+0.95%`) | `+0.00253` (`+0.25%`) | `+0.00218` (`+0.22%`) | **`+0.00212`** | `+0.00215` (`+0.21%`) | `-0.000035` | `hadamard_b64_gptq` |
+| | `mxfp4_g32` | `+0.01300` (`+1.31%`) | `+0.00459` (`+0.46%`) | `+0.00365` (`+0.37%`) | `+0.00388` | **`+0.00363`** (`+0.36%`) | `-0.000021` | `adaptive_butterfly_b16_gptq` |
+| | `int2_asym_g16` | `+0.15383` (`+16.63%`) | `+0.03932` (`+4.01%`) | `+0.03402` (`+3.46%`) | `+0.03388` | **`+0.03336`** (`+3.39%`) | `-0.000658` | `adaptive_butterfly_b16_gptq` |
+| | `int2_asym_g32` | `+0.26761` (`+30.68%`) | `+0.06638` (`+6.86%`) | `+0.05641` (`+5.80%`) | `+0.05575` | **`+0.05345`** (`+5.49%`) | `-0.002958` | `adaptive_butterfly_b16_gptq` |
+| **AdamW** (`409.62`, NLL `6.01524`) | `nvfp4_g16` | `+0.00122` (`+0.12%`) | **`+0.00040`** (`+0.04%`) | `+0.00043` (`+0.04%`) | `+0.00053` | `+0.00042` (`+0.04%`) | `-0.000016` | `gptq` |
+| | `mxfp4_g32` | `+0.00253` (`+0.25%`) | `+0.00079` (`+0.08%`) | `+0.00078` (`+0.08%`) | `+0.00089` | **`+0.00073`** (`+0.07%`) | `-0.000052` | `adaptive_butterfly_b16_gptq` |
+| | `int2_asym_g16` | `+0.01473` (`+1.48%`) | `+0.00387` (`+0.39%`) | `+0.00398` (`+0.40%`) | `+0.00409` | **`+0.00379`** (`+0.38%`) | `-0.000197` | `adaptive_butterfly_b16_gptq` |
+| | `int2_asym_g32` | `+0.02124` (`+2.15%`) | `+0.00624` (`+0.63%`) | `+0.00624` (`+0.63%`) | `+0.00602` | **`+0.00565`** (`+0.57%`) | `-0.000589` | `adaptive_butterfly_b16_gptq` |
+
+- **Honest F5 Takeaway:** On **FP4 (`nvfp4_g16`, `mxfp4_g32`)**, parameter-free fixed `hadamard_b16_gptq` (and `hadamard_b64_gptq` on Muon NVFP4, or plain `gptq` on AdamW NVFP4) matches `adaptive_butterfly_b16_gptq` within `0.000016`–`0.000052` NLL (single-seed noise); learned butterfly angles provide **no practical FP4 advantage** over zero-overhead fixed Hadamard rotations. On **2-bit (`int2_asym_g16`, `int2_asym_g32`)**, `adaptive_butterfly_b16_gptq` delivers a genuine but modest gain over `hadamard_b16_gptq` on real 50M LMs (`-1.9%` to `-5.2%` relative `ΔNLL` on Muon, `-4.9%` to `-9.4%` on AdamW) and a strong gain on extreme-outlier `synthetic_stress` (`int2_asym_g16`: `0.007738 → 0.005755`, `-25.6%`; `int2_asym_g32`: `0.025153 → 0.016737`, `-33.5%`; whereas on `mxfp4_g32` stress, fixed `hadamard_b16_gptq = 0.001803` slightly beats `adaptive_butterfly_b16_gptq = 0.001847`).
+
