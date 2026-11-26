@@ -33,26 +33,25 @@
     "audits_completed": 15
   },
   "completed": [
-    "C4-02 END-TO-END BLACKWELL NVFP4 W4A4 INFERENCE (0 D2H syncs, 216/216 quant parity, 60/60 int32 weight parity x5): CUDA-graph had_b16 reaches 384.4 TFLOPS / 3.823x BF16 @ 1024x4096 (415.7 TFLOPS / 4.134x static_gs) and 611.7 TFLOPS / 5.277x @ 2048x8192 (657.0 / 5.667x static_gs; 85.8-92.4% ceiling @ 16x4096; negative 0.860x dynamic @ 1024x512x1408); full forward graph vs compiled BF16: 1.008x (50m), 1.209x (120m), 1.972x (w2048_6l); real 50m muon_ss3_54 320-step val-selected best adaptive_butterfly_b16_gptq test +0.01121 dNLL / +1.127% PPL (had_b16_gptq +1.232%, gptq +1.188%)",
-    "C3-03 TILE-NORM LAUNCH FUSION & TIER-1 REFRESH (0/55 capture err, 0.0 diff, 0/117 div): SS3 launches 17->16 / 16->15 / 15->14; SS3_53 beats PS3_55 across all 5 shapes (1.034-1.132x graph, 2.700x vs PE @ 2048x8192); SS3_54 beats PS3_55 at n>=1024 (1.017-1.062x, wall 0.2256 vs 0.2289 ms @ 512x2048, 0.987x graph)",
-    "C3-01 WIDE CROSSOVER & 120M SHORT-BUDGET TRANSFER (0/33 div, 0.0s overshoot): Full 12-layer step SS3_53 beats PS3_55 across w512..w2048 (1.019-1.067x); SS3_54 crosses at w1024 (1.000x -> 1.020x @ w2048). 120m 3-seed FineWeb-Edu (256 tok / 100s wall): Blackwell +2.90-3.00% tok/s vs PE compiled (Holm p<=0.0018); SS3_54 wall test loss -0.0055 vs PS3 (Holm 10-pair p=0.0352, joint p=0.0810)",
-    "C3-02 HYBRID & EARLY-POLISH VERDICT (0/20 div): Falsified PS3/SS3_54->SS3_34 hybrid (+0.010/+0.011 50m loss regression); SS3_35 BF16 parity (+0.0026); early-polish SS3_54E0 not promoted (-13% step-20 err while losing 53% mid/late lead)",
-    "T4-01 MUP COORDINATE CHECK (CPU, 3 seeds, 128->1024): SP fails (max |beta| 2.599 AdamW / 1.553 Muon), readout_lr_power=1 fails (0.975-1.049), muP passes (0.116 AdamW, 0.078-0.082 Muon across svd_exact/PE/PS3/SS3 within 0.004); val LR transfer 0.08->0.04 for PS3/SS3 vs +2.0 log2 drift on SP",
-    "T5-01 BLACKWELL NVFP4/MXFP4/INT2 PTQ (40/40 GPTQ damp=0.01, 4x L2 flush): Native F.scaled_mm NVFP4 hits 511.8 TFLOPS (5.07x @ 1024x4096) & 757.5 TFLOPS (6.54x @ 2048x8192) pre-quant GEMM; GPTQ cuts full test.bin (2.0M tok) dNLL 3-5x vs RTN (Muon NVFP4 +0.0095->+0.0021 had_b64_gptq; INT2 g32 +0.268->+0.053 bfly_b16_gptq)",
-    "CYCLE 2 VERIFIED BASELINE: M5 Max 64x64 Metal SYRK <=2048^2 (2.58x FP16 / 2.57x BF16 vs dense MLX PS3; FP32 gated dense) & 50m 5-seed FineWeb-Edu (+3.10-3.18% tok/s vs PE eager, -0.026 to -0.033 75s loss, Holm p<0.05)"
+    "C4-02 BLACKWELL NVFP4 W4A4 E2E (0 D2H, 216/216 quant, 60x5 int32 parity): had_b16 graph hits 3.823x/384 TF @ 1024x4096 & 5.277x/612 TF @ 2048x8192 (4.134x/5.667x static_gs); full fwd vs compiled BF16: 1.008x (50m), 1.209x (120m), 1.972x (w2048); 50m val-best bfly_b16_gptq +1.127% PPL",
+    "C3-03 TILE-NORM FUSION (0/55 err, 0.0 diff, 0/117 div): SS3_53 beats PS3_55 on all 5 shapes (1.034-1.132x graph, 2.700x vs PE @ 2048x8192); SS3_54 beats PS3_55 at n>=1024 (1.017-1.062x, 0.2256 vs 0.2289ms wall @ 512x2048)",
+    "C3-01 WIDE & 120M TRANSFER (0/33 div): 12-layer step SS3_53 wins w512..w2048 (1.019-1.067x); SS3_54 crosses w1024->1.020x @ w2048; 120m 3-seed +2.90-3.00% tok/s vs PE compiled (Holm p<=0.0018)",
+    "C3-02 & T4-01: Falsified hybrid ->SS3_34 (+0.010/+0.011 50m loss); SS3_35 BF16 parity; SS3_54E0 unpromoted. CPU muP (3 seeds, 128->1024) passes (0.078-0.116 vs SP 1.553-2.599) with val LR transfer",
+    "T5-01 NVFP4/INT2 PTQ (40/40 GPTQ, 4x L2 flush): Pre-quant NVFP4 GEMM hits 5.07x (512 TF) & 6.54x (758 TF); FP64-Hessian GPTQ cuts 2M-tok dNLL 3-5x vs RTN (Muon NVFP4 +0.0021; INT2 g32 +0.053)",
+    "CYCLE 2 BASELINE: M5 Max 64x64 Metal SYRK <=2048^2 (2.58x FP16 / 2.57x BF16 vs dense PS3) & 50m 5-seed FineWeb-Edu (+3.10-3.18% tok/s vs PE eager, -0.026 to -0.033 75s loss, Holm p<0.05)"
   ],
   "wip": [
-    "C4-01b (launching now): Iso-loss quality-matched 3-seed Muon (ss3_54) vs AdamW PTQ + hardware NVFP4 W4A4 evaluation on 50m FineWeb-Edu",
-    "C4-01a: Longer-budget >=20M-token (>=640 steps) & >=300s wall-clock 120m FineWeb-Edu 3-seed pretraining transfer",
-    "C4-03: Wide-layer (w >= 1536) training crossover, predeclared common-checkpoint SS3_54/53 vs PS3_55 replication & K=2^25 FP16 Gram drift",
-    "C3-04: Open-lid caffeinate -dimsu M5 Max 4096^2 single-session rerun + post-merge live pytest tests/test_mlx.py (blocked while MacBook Pro unreachable)"
+    "C4-01b (launching): Iso-loss 3-seed Muon (ss3_54) vs AdamW PTQ + hardware NVFP4 W4A4 on 50m FineWeb-Edu",
+    "C4-01a: Longer-budget >=20M-tok (>=640 steps) & >=300s wall 120m FineWeb-Edu 3-seed transfer",
+    "C4-03: Wide-layer (w>=1536) training crossover, common-ckpt SS3 vs PS3 replication & K=2^25 Gram drift",
+    "C3-04: M5 Max open-lid 4096^2 rerun + live pytest tests/test_mlx.py (waiting for MacBook Pro)"
   ],
   "blockers": [
-    "C4-02 dynamic had_b16 NVFP4 is 0.860x vs BF16 cuBLAS at small (1024,512,1408); Part C uses single-seed 320-step 50m checkpoint & BF16-calibrated static scales; had_b16_gptq (+1.232%) slightly trails unrotated gptq (+1.188%) on W4A4",
-    "SS3_54 remains 1.3% slower than PS3_55_blackwell in CUDA-graph at (512, 2048) (0.987x) & Tier-1 median (0.991x); w512 wide crossover had host-load tails (6.57->8.67)",
-    "C3-01 120m used short 8.39M-token / 100s budgets (<20M backlog target); PS3_55_blackwell retained as conservative 120m default",
-    "C3-02 hybrid PS3/SS3_54 -> SS3_34 falsified (+0.010/+0.011 50m loss); T5-01 Muon-vs-AdamW confounded by 1.86x PPL gap (220.1 vs 409.6); NVFP4 outliers favor unrotated GPTQ",
-    "Ryan's MacBook Pro unreachable (C3-04 deferred in Cycle 4); 3 Metal-only tests + 3 large-size tests skipped on Linux"
+    "C4-02 dynamic had_b16 is 0.860x vs BF16 @ (1024,512,1408); Part C single-seed 320-step 50m & BF16-calibrated static scales; had_b16_gptq (+1.232%) trails gptq (+1.188%)",
+    "SS3_54 trails PS3_55_bw in graph @ (512,2048) (0.987x) & Tier-1 med (0.991x); w512 host-load tails",
+    "C3-01 120m used short 8.39M-tok / 100s budgets; PS3_55_bw kept as conservative 120m default",
+    "C3-02 hybrid ->SS3_34 falsified; T5-01 Muon-vs-AdamW confounded by 1.86x PPL gap (220 vs 410)",
+    "MacBook Pro unreachable (C3-04 deferred); 3 Metal-only + 3 large-size tests skipped on Linux"
   ],
   "audits": [
     {
@@ -157,9 +156,9 @@
     }
   ],
   "next_queue": [
-    "C4-01b (launching): Iso-loss quality-matched 3-seed Muon-vs-AdamW PTQ + Blackwell hardware W4A4 on 50m FineWeb-Edu",
-    "C4-01a: Longer-budget >=20M-token (>=640 steps) & >=300s wall-clock 120m FineWeb-Edu 3-seed transfer",
-    "C4-03: Wide-layer (w >= 1536) training crossover, predeclared common-checkpoint SS3_54/53 vs PS3_55 replication & K=2^25 FP16 Gram drift",
-    "C3-04: Open-lid caffeinate -dimsu M5 Max 4096^2 single-session rerun + post-merge live pytest tests/test_mlx.py (when MacBook Pro reachable)"
+    "C4-01b (launching): Iso-loss 3-seed Muon vs AdamW PTQ + hardware NVFP4 W4A4 on 50m FineWeb-Edu",
+    "C4-01a: Long-budget >=20M-tok (>=640 steps) & >=300s wall 120m FineWeb-Edu 3-seed transfer",
+    "C4-03: Wide-layer (w>=1536) crossover, common-ckpt SS3 vs PS3 replication & K=2^25 Gram drift",
+    "C3-04: M5 Max open-lid 4096^2 rerun + live pytest tests/test_mlx.py once MacBook Pro reconnects"
   ]
 }
