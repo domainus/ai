@@ -456,3 +456,131 @@ def test_compile_model_reusable_and_pe_compiled(data):
     assert not r1["diverged"] and not r2["diverged"]
     assert math.isfinite(r1["test_loss"]) and math.isfinite(r2["test_loss"])
     assert r1["init_fingerprint"] == r2["init_fingerprint"]
+
+
+# ---------------------------------------------------------------- phase-switched hybrid schedule
+from research.polar_opt import tier2_candidates as cand  # noqa: E402
+
+
+class _Recorder:
+    """Orthogonalizer stand-in that records each call by tag."""
+
+    def __init__(self, tag, log):
+        self.tag, self.log = tag, log
+
+    def __call__(self, G):
+        self.log.append(self.tag)
+        from research.polar_opt.baselines import polar_switch
+
+        return polar_switch(G, "PS2_55")
+
+
+def test_hybrid_phase_polar_counts_optimizer_steps_and_switches():
+    log = []
+    hybrid = cand.HybridPhasePolar(_Recorder("warm", log), _Recorder("fast", log), warmup_steps=2)
+    G = torch.randn(3, 8, 4)
+    for _ in range(3):  # three shape-group calls inside one optimizer step
+        hybrid(G)
+    assert hybrid.step == 0 and log == ["warm"] * 3
+    hybrid.on_step_end()
+    hybrid(G)
+    hybrid.on_step_end()
+    assert hybrid.step == 2 and log[-1] == "warm"
+    hybrid(G)
+    hybrid(G)
+    assert log[-2:] == ["fast", "fast"]
+    # Compile warm-up: both phases run, the warm-up result is returned, the phase does not move.
+    log.clear()
+    warm = cand.HybridPhasePolar(_Recorder("warm", log), _Recorder("fast", log), warmup_steps=1)
+    warm.set_warmup(True)
+    out = warm(G)
+    warm.on_step_end()
+    assert log == ["fast", "warm"] and warm.step == 0
+    torch.testing.assert_close(out, _Recorder("x", [])(G))
+    warm.set_warmup(False)
+    log.clear()
+    warm(G)
+    warm.on_step_end()
+    warm(G)
+    assert log == ["warm", "fast"] and warm.step == 1
+    with pytest.raises(ValueError):
+        cand.HybridPhasePolar(None, None, warmup_steps=-1)
+
+
+HYBRIDS = []
+
+
+def make_recording_hybrid():
+    """Zero-argument factory: a fresh hybrid that records its phase per call."""
+    log = []
+    hybrid = cand.HybridPhasePolar(_Recorder("warm", log), _Recorder("fast", log), warmup_steps=2)
+    hybrid.log = log
+    HYBRIDS.append(hybrid)
+    return hybrid
+
+
+def test_hybrid_phase_polar_in_muon_and_run_trial(data):
+    # Muon advances the phase once per optimizer step, not once per same-shape group.
+    model = h.Transformer(TINY)
+    x = torch.randint(0, 50257, (2, TINY.sequence_length))
+    h._loss(model, x, x).backward()
+    hybrid = make_recording_hybrid()
+    optimizer = h.Muon(model, hybrid, lr=0.02, auxiliary_lr=1e-3, weight_decay=0.01)
+    assert len(optimizer.groups) > 1
+    optimizer.step()
+    assert hybrid.step == 1 and hybrid.log == ["warm"] * len(optimizer.groups)
+    # run_trial warms both phases on a disposable instance; the timed one starts at step 0.
+    HYBRIDS.clear()
+    factories = {}
+    h.parse_extra(["hyb=tests.test_tier2_real:make_recording_hybrid"], factories)
+    groups = len(optimizer.groups)
+    for _ in range(2):  # a second trial must not inherit the first trial's phase
+        start = len(HYBRIDS)
+        row = h.run_trial(TINY, data, device=torch.device("cpu"), seed=0, optimizer_name="hyb",
+                          factory=factories["hyb"], lr=0.02, tokens=3 * TINY.step_tokens,
+                          compile_warmup_steps=1, eval_tokens=1024, telemetry_every=0)
+        warm, timed = HYBRIDS[start:]
+        assert not row["diverged"] and row["steps"] == 3
+        assert warm.step == 0 and warm.log == ["fast", "warm"] * groups
+        assert timed.step == 3 and not timed._warming
+        assert timed.log == ["warm"] * (2 * groups) + ["fast"] * groups
+
+
+def test_cycle3_candidates_register_via_load_factory():
+    specs = {"muon_ss3_35_bf16": "ss3_35_blackwell_bf16",
+             "muon_hybrid_ps3_ss3_34": "hybrid_ps3_to_ss3_34_w40",
+             "muon_hybrid_ss3_54_ss3_34": "hybrid_ss3_54_to_ss3_34_w40"}
+    factories = {}
+    names = h.parse_extra([f"{k}=research.polar_opt.tier2_candidates:{v}" for k, v in specs.items()], factories)
+    assert names == list(specs)
+    assert factories["muon_ss3_35_bf16"]() is cand.ss3_35_blackwell_bf16
+    a, b = factories["muon_hybrid_ps3_ss3_34"](), factories["muon_hybrid_ps3_ss3_34"]()
+    assert isinstance(a, cand.HybridPhasePolar) and a is not b and a.step == 0 and a.warmup_steps == 40
+    assert (a.warmup_fn, a.fast_fn) == (cand.ps3_blackwell_fp16, cand.ss3_34_blackwell_fp16)
+    c = factories["muon_hybrid_ss3_54_ss3_34"]()
+    assert (c.warmup_fn, c.fast_fn) == (cand.ss3_54_blackwell_fp16, cand.ss3_34_blackwell_fp16)
+
+
+@needs_cuda
+@pytest.mark.parametrize("name", ["ss3_35_blackwell_bf16", "hybrid_ps3_to_ss3_34_w40",
+                                  "hybrid_ss3_54_to_ss3_34_w40"])
+def test_cycle3_candidates_cuda_step(name):
+    torch.manual_seed(0)
+    model = h.Transformer(TINY).cuda()
+    x = torch.randint(0, 50257, (2, TINY.sequence_length), device="cuda")
+    polar = h.load_factory(f"research.polar_opt.tier2_candidates:{name}")()
+    if isinstance(polar, cand.HybridPhasePolar):
+        polar.warmup_steps = 1  # exercise both phases in two steps
+    optimizer = h.Muon(model, polar, lr=0.02, auxiliary_lr=1e-3, weight_decay=0.01)
+    before = [p.detach().clone() for p in optimizer.matrices.values()]
+    for _ in range(2):
+        h._loss(model, x, x).backward()
+        optimizer.step()
+        model.zero_grad(set_to_none=True)
+    torch.cuda.synchronize()
+    for p, p0 in zip(optimizer.matrices.values(), before):
+        assert torch.isfinite(p).all() and not torch.equal(p, p0)
+    G = torch.randn(2, 256, 128, device="cuda")
+    out = polar(G).float()
+    s = torch.linalg.svdvals(out)
+    assert out.shape == G.shape and torch.isfinite(out).all() and 0.5 < s.min() and s.max() < 1.3
