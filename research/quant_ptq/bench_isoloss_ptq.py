@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import importlib
 import json
 import math
 import os
@@ -106,6 +107,39 @@ class SplitLedger(dict):
             raise RuntimeError(f"{name}.bin is locked in this stage")
         self.reads[name] += 1
         return super().__getitem__(name)
+
+    def get(self, name: str, default=None):
+        if name in self:
+            return self[name]
+        if name in self.locked:
+            raise RuntimeError(f"{name}.bin is locked in this stage")
+        return default
+
+    def _ensure_unlocked(self) -> None:
+        for k in self:
+            if k in self.locked:
+                raise RuntimeError(f"{k}.bin is locked in this stage")
+
+    def values(self):
+        self._ensure_unlocked()
+        return [self[k] for k in self]
+
+    def items(self):
+        self._ensure_unlocked()
+        return [(k, self[k]) for k in self]
+
+    def copy(self):
+        self._ensure_unlocked()
+        return {k: self[k] for k in self}
+
+    def pop(self, *args, **kwargs):
+        raise RuntimeError("SplitLedger does not allow mutating split access")
+
+    def popitem(self):
+        raise RuntimeError("SplitLedger does not allow mutating split access")
+
+    def setdefault(self, *args, **kwargs):
+        raise RuntimeError("SplitLedger does not allow mutating split access")
 
     @contextlib.contextmanager
     def forbid(self, *names: str):
@@ -859,11 +893,22 @@ def _keys(obj):
             yield from _keys(value)
 
 
-def _validate_training(row: dict, path: str) -> None:
+def _is_hex(value, length: int) -> bool:
+    return (isinstance(value, str) and len(value) == length
+            and all(c in "0123456789abcdefABCDEF" for c in value))
+
+
+def _validate_training(row: dict, path: str, config: dict, protocol: dict) -> None:
     if row["warmup_steps"] != warmup_for(row["steps"]) or row["weight_decay"] != WEIGHT_DECAY \
             or row["min_lr_ratio"] != MIN_LR_RATIO:
         raise ValueError(f"{path}: schedule differs from warmup max(20, T // 10), weight decay 0.01, min LR 0.1")
-    if len(row["checkpoint_sha256"]) != 64 or int(row["checkpoint_sha256"], 16) < 0:
+    step_tokens = config["micro_batch"] * config["grad_accum"] * config["sequence_length"]
+    if row["tokens"] != row["steps"] * step_tokens:
+        raise ValueError(f"{path}: token count {row['tokens']!r} differs from steps * {step_tokens}")
+    expected_aux = protocol["muon"]["auxiliary_lr"] if row["optimizer"] == MUON else None
+    if row["auxiliary_lr"] != expected_aux:
+        raise ValueError(f"{path}: auxiliary_lr {row['auxiliary_lr']!r} differs from {expected_aux!r}")
+    if not _is_hex(row["checkpoint_sha256"], 64):
         raise ValueError(f"{path}: missing checkpoint SHA-256")
 
 
@@ -873,50 +918,69 @@ def validate_results(payload: dict, *, canonical: bool | None = None) -> None:
 
     ``canonical`` (default: ``not payload["quick"]``) adds the checks of the full RTX 5080 run:
     pinned shard hashes, full val/test token counts, the complete 25-row grid with hardware W4A4,
-    the locked protocol constants and an sm_120+ device.
+    the locked protocol constants, a clean git tree, and an sm_120+ device.
     """
     json.dumps(payload, allow_nan=False)
     if payload.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("Unexpected schema version")
     canonical = (not payload["quick"]) if canonical is None else canonical
+    meta = payload["meta"]
     for key in ("git_sha", "git_dirty", "command", "environment", "gpu_telemetry", "loadavg_start", "loadavg_end",
                 "config_hash", "code_sha256"):
-        if key not in payload["meta"]:
+        if key not in meta:
             raise ValueError(f"Missing meta key {key!r}")
+    if not _is_hex(meta["git_sha"], 40):
+        raise ValueError("meta.git_sha must be a 40-char hex SHA")
+    if not _is_hex(meta["code_sha256"], 64):
+        raise ValueError("meta.code_sha256 must be a 64-char hex SHA-256")
+    if not _is_hex(meta["config_hash"], 16):
+        raise ValueError("meta.config_hash must be a 16-char hex digest")
+    if not isinstance(meta["git_dirty"], bool):
+        raise ValueError("meta.git_dirty must be a bool")
     protocol, data, pilot, stage = payload["protocol"], payload["data"], payload["stage_a_pilot"], payload["stage_b"]
     tolerance, seeds = protocol["tolerance_nats"], protocol["seeds"]
-    layers = payload["config"]["layers"]
+    config = payload["config"]
+    layers, seq_len = config["layers"], config["sequence_length"]
     matrices = layers * len(q.LINEAR_KINDS)
+    train_tokens = data["splits"]["train"]["tokens"]
 
     # Data hygiene.
-    if (data["calibration_split"] != "train" or data["static_scale_split"] != "train"
-            or data["selection_split"] != "val" or data["evaluation_split"] != "test"
-            or stage["calibration"]["split"] != "train"):
+    if (data.get("training_split") != "train" or data["calibration_split"] != "train"
+            or data["static_scale_split"] != "train" or data["selection_split"] != "val"
+            or data["evaluation_split"] != "test" or stage["calibration"]["split"] != "train"):
         raise ValueError("Calibration must use train.bin, selection val.bin and evaluation test.bin")
-    if (stage["calibration"]["sequences"] != protocol["calibration_sequences"]
-            or stage["calibration"]["seed"] != protocol["calibration_seed"]):
+    cal = stage["calibration"]
+    starts = cal.get("starts")
+    if (cal["sequences"] != protocol["calibration_sequences"] or cal["seed"] != protocol["calibration_seed"]
+            or cal.get("tokens") != protocol["calibration_sequences"] * seq_len
+            or not isinstance(starts, list) or len(starts) != protocol["calibration_sequences"]
+            or len(set(starts)) != len(starts)
+            or any(isinstance(s, bool) or not isinstance(s, int) or s < 0 or s > train_tokens - seq_len for s in starts)):
         raise ValueError("Calibration windows differ from the protocol")
     if canonical:
         found = {k: v["sha256"] for k, v in data["splits"].items()}
         if not data["sha256_verified"] or data["expected_sha256"] != q.EXPECTED_SHA256 \
                 or any(found.get(k) != v for k, v in q.EXPECTED_SHA256.items()):
             raise ValueError("Shard SHA-256 values differ from the pinned train/val/test hashes")
-        if payload["quick"] or payload["meta"]["environment"].get("capability", [0, 0]) < [12, 0]:
+        if payload["quick"] or meta["environment"].get("capability", [0, 0]) < [12, 0]:
             raise ValueError("A canonical result needs a full run on a Blackwell (sm_120+) CUDA device")
         locked = dict(_CANONICAL_PROTOCOL, max_eval_windows=None)
         if any(protocol.get(k) != v for k, v in locked.items()):
             raise ValueError("Protocol differs from the canonical C4-01b protocol")
+        if meta["git_dirty"] is not False:
+            raise ValueError("A canonical result must come from a clean git tree")
 
     # Stage A: seed 0, val.bin only.
     if pilot["seed"] != protocol["pilot_seed"] or pilot["seed"] in seeds:
         raise ValueError("The Stage A seed must be disjoint from the Stage B seeds")
     if pilot["split_reads"].get("test") != 0 or set(pilot["splits_used"]) != {"train", "val"}:
         raise ValueError("Stage A must not read test.bin")
+    if not isinstance(pilot.get("search"), list):
+        raise ValueError("Stage A must include the search trace list")
     if any("test" in key for key in _keys([pilot["rows"], pilot["search"], pilot["selection"]])):
         raise ValueError("Stage A holds a test.bin field")
-    train_tokens = data["splits"]["train"]["tokens"]
     for i, row in enumerate(pilot["rows"]):
-        _validate_training(row, f"stage_a_pilot.rows[{i}]")
+        _validate_training(row, f"stage_a_pilot.rows[{i}]", config, protocol)
         if row["seed"] != pilot["seed"] or row["evaluated_splits"] != ["val"]:
             raise ValueError("Every Stage A row must be a seed-0 run evaluated on val.bin only")
         steps, lr = row["steps"], row["lr"]
@@ -927,6 +991,10 @@ def validate_results(payload: dict, *, canonical: bool | None = None) -> None:
         if canonical and (row["val_tokens"] != VAL_TOKENS or not row["tokens"] < train_tokens):
             raise ValueError("Stage A rows need the full val.bin and less than one epoch of train.bin")
         _assert_close(row["val_ppl"], math.exp(row["val_nll"]), f"stage_a_pilot.rows[{i}].val_ppl")
+    full_adamw_lrs = {r["lr"] for r in pilot["rows"]
+                      if r["optimizer"] == ADAMW and r["steps"] == protocol["adamw_max_steps"]}
+    if any(lr not in full_adamw_lrs for lr in protocol["adamw_lrs"]):
+        raise ValueError("Stage A must evaluate every AdamW LR at adamw_max_steps")
     selection = select_isoloss(pilot["rows"], tolerance=tolerance, t_muon_candidates=protocol["t_muon_candidates"],
                                adamw_max_steps=protocol["adamw_max_steps"])
     _assert_close(pilot["selection"], selection, "stage_a_pilot.selection")
@@ -947,12 +1015,13 @@ def validate_results(payload: dict, *, canonical: bool | None = None) -> None:
                        for f in protocol["weight_formats"] for m in protocol["methods"]]
     hw_combos = ([(HW_FORMAT, m, mode) for m in protocol["methods"] for mode in HW_MODES]
                  + [(HW_FORMAT, EMULATED_METHOD, EMULATED_MODE)])
+    expected_layers = {f"blocks.{i}.{k}" for i in range(layers) for k in q.LINEAR_KINDS}
     if [(c["seed"], c["optimizer"]) for c in stage["checkpoints"]] != [(s, o) for s in seeds for o in OPTIMIZERS]:
         raise ValueError("Stage B needs one Muon and one AdamW checkpoint per seed, in order")
     for c in stage["checkpoints"]:
         path = f"stage_b[{c['seed']}, {c['optimizer']}]"
         training = c["training"]
-        _validate_training(training, path)
+        _validate_training(training, path, config, protocol)
         if (training["seed"], training["optimizer"], (training["steps"], training["lr"])) != \
                 (c["seed"], c["optimizer"], plan[c["optimizer"]]):
             raise ValueError(f"{path}: training differs from the locked selection")
@@ -983,9 +1052,17 @@ def validate_results(payload: dict, *, canonical: bool | None = None) -> None:
                     or r.get("hw_weights_checked_matrices") != matrices):
                 raise ValueError(f"{where}: hardware weights must decode to the fake-quant weights in all "
                                  f"{matrices} matrices")
-        if len(c["diagnostics"]["per_layer"]) != matrices:
+            if r["mode"] == "w4a4_hw_static":
+                cal_desc = str(r.get("static_scale_calibration", ""))
+                if "train.bin" not in cal_desc or "test" in cal_desc.lower():
+                    raise ValueError(f"{where}: static activation scale calibration must come from train.bin")
+        per_layer = c["diagnostics"]["per_layer"]
+        if len(per_layer) != matrices:
             raise ValueError(f"{path}: diagnostics must cover all {matrices} linear layers")
-        _assert_close(c["diagnostics"]["summary"], summarize_diagnostics(c["diagnostics"]["per_layer"]),
+        if {r["name"] for r in per_layer} != expected_layers or any(
+                r["kind"] != r["name"].rsplit(".", 1)[1] for r in per_layer):
+            raise ValueError(f"{path}: diagnostics layer names or kinds do not match model projections")
+        _assert_close(c["diagnostics"]["summary"], summarize_diagnostics(per_layer),
                       f"{path}.diagnostics.summary")
         _assert_close(c["best"], best_methods(c["grid"]), f"{path}.best")
 
@@ -1046,9 +1123,19 @@ def unit_log_path(output: Path) -> Path:
 
 
 def code_sha256() -> str:
-    """SHA-256 of the source files that define training, quantization and this benchmark."""
+    """SHA-256 of the source files that define training, quantization, data, and Muon kernels."""
     digest = hashlib.sha256()
-    for module in (sys.modules[__name__], q, nb, e2e, h, harness_tier2_lm):
+    extra_modules = (
+        importlib.import_module(name)
+        for name in (
+            "research.polar_opt.real_text_data",
+            "research.polar_opt.tier2_candidates",
+            "research.polar_opt.schatten_switch_blackwell",
+            "research.polar_opt.polar_switch_blackwell",
+            "research.polar_opt.kernels_blackwell",
+        )
+    )
+    for module in (sys.modules[__name__], q, nb, e2e, h, harness_tier2_lm, *extra_modules):
         digest.update(Path(module.__file__).read_bytes())
     return digest.hexdigest()
 
@@ -1116,7 +1203,9 @@ def run_experiment(args) -> dict:
     environment = q.environment(device)
     hashed = {"schema_version": SCHEMA_VERSION, "config": asdict(config), "protocol": protocol,
               "data_sha256": {k: v["sha256"] for k, v in data.summary()["splits"].items()},
-              "code_sha256": code_sha256(), "torch": environment["torch"], "device": environment.get("device", "cpu")}
+              "code_sha256": code_sha256(), "torch": environment["torch"],
+              "triton": environment.get("triton"), "cuda": environment.get("cuda"),
+              "device": environment.get("device", "cpu")}
     config_hash = hashlib.sha256(json.dumps(hashed, sort_keys=True).encode()).hexdigest()[:16]
     units = UnitLog(unit_log_path(output) if output is not None else None, config_hash, args.resume)
     meta = {**h.git_info(), "command": [sys.executable, *sys.argv], "args": {k: str(v) for k, v in vars(args).items()},

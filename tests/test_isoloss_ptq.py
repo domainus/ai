@@ -160,11 +160,27 @@ def _quick_args(tmp_path, *extra):
 def test_split_ledger_locks_and_counts():
     ledger = iso.SplitLedger({"train": 1, "val": 2, "test": 3})
     assert ledger["test"] == 3 and ledger.reads == {"train": 0, "val": 0, "test": 1}
+    assert ledger.get("val") == 2 and ledger.get("missing", 99) == 99
+    assert ledger.reads == {"train": 0, "val": 1, "test": 1}
     with ledger.forbid("test"):
-        assert ledger["val"] == 2
-        with pytest.raises(RuntimeError, match="test.bin is locked"):
-            ledger["test"]
-    assert ledger["test"] == 3 and ledger.reads == {"train": 0, "val": 1, "test": 2}
+        assert ledger["val"] == 2 and ledger.get("val") == 2
+        assert ledger.get("missing", 99) == 99
+        for call in (
+            lambda: ledger["test"],
+            lambda: ledger.get("test"),
+            lambda: ledger.values(),
+            lambda: ledger.items(),
+            lambda: ledger.copy(),
+        ):
+            with pytest.raises(RuntimeError, match="test.bin is locked"):
+                call()
+    for mut in (lambda: ledger.pop("test"), lambda: ledger.popitem(), lambda: ledger.setdefault("x", 0)):
+        with pytest.raises(RuntimeError, match="mutating split access"):
+            mut()
+    assert ledger.values() == [1, 2, 3]
+    assert ledger.items() == [("train", 1), ("val", 2), ("test", 3)]
+    assert ledger.copy() == {"train": 1, "val": 2, "test": 3}
+    assert ledger["test"] == 3 and ledger.reads == {"train": 3, "val": 6, "test": 5}
 
 
 def test_stage_a_never_reads_test_bin(tmp_path):
@@ -430,6 +446,25 @@ def test_unit_log_resumes_by_key_and_config_hash(tmp_path):
     assert iso.unit_log_path(Path("results/x.json")) == Path("results/x.json.units.jsonl")
 
 
+def test_code_sha256_covers_transitive_muon_and_data_modules(monkeypatch, tmp_path):
+    import importlib
+
+    baseline = iso.code_sha256()
+    for i, mod_name in enumerate((
+        "research.polar_opt.real_text_data",
+        "research.polar_opt.tier2_candidates",
+        "research.polar_opt.schatten_switch_blackwell",
+        "research.polar_opt.polar_switch_blackwell",
+        "research.polar_opt.kernels_blackwell",
+    )):
+        mod = importlib.import_module(mod_name)
+        fake = tmp_path / f"mod_{i}.py"
+        fake.write_bytes(Path(mod.__file__).read_bytes() + b"\n# tampered\n")
+        with monkeypatch.context() as m:
+            m.setattr(mod, "__file__", str(fake))
+            assert iso.code_sha256() != baseline
+
+
 # ------------------------------------------------------------------ quick end-to-end pipeline
 @pytest.fixture(scope="module")
 def quick(tmp_path_factory):
@@ -598,6 +633,41 @@ def test_validate_results_rejects_tampering(quick):
         iso.validate_results(pinned, canonical=True)
 
 
+def test_validate_results_hardened_provenance_and_bounds(quick):
+    ckpt = ["stage_b", "checkpoints", 0]
+    starts = list(quick["stage_b"]["calibration"]["starts"])
+    hardened = [
+        (_set(["meta", "git_sha"], "not-a-sha"), "git_sha"),
+        (_set(["meta", "code_sha256"], "xyz"), "code_sha256"),
+        (_set(["meta", "config_hash"], "1234"), "config_hash"),
+        (_set(["meta", "git_dirty"], "false"), "git_dirty"),
+        (_set(["data", "training_split"], "test"), "train.bin"),
+        (_set(["stage_b", "calibration", "starts"], [-1, *starts[1:]]), "Calibration windows"),
+        (_set(["stage_b", "calibration", "starts"], [quick["data"]["splits"]["train"]["tokens"], *starts[1:]]),
+         "Calibration windows"),
+        (_set(["stage_b", "calibration", "tokens"], 7), "Calibration windows"),
+        (_set(["stage_a_pilot", "search"], None), "search trace"),
+        (lambda p: p["stage_a_pilot"]["rows"].__setitem__(
+            0, {**p["stage_a_pilot"]["rows"][0], "steps": p["protocol"]["adamw_max_steps"] - 8,
+                "warmup_steps": iso.warmup_for(p["protocol"]["adamw_max_steps"] - 8),
+                "tokens": (p["protocol"]["adamw_max_steps"] - 8) * 64 * 8}),
+         "adamw_max_steps"),
+        (_set(["stage_a_pilot", "rows", 0, "tokens"], 7), "token count"),
+        (_set(ckpt + ["training", "auxiliary_lr"], 99.0), "auxiliary_lr"),
+        (_set(ckpt + ["diagnostics", "per_layer", 0, "name"], "blocks.0.bogus"), "layer names"),
+        (_set(ckpt + ["diagnostics", "per_layer", 0, "kind"], "out"), "layer names"),
+    ]
+    for edit, match in hardened:
+        with pytest.raises(ValueError, match=match):
+            iso.validate_results(_tampered(quick, edit))
+    if FP4_GEMM:
+        idx = next(i for i, r in enumerate(quick["stage_b"]["checkpoints"][0]["grid"])
+                   if r["mode"] == "w4a4_hw_static")
+        with pytest.raises(ValueError, match="static activation scale"):
+            iso.validate_results(_tampered(
+                quick, _set(ckpt + ["grid", idx, "static_scale_calibration"], "test.bin static scales")))
+
+
 # ------------------------------------------------------------------ committed canonical artifact
 def _canonical():
     if not RESULT.exists():
@@ -640,6 +710,7 @@ def test_committed_canonical_artifact_rejects_tampering():
         _set(["data", "splits", "test", "sha256"], "0" * 64),
         _set(["data", "sha256_verified"], False),
         _set(["meta", "environment", "capability"], [9, 0]),
+        _set(["meta", "git_dirty"], True),
         _set(["quick"], True),
         _set(["protocol", "tolerance_nats"], 0.05),
         _set(["stage_b", "checkpoints", 1, "grid", 0, "hw_weights_checked_matrices"], 5),

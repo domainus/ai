@@ -3,7 +3,7 @@
   "repo": "https://github.com/domainus/ai",
   "cycle": 4,
   "phase": "cycle4_in_progress",
-  "last_updated": "2026-11-26T06:30:46-07:00",
+  "last_updated": "2026-11-26T10:04:06-07:00",
   "fleet": {
     "bazzite": {
       "environment_id": "6fb39dcd-f3b7-4929-a1d5-637d67eb79bb",
@@ -25,14 +25,15 @@
     }
   },
   "kpis": {
-    "experiments_run": 23,
+    "experiments_run": 24,
     "verified_wins": 10,
     "best_speedup_vs_pe": 2.7,
     "best_speedup_vs_ps": 2.58,
-    "tests_passing": 1238,
-    "audits_completed": 15
+    "tests_passing": 1269,
+    "audits_completed": 16
   },
   "completed": [
+    "C4-01b ISO-LOSS MUON-VS-ADAMW PTQ (PASS_WITH_CAVEATS, M1/M2/M3 hardened; promotion held): Seed-0 val match (320 vs 544 steps @ LR 0.0015, 0.0137 nats, 1.70x tokens); Muon loses 2.15-11.93x more dNLL across all 6 primary cells (Holm p<=0.0021; W4A4 +0.01102 vs +0.00506; INT2 g32 +0.05372 vs +0.00450; abs NLL Holm p=1.0); 60/60 FP4 GEMMs, 480/480 decode parity; geometric alignment mechanism (Muon stable rank 172.3 vs 23.3)",
     "C4-02 BLACKWELL NVFP4 W4A4 E2E (0 D2H, 216/216 quant, 60x5 int32 parity): had_b16 graph hits 3.823x/384 TF @ 1024x4096 & 5.277x/612 TF @ 2048x8192 (4.134x/5.667x static_gs); full fwd vs compiled BF16: 1.008x (50m), 1.209x (120m), 1.972x (w2048); 50m val-best bfly_b16_gptq +1.127% PPL",
     "C3-03 TILE-NORM FUSION (0/55 err, 0.0 diff, 0/117 div): SS3_53 beats PS3_55 on all 5 shapes (1.034-1.132x graph, 2.700x vs PE @ 2048x8192); SS3_54 beats PS3_55 at n>=1024 (1.017-1.062x, 0.2256 vs 0.2289ms wall @ 512x2048)",
     "C3-01 WIDE & 120M TRANSFER (0/33 div): 12-layer step SS3_53 wins w512..w2048 (1.019-1.067x); SS3_54 crosses w1024->1.020x @ w2048; 120m 3-seed +2.90-3.00% tok/s vs PE compiled (Holm p<=0.0018)",
@@ -41,19 +42,26 @@
     "CYCLE 2 BASELINE: M5 Max 64x64 Metal SYRK <=2048^2 (2.58x FP16 / 2.57x BF16 vs dense PS3) & 50m 5-seed FineWeb-Edu (+3.10-3.18% tok/s vs PE eager, -0.026 to -0.033 75s loss, Holm p<0.05)"
   ],
   "wip": [
-    "C4-01b (launching): Iso-loss 3-seed Muon (ss3_54) vs AdamW PTQ + hardware NVFP4 W4A4 on 50m FineWeb-Edu",
-    "C4-01a: Longer-budget >=20M-tok (>=640 steps) & >=300s wall 120m FineWeb-Edu 3-seed transfer",
+    "C4-01a (launching): Long-budget >=20M-tok (640 steps, 20.97M tok) & >=300s wall 120m FineWeb-Edu 3-seed transfer",
     "C4-03: Wide-layer (w>=1536) training crossover, common-ckpt SS3 vs PS3 replication & K=2^25 Gram drift",
     "C3-04: M5 Max open-lid 4096^2 rerun + live pytest tests/test_mlx.py (waiting for MacBook Pro)"
   ],
   "blockers": [
+    "C4-01b promotion/3-seed iso-loss held: only 1/3 Stage B seeds met <=0.02-nat target (0.0905/0.1439 gaps on seeds 1/3; non-monotone AdamW LR 0.0015; non-deterministic retrain)",
     "C4-02 dynamic had_b16 is 0.860x vs BF16 @ (1024,512,1408); Part C single-seed 320-step 50m & BF16-calibrated static scales; had_b16_gptq (+1.232%) trails gptq (+1.188%)",
     "SS3_54 trails PS3_55_bw in graph @ (512,2048) (0.987x) & Tier-1 med (0.991x); w512 host-load tails",
     "C3-01 120m used short 8.39M-tok / 100s budgets; PS3_55_bw kept as conservative 120m default",
-    "C3-02 hybrid ->SS3_34 falsified; T5-01 Muon-vs-AdamW confounded by 1.86x PPL gap (220 vs 410)",
+    "C3-02 hybrid ->SS3_34 falsified; T5-01 1.86x PPL confound investigated in C4-01b (seed-0 match only)",
     "MacBook Pro unreachable (C3-04 deferred); 3 Metal-only + 3 large-size tests skipped on Linux"
   ],
   "audits": [
+    {
+      "auditor": "GPT 6.2 Astra (C4-01b live GPU, high)",
+      "verdict": "PASS_WITH_CAVEATS -> M1/M2/M3 HARDENED",
+      "status": "DONE",
+      "report": "audits/AUDIT_cycle4_c4_01b_gpt62_astra.md",
+      "target": "Seed-0-calibrated 3-seed Muon-vs-AdamW FP64-Hessian & hardware W4A4 PTQ + geometric root-cause replay"
+    },
     {
       "auditor": "GPT 6.2 Astra (C4-02 live GPU + re-check, high)",
       "verdict": "FAIL -> REMEDIATED -> PASS (HOLD LIFTED)",
@@ -156,8 +164,7 @@
     }
   ],
   "next_queue": [
-    "C4-01b (launching): Iso-loss 3-seed Muon vs AdamW PTQ + hardware NVFP4 W4A4 on 50m FineWeb-Edu",
-    "C4-01a: Long-budget >=20M-tok (>=640 steps) & >=300s wall 120m FineWeb-Edu 3-seed transfer",
+    "C4-01a (launching): Long-budget >=20M-tok (640 steps, 20.97M tok) & >=300s wall 120m FineWeb-Edu 3-seed transfer",
     "C4-03: Wide-layer (w>=1536) crossover, common-ckpt SS3 vs PS3 replication & K=2^25 Gram drift",
     "C3-04: M5 Max open-lid 4096^2 rerun + live pytest tests/test_mlx.py once MacBook Pro reconnects"
   ]
