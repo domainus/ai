@@ -188,10 +188,15 @@ def unpack_e2m1(packed: Tensor) -> Tensor:
 # Group quantizers
 # ======================================================================================
 def nvfp4_global_scale(W: Tensor) -> Tensor:
-    """FP32 per-tensor scale amax / (6 * 448) over the last two dimensions, shape (..., 1, 1)."""
+    """FP32 per-tensor scale amax / (6 * 448) over the last two dimensions, shape (..., 1, 1).
+
+    Zero, NaN, and extreme subnormal tensors whose amax / (6 * 448) underflows to 0.0 fall back
+    to 1.0, preventing 0 / 0 -> NaN E4M3 block scales on zero groups.
+    """
     amax = W.detach().abs().amax(dim=(-2, -1), keepdim=True).float()
     # Tensor divisor: CUDA divides by a Python scalar via its reciprocal, which is not exact IEEE division.
-    return torch.where(amax > 0, amax / torch.full_like(amax, E2M1_MAX * E4M3_MAX), torch.ones_like(amax))
+    raw = amax / torch.full_like(amax, E2M1_MAX * E4M3_MAX)
+    return torch.where(raw > 0, raw, torch.ones_like(amax))
 
 
 def mxfp4_exponent(amax: Tensor) -> Tensor:
@@ -451,13 +456,16 @@ def make_rotation(family: str, W: Tensor | None = None, fmt: QuantFormat | None 
 # GPTQ / LDLQ
 # ======================================================================================
 def gptq_quantize(W: Tensor, H: Tensor, fmt: QuantFormat, *, block_size: int = 128, damp: float = 0.01,
-                  max_damp_tries: int = 8) -> tuple[Tensor, dict]:
+                  max_damp_tries: int = 8, return_encoding: bool = False) -> tuple[Tensor, dict]:
     """GPTQ of a weight stack ``W`` (L, rows, cols) with input Hessians ``H`` (L, cols, cols).
 
     Column j is rounded with its group's parameters, and its scaled error
     (w_j - q_j) / U_jj is fed into the later columns through row j of U, the upper Cholesky
     factor of H^-1. Group parameters are fitted when the sweep reaches the first column of a
     group, from the error-updated weights. With H = I this is exactly RTN.
+
+    ``return_encoding`` (NVFP4 only) adds ``info["encoding"]``: the E2M1 codes, the E4M3 block
+    scales and the FP32 tensor scales, so that ``codes * block * global`` is exactly ``Q``.
     """
     if W.ndim != 3 or H.ndim != 3:
         raise ValueError("Expected W (L, rows, cols) and H (L, cols, cols)")
@@ -486,6 +494,12 @@ def gptq_quantize(W: Tensor, H: Tensor, fmt: QuantFormat, *, block_size: int = 1
     U = U.float()
     gs = nvfp4_global_scale(W) if fmt.kind == "nvfp4" else None
     Q = torch.zeros_like(W)
+    encode = return_encoding and fmt.kind == "nvfp4"
+    if return_encoding and not encode:
+        raise ValueError("return_encoding needs the NVFP4 format")
+    if encode:
+        codes = torch.zeros(W.shape, dtype=torch.uint8, device=W.device)
+        blocks = torch.zeros(L, rows, cols // g, dtype=W.dtype, device=W.device)
     scale = zero = None
     for i1 in range(0, cols, block_size):
         i2 = min(i1 + block_size, cols)
@@ -495,14 +509,23 @@ def gptq_quantize(W: Tensor, H: Tensor, fmt: QuantFormat, *, block_size: int = 1
         for i in range(i2 - i1):
             if i % g == 0:
                 scale, zero = group_params(W1[:, :, i:i + g], fmt, gs)
+                if encode:  # the E4M3 factor of ``scale``, by the expression of ``group_params``
+                    amax = W1[:, :, i:i + g].abs().amax(-1, keepdim=True)
+                    blocks[:, :, (i1 + i) // g] = to_e4m3(amax / (E2M1_MAX * gs)).squeeze(-1)
             w = W1[:, :, i:i + 1]
-            _, q = quantize_with(w, scale, zero, fmt)
+            c, q = quantize_with(w, scale, zero, fmt)
             Q[:, :, i1 + i:i1 + i + 1] = q
+            if encode:
+                codes[:, :, i1 + i:i1 + i + 1] = c
             err = (w - q) / U1[:, i, i].view(L, 1, 1)
             W1[:, :, i:] -= err * U1[:, i:i + 1, i:]
             E1[:, :, i:i + 1] = err
         W[:, :, i2:] -= E1 @ U[:, i1:i2, i2:]
-    return Q, {"damping_lambda": lam.tolist(), "dead_columns": int(dead.sum())}
+    info = {"damping_lambda": lam.tolist(), "dead_columns": int(dead.sum())}
+    if encode:
+        info["encoding"] = {"codes": codes, "block_scale": blocks.to(torch.float8_e4m3fn),
+                            "global_scale": gs.reshape(L)}
+    return Q, info
 
 
 def output_error(W: Tensor, W_hat: Tensor, H: Tensor) -> Tensor:
