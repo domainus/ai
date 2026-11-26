@@ -88,6 +88,13 @@ def bench_shape(methods: dict, shape: tuple, *, flush: torch.Tensor, warmup: int
     """Time every method on one seeded FP32 Gaussian input across isolated clock passes."""
     torch.manual_seed(seed)
     G = torch.randn(*shape, device="cuda")
+    return bench_matrix(methods, G, flush=flush, warmup=warmup, blocks=blocks, iters=iters)
+
+
+def bench_matrix(methods: dict, G: torch.Tensor, *, flush: torch.Tensor, warmup: int, blocks: int,
+                 iters: int) -> dict:
+    """Time every method on the CUDA input ``G`` across isolated clock passes."""
+    shape = tuple(G.shape)
     G_ref = G.detach().clone()
     load_start = os.getloadavg()
     names = list(methods)

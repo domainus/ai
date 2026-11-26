@@ -7,9 +7,10 @@ Each segment is the Polar Switch grammar of ``polar_switch_blackwell``:
                                                     FP16/BF16 operands, FP32 accumulation, one rounding
     X <- B[last dst] @ X                            ``_apply`` (cuBLAS)
 
-No new matrix multiplication kernels are defined here: ``_syrk_kernel``, ``_CONFIGS``,
-``_tri_tile``, and ``_store_sym`` come from ``kernels_blackwell``; ``_launch``, ``_symprod_kernel``,
-``_triangle_grid``, and ``_apply`` come from ``polar_switch_blackwell``.
+``_syrk_kernel``, ``_CONFIGS``, ``_tri_tile``, and ``_store_sym`` come from ``kernels_blackwell``;
+``_launch``, ``_symprod_kernel``, ``_triangle_grid``, and ``_apply`` come from
+``polar_switch_blackwell``. The first SYRK and the first square of segment 1 have variants here
+(``_syrk_norm_kernel``, ``_square_norm_kernel``) with the same tile loop and one more epilogue.
 
 The difference from ``PS3_55`` is the scale. ``PS3_55`` divides by the Frobenius norm, which is
 about 3.2 times the top singular value of a Muon momentum. Here the first squaring of segment 1
@@ -39,6 +40,12 @@ Scale handling (the Cycle 1 P0 findings & zero-sync CUDA-graph execution)
   (``||G||_F <= 1e-12``), or non-finite inputs (note: inputs are cast to FP32 before norm
   reduction, so ``float64`` entries exceeding ``FLT_MAX`` are treated as non-finite). "FP32
   accumulation, one rounding" applies to the Triton kernels; ``_apply`` uses cuBLAS.
+* Launch fusion (Cycle 3, C3-03). Segment 1 has three auxiliary launches: the norm partials,
+  the normalization, and ``_fold_and_row0_axpy_kernel``. The norms of ``R_h`` and of
+  ``S = fl(alpha * R_h^2)`` are not a separate pass: the kernel that computes a tile also writes
+  the sum of squares of the rounded tile (``_tile_sumsq``, one slot per tile, no atomics), so
+  a CUDA-graph replay repeats the eager result bit for bit. All device scalars of a call are
+  in one scratch allocation that the call owns (``_scratch_layout``).
 
 Inputs have shape ``(..., rows, columns)``; tall, wide, square, odd, and ``min(rows, columns)
 == 1`` are supported.
@@ -66,12 +73,19 @@ _WORK_DTYPES = (torch.float16, torch.bfloat16)
 PRESCALE = 64.0  # ||X_h||_F for n >= PRESCALE_MIN_N; trace(R_h) = 4096
 PRESCALE_MIN_N = 1024
 FRO_FLOOR = 1e-12  # inputs at or below this Frobenius norm return zeros
-_SLACK = 1.0 + 2.0 ** -12  # FP32 accumulation and FP32 norm reductions
-_REDUCE_BLOCKS = 64
+_SLACK = 1.0 + 2.0 ** -12  # FP32 accumulation of the products and of the norm partials
+_REDUCE_BLOCKS = 256  # partial slots per matrix of the input norm
+_NORM_BLOCK = 4096  # elements per step of one norm partial
+_TILE_CHUNK = 64  # tile partials are summed in chunks of this size
+_ELEMENTWISE_BLOCK = 4096  # elements per step of an elementwise kernel
+_NORMALIZE_PROGRAMS, _NORMALIZE_WARPS = 64, 4  # most programs per matrix, warps per program
+_FOLD_PROGRAMS, _FOLD_WARPS = 64, 4
+_FOLD_ROWS = 8  # most rows of segment 1 (one vector operation folds all of them)
+_MIN_BLOCK = min(config.kwargs["BLOCK"] for config in _CONFIGS)
 # dtype -> (unit roundoff, largest absolute rounding error of a subnormal entry)
 _ROUNDING = {torch.float16: (2.0 ** -11, 2.0 ** -25), torch.bfloat16: (2.0 ** -8, 0.0),
              torch.float64: (0.0, 0.0)}
-_TABLE_CACHE: dict[tuple, tuple[Tensor, Tensor]] = {}
+_TABLE_CACHE: dict[tuple, Tensor] = {}
 
 
 # --------------------------------------------------------------------------------------
@@ -276,7 +290,7 @@ def _prescale(n: int) -> tuple[float, float]:
     The factor 8 of FP16 range that remains is for the first row ``R^2 + b R + c I``.
     """
     P = PRESCALE if n >= PRESCALE_MIN_N else 1.0
-    return P, 2.0 ** 13 / P ** 4
+    return P, 2.0 ** 13 / P ** 4  # a power of two: the kernels also use the exact 1 / alpha
 
 
 def _trace_bound(n: int, dtype: torch.dtype) -> float:
@@ -294,8 +308,9 @@ def _upper(norm_r: float, norm_s: float, n: int, dtype: torch.dtype) -> float:
         lambda_max(R_h)   <= ||R_h^2||_F^(1/2)              (Schatten-8)
         ||X_h X_h^T - R_h||_F <= u ||R_h||_F + n e          (cast residual of the Gram matrix)
 
-    ``_SLACK`` covers the FP32 accumulation of the products and of the two norms. The trace
-    bound ``||X_h||_F^2`` is taken when it is smaller.
+    ``_SLACK`` covers the FP32 accumulation of the products and of the two norms (the native
+    path sums at most one tile row of exact squares in FP32, then FP64). The trace bound
+    ``||X_h||_F^2`` is taken when it is smaller.
     """
     u, e = _ROUNDING[dtype]
     schatten8 = math.sqrt(((1.0 + u) * norm_s * _SLACK + n * e) / _prescale(n)[1])
@@ -364,41 +379,79 @@ def _check(circuit: SchattenSwitchCircuit, dtype, scaling, allow_unsafe_bf16):
 # --------------------------------------------------------------------------------------
 # Native path (sync-free, CUDA-graph capturable)
 # --------------------------------------------------------------------------------------
-def _seg1_table_tensors(circuit: SchattenSwitchCircuit, device: torch.device) -> tuple[Tensor, Tensor]:
-    """Cache segment-1 coefficients (float64) and register triples (int32) on ``device``."""
-    if circuit.buffers > 3:
-        raise ValueError(f"Sync-free kernel supports at most 3 buffers, got {circuit.buffers}")
+def _seg1_table(circuit: SchattenSwitchCircuit, device: torch.device) -> Tensor:
+    """Cached float64 rows ``(a, b, c, src_code, add_code)`` of segment 1 on ``device``.
+
+    A code names the scale of the buffer that a row reads, so the kernel folds every row
+    without the register history: 0 is buffer 0 (``x^2 / kappa``), 1 is the first row
+    (``alpha / kappa^2`` times its table value), 2 is a later destination (its table value).
+    """
     seg1_rows = circuit.table[0][1]
     key = (circuit.name, seg1_rows, device)
     cached = _TABLE_CACHE.get(key)
     if cached is not None:
         return cached
+    if len(seg1_rows) > _FOLD_ROWS:
+        raise ValueError(f"Segment 1 supports at most {_FOLD_ROWS} rows, got {len(seg1_rows)}")
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
             "Warm up schatten_switch_blackwell eagerly once per (circuit, shape, dtype, device) "
             "before CUDA-graph capture"
         )
-    coeffs = torch.tensor([[row[3], row[4], row[5]] for row in seg1_rows], dtype=torch.float64, device=device)
-    regs = torch.tensor([[row[0], row[1], row[2]] for row in seg1_rows], dtype=torch.int32, device=device)
-    _TABLE_CACHE[key] = (coeffs, regs)
-    return coeffs, regs
+    codes, values = {0: 0.0, 1: 1.0}, [[*seg1_rows[0][3:6], 2.0, 2.0]]
+    for dst, src, add, a, b, c in seg1_rows[1:]:
+        values.append([a, b, c, codes.get(src, 2.0), codes.get(add, 2.0)])
+        codes[dst] = 2.0
+    table = torch.tensor(values, dtype=torch.float64, device=device)
+    _TABLE_CACHE[key] = table
+    return table
 
 
-@triton.autotune(configs=[triton.Config({"BLOCK": 4096, "REDUCE_BLOCKS": _REDUCE_BLOCKS}, num_warps=4)], key=[])
+def _scratch_layout(n: int, rows: int) -> tuple[int, int, int, int]:
+    """Offsets in the float64 scratch row of one matrix: ``(off_r, off_s, off_c, width)``.
+
+    One allocation per call holds every device-side scalar, so a call owns its scratch (safe
+    for concurrent streams and graphs):
+
+        [0, 3 * _REDUCE_BLOCKS)  input norm partials: sums of squares, maxima, non-finite flags
+        [off_r, off_s)           Frobenius-squared partial of each stored tile of ``R_h``
+        [off_s, off_c)           the same for ``S = fl(alpha * R_h^2)``
+        [off_c, width)           segment-1 coefficient rows ``(a, b, c, ok)``; row 0 holds
+                                 ``(residual * sqrt(kappa), unused, unused, ok)``
+
+    A tile region has room for the smallest autotune ``BLOCK``, because the tile count of the
+    chosen configuration is known only after the kernel ran.
+    """
+    tiles = -(-n // _MIN_BLOCK)
+    capacity = tiles * (tiles + 1) // 2
+    off_r = 3 * _REDUCE_BLOCKS
+    return off_r, off_r + capacity, off_r + 2 * capacity, off_r + 2 * capacity + 4 * rows
+
+
+def _tile_count(n: int, config: dict) -> int:
+    tiles = -(-n // config["BLOCK"])
+    return tiles * (tiles + 1) // 2
+
+
+@triton.autotune(configs=[triton.Config({"BLOCK": _NORM_BLOCK, "REDUCE_BLOCKS": _REDUCE_BLOCKS}, num_warps=4)], key=[])
 @triton.jit
 def _safe_norm_part_kernel(
-    x_ptr, m_ptr, s_ptr, nf_ptr, size, num_blocks,
+    x_ptr, sc_ptr, size, num_blocks, sc_stride,
     BLOCK: tl.constexpr, REDUCE_BLOCKS: tl.constexpr,
 ):
-    """LAPACK/Blue-style overflow/underflow-safe partial Frobenius norm reduction per matrix."""
+    """Overflow- and underflow-safe partial sums of squares of each matrix (Blue-style scaling).
+
+    A chunk is scaled by its largest entry and summed in FP32. The chunk sums accumulate in
+    FP64, where the square of every finite FP32 value is in range.
+    """
     pid = tl.program_id(0)
     matrix = tl.program_id(1).to(tl.int64)
     stride_i32 = num_blocks * BLOCK
     stride = stride_i32.to(tl.int64)
     n_steps = tl.cdiv(size, stride_i32)
 
-    m_cur = tl.full((), 0.0, dtype=tl.float64)
-    s_cur = tl.full((), 0.0, dtype=tl.float64)
+    q_cur = tl.full((), 0.0, dtype=tl.float64)
+    m_cur = tl.full((), 0.0, dtype=tl.float32)
     nf_cur = tl.full((), 0, dtype=tl.int32)
     x_base = x_ptr + matrix * size
 
@@ -415,112 +468,179 @@ def _safe_norm_part_kernel(
         inv_m = tl.where(has_val, 1.0 / tl.where(has_val, m_chunk, 1.0), 0.0)
         ratio = av_clean * inv_m
         s_chunk = tl.where(has_val, tl.sum(ratio * ratio, axis=0), 0.0)
+        mc = tl.where(has_val, m_chunk, 0.0)
+        mc64 = mc.to(tl.float64)
+        q_cur += s_chunk.to(tl.float64) * (mc64 * mc64)
+        m_cur = tl.maximum(m_cur, mc)
 
-        mc = tl.where(has_val, m_chunk, 0.0).to(tl.float64)
-        sc = s_chunk.to(tl.float64)
-        m_new = tl.maximum(m_cur, mc)
-        m_safe = tl.where(m_new > 0.0, m_new, 1.0)
-        r_old = m_cur / m_safe
-        r_new = mc / m_safe
-        s_cur = s_cur * (r_old * r_old) + sc * (r_new * r_new)
-        m_cur = m_new
-
-    out_idx = matrix * REDUCE_BLOCKS + pid.to(tl.int64)
-    tl.store(m_ptr + out_idx, m_cur)
-    tl.store(s_ptr + out_idx, s_cur)
-    tl.store(nf_ptr + out_idx, nf_cur)
+    out = sc_ptr + matrix * sc_stride + pid.to(tl.int64)
+    tl.store(out, q_cur)
+    tl.store(out + REDUCE_BLOCKS, m_cur.to(tl.float64))
+    tl.store(out + 2 * REDUCE_BLOCKS, nf_cur.to(tl.float64))
 
 
-@triton.autotune(configs=[triton.Config({"BLOCK": 4096, "REDUCE_BLOCKS": _REDUCE_BLOCKS}, num_warps=4)], key=[])
+@triton.autotune(configs=[triton.Config({"BLOCK": _ELEMENTWISE_BLOCK, "REDUCE_BLOCKS": _REDUCE_BLOCKS},
+                                        num_warps=_NORMALIZE_WARPS)], key=[])
 @triton.jit
 def _normalize_safe_kernel(
-    x_ptr, m_ptr, s_ptr, nf_ptr, factors_ptr, o_ptr,
-    size, num_blocks, has_factors, prescale, fro_floor, dtype_max,
+    x_ptr, sc_ptr, factors_ptr, o_ptr,
+    size, num_blocks, num_programs, sc_stride, has_factors, prescale, fro_floor, dtype_max,
     BLOCK: tl.constexpr, REDUCE_BLOCKS: tl.constexpr,
 ):
-    """Reduce partial scaled norms in FP64 and normalize to target operand norm (zeros if invalid)."""
+    """Reduce the norm partials in FP64 and normalize to the operand norm (zeros if invalid).
+
+    Every thread of every program repeats the FP64 reduction, so a matrix gets at most
+    ``num_programs`` programs, and each one walks its blocks in strided steps.
+    """
+    pid = tl.program_id(0).to(tl.int64)
     matrix = tl.program_id(1).to(tl.int64)
-    local = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     idx = tl.arange(0, REDUCE_BLOCKS)
     bmask = idx < num_blocks
+    part = sc_ptr + matrix * sc_stride + idx
 
-    m_vec = tl.load(m_ptr + matrix * REDUCE_BLOCKS + idx, mask=bmask, other=0.0)
-    s_vec = tl.load(s_ptr + matrix * REDUCE_BLOCKS + idx, mask=bmask, other=0.0)
-    nf_vec = tl.load(nf_ptr + matrix * REDUCE_BLOCKS + idx, mask=bmask, other=0)
-
-    any_nf = tl.sum(nf_vec, axis=0) > 0
-    M = tl.max(m_vec, axis=0)
+    total = tl.sum(tl.load(part, mask=bmask, other=0.0), axis=0)
+    M = tl.max(tl.load(part + REDUCE_BLOCKS, mask=bmask, other=0.0).to(tl.float32), axis=0)
+    any_nf = tl.max(tl.load(part + 2 * REDUCE_BLOCKS, mask=bmask, other=0.0).to(tl.float32), axis=0) > 0.0
     M_safe = tl.where(M > 0.0, M, 1.0)
-    ratios = m_vec / M_safe
-    ssq = tl.sum(s_vec * (ratios * ratios), axis=0)
-    sqrt_ssq = tl.sqrt(ssq)
-    fro = M * sqrt_ssq
+    fro = tl.sqrt(total)
 
+    # With s = ||G / M||_F = fro / M: the scale is prescale / s, and it is in range if
+    # prescale <= dtype_max * s. Both are written without a second FP64 division.
     zero64 = tl.full((), 0.0, dtype=tl.float64)
-    prescale64 = zero64 + prescale
-    dtype_max64 = zero64 + dtype_max
-    factor = tl.where(has_factors != 0, tl.load(factors_ptr + matrix).to(tl.float64), 1.0)
-    eff_prescale = prescale64 / factor
+    scaled_max = zero64 + prescale
+    if has_factors != 0:
+        scaled_max = scaled_max / tl.load(factors_ptr + matrix).to(tl.float64)
+    scaled_max = scaled_max * M_safe.to(tl.float64)
     valid = (
         (~any_nf) & (M > 0.0) & (fro == fro) & (fro < 1e308) & (fro > fro_floor)
-        & (eff_prescale <= dtype_max64 * sqrt_ssq)
+        & (scaled_max <= (zero64 + dtype_max) * fro)
     )
-    unit_scale = tl.where(valid, eff_prescale / tl.where(sqrt_ssq > 0.0, sqrt_ssq, 1.0), 0.0).to(tl.float32)
-    M_f32 = M_safe.to(tl.float32)
+    unit_scale = tl.where(valid, scaled_max / tl.where(fro > 0.0, fro, 1.0), 0.0).to(tl.float32)
 
-    mask = local < size
-    x = tl.load(x_ptr + matrix * size + local, mask=mask, other=0.0).to(tl.float32)
-    y = tl.where(valid, (x / M_f32) * unit_scale, 0.0)
-    tl.store(o_ptr + matrix * size + local, y.to(o_ptr.dtype.element_ty), mask=mask)
+    span_i32 = num_programs * BLOCK
+    span = span_i32.to(tl.int64)
+    for step in range(0, tl.cdiv(size, span_i32)):
+        local = step.to(tl.int64) * span + pid * BLOCK + tl.arange(0, BLOCK)
+        mask = local < size
+        x = tl.load(x_ptr + matrix * size + local, mask=mask, other=0.0).to(tl.float32)
+        y = tl.where(valid, (x / M_safe) * unit_scale, 0.0)
+        tl.store(o_ptr + matrix * size + local, y.to(o_ptr.dtype.element_ty), mask=mask)
 
 
-@triton.autotune(configs=[triton.Config({"BLOCK": 4096, "REDUCE_BLOCKS": _REDUCE_BLOCKS}, num_warps=4)], key=[])
 @triton.jit
-def _dual_norm_part_kernel(
-    r_ptr, s_ptr, part_r_ptr, part_s_ptr, nn, num_blocks,
-    BLOCK: tl.constexpr, REDUCE_BLOCKS: tl.constexpr,
+def _tile_sumsq(stored, i, j, N, BLOCK: tl.constexpr):
+    """Sum of squares that tile ``(i, j)`` adds to the stored symmetric matrix, in FP64.
+
+    ``stored`` is the tile after rounding to the buffer dtype. ``_store_sym`` writes an entry
+    above the diagonal twice (itself and its mirror), a diagonal entry once, and no entry below
+    the diagonal of a diagonal tile. The square of an FP16 or BF16 value is exact in FP32. One
+    row (at most ``BLOCK`` squares) is summed in FP32, and the row sums in FP64.
+    """
+    rm = i * BLOCK + tl.arange(0, BLOCK)
+    rn = j * BLOCK + tl.arange(0, BLOCK)
+    v = stored.to(tl.float32)
+    inside = (rm[:, None] < N) & (rn[None, :] < N)
+    weight = (rm[:, None] <= rn[None, :]).to(tl.float32) + (rm[:, None] < rn[None, :]).to(tl.float32)
+    rows = tl.sum(tl.where(inside, weight * (v * v), 0.0), axis=1)
+    return tl.sum(rows.to(tl.float64), axis=0)
+
+
+@triton.autotune(configs=_CONFIGS, key=["N", "K"])
+@triton.jit
+def _syrk_norm_kernel(
+    x_ptr, c_ptr, sc_ptr, N, K, sxb, sxn, sxk, part_off, sc_stride,
+    BLOCK: tl.constexpr, BK: tl.constexpr,
 ):
-    """Single-pass partial Frobenius-squared reduction of symmetric R_h and S in FP64."""
+    """``_syrk_kernel`` that also writes ``_tile_sumsq`` of each tile to the scratch row.
+
+    The norm of ``R_h`` comes from the tiles in registers: no second pass over the matrix, no
+    atomics, and one fixed summation order per configuration.
+    """
     pid = tl.program_id(0)
-    matrix = tl.program_id(1).to(tl.int64)
-    stride_i32 = num_blocks * BLOCK
-    stride = stride_i32.to(tl.int64)
-    n_steps = tl.cdiv(nn, stride_i32)
-
-    acc_r = tl.full((), 0.0, dtype=tl.float64)
-    acc_s = tl.full((), 0.0, dtype=tl.float64)
-    r_base = r_ptr + matrix * nn
-    s_base = s_ptr + matrix * nn
-
-    for step in range(0, n_steps):
-        cur_offs = step.to(tl.int64) * stride + pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-        mask = cur_offs < nn
-        r = tl.load(r_base + cur_offs, mask=mask, other=0.0).to(tl.float32)
-        s = tl.load(s_base + cur_offs, mask=mask, other=0.0).to(tl.float32)
-        acc_r += tl.sum(r * r, axis=0).to(tl.float64)
-        acc_s += tl.sum(s * s, axis=0).to(tl.float64)
-
-    out_idx = matrix * REDUCE_BLOCKS + pid.to(tl.int64)
-    tl.store(part_r_ptr + out_idx, acc_r)
-    tl.store(part_s_ptr + out_idx, acc_s)
+    bidx = tl.program_id(1).to(tl.int64)
+    i, j = _tri_tile(pid, tl.cdiv(N, BLOCK))
+    rm = i * BLOCK + tl.arange(0, BLOCK)
+    rn = j * BLOCK + tl.arange(0, BLOCK)
+    rk = tl.arange(0, BK)
+    x_base = x_ptr + bidx * sxb
+    a_ptrs = x_base + rm[:, None].to(tl.int64) * sxn + rk[None, :] * sxk
+    b_ptrs = x_base + rk[:, None] * sxk + rn[None, :].to(tl.int64) * sxn
+    acc = tl.zeros((BLOCK, BLOCK), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BK)):
+        kmask = rk < K - k * BK
+        a = tl.load(a_ptrs, mask=(rm[:, None] < N) & kmask[None, :], other=0.0)
+        b = tl.load(b_ptrs, mask=kmask[:, None] & (rn[None, :] < N), other=0.0)
+        acc = tl.dot(a, b, acc)
+        a_ptrs += BK * sxk
+        b_ptrs += BK * sxk
+    stored = acc.to(c_ptr.dtype.element_ty)
+    _store_sym(c_ptr + bidx * N * N, stored, i, j, N, BLOCK)
+    tl.store(sc_ptr + bidx * sc_stride + part_off + pid, _tile_sumsq(stored, i, j, N, BLOCK))
 
 
-@triton.autotune(configs=[triton.Config({"BLOCK": 4096, "REDUCE_BLOCKS": _REDUCE_BLOCKS}, num_warps=4)], key=[])
+@triton.autotune(configs=_CONFIGS, key=["N"])
+@triton.jit
+def _square_norm_kernel(
+    a_ptr, o_ptr, sc_ptr, N, alpha, part_off, sc_stride,
+    BLOCK: tl.constexpr, BK: tl.constexpr,
+):
+    """``out = fl(alpha * A @ A)`` for symmetric ``A``, plus ``_tile_sumsq`` of each tile.
+
+    The first square of segment 1. ``out`` must not alias ``A``.
+    """
+    pid = tl.program_id(0)
+    bidx = tl.program_id(1).to(tl.int64)
+    offset = bidx * N * N
+    i, j = _tri_tile(pid, tl.cdiv(N, BLOCK))
+    rm = i * BLOCK + tl.arange(0, BLOCK)
+    rn = j * BLOCK + tl.arange(0, BLOCK)
+    rk = tl.arange(0, BK)
+    l_ptrs = a_ptr + offset + rm[:, None].to(tl.int64) * N + rk[None, :]
+    r_ptrs = a_ptr + offset + rk[:, None].to(tl.int64) * N + rn[None, :]
+    acc = tl.zeros((BLOCK, BLOCK), dtype=tl.float32)
+    for k in range(0, tl.cdiv(N, BK)):
+        kmask = rk < N - k * BK
+        left = tl.load(l_ptrs, mask=(rm[:, None] < N) & kmask[None, :], other=0.0)
+        right = tl.load(r_ptrs, mask=kmask[:, None] & (rn[None, :] < N), other=0.0)
+        acc = tl.dot(left, right, acc)
+        l_ptrs += BK
+        r_ptrs += BK * N
+    stored = (alpha * acc).to(o_ptr.dtype.element_ty)
+    _store_sym(o_ptr + offset, stored, i, j, N, BLOCK)
+    tl.store(sc_ptr + bidx * sc_stride + part_off + pid, _tile_sumsq(stored, i, j, N, BLOCK))
+
+
+@triton.autotune(configs=[triton.Config({"BLOCK": _ELEMENTWISE_BLOCK, "CHUNK": _TILE_CHUNK, "ROWS": _FOLD_ROWS},
+                                        num_warps=_FOLD_WARPS)], key=[])
 @triton.jit
 def _fold_and_row0_axpy_kernel(
-    r_ptr, s_ptr, part_r_ptr, part_s_ptr, tbl_ptr, regs_ptr, out_coeffs_ptr,
-    n, nn, batch, num_blocks, num_rows, use_frobenius, has_b0, has_c0,
-    u, e, prescale, alpha, u_safe, slack, residual,
-    BLOCK: tl.constexpr, REDUCE_BLOCKS: tl.constexpr,
+    r_ptr, s_ptr, sc_ptr, tbl_ptr,
+    n, nn, num_programs, sc_stride, off_r, tiles_r, off_s, tiles_s, off_c, num_rows,
+    use_frobenius, has_b0, has_c0,
+    u, e, prescale, alpha, inv_alpha, u_safe, slack, residual,
+    BLOCK: tl.constexpr, CHUNK: tl.constexpr, ROWS: tl.constexpr,
 ):
-    """Compute per-matrix Schatten-8 kappa, fold Segment-1 table, and fuse row-0 update into S."""
+    """Reduce the tile partials to the Schatten-8 ``kappa`` of each matrix, fold the segment-1
+    table with it, and apply the first row ``S += b0 R + c0 I``, in one launch.
+
+    Programs ``0 .. num_programs - 1`` of a matrix apply the first row in strided steps.
+    Program ``num_programs`` writes the coefficient rows. An FP64 division or square root
+    costs about ten multiplications, and every thread of every program computes the bound. So
+    the bound is ``w = 1 / kappa`` (no division), and the programs per matrix are few.
+    """
     pid = tl.program_id(0)
     matrix = tl.program_id(1).to(tl.int64)
-    idx = tl.arange(0, REDUCE_BLOCKS)
-    bmask = idx < num_blocks
+    sc = sc_ptr + matrix * sc_stride
+    idx = tl.arange(0, CHUNK)
 
-    sum_r = tl.sum(tl.load(part_r_ptr + matrix * REDUCE_BLOCKS + idx, mask=bmask, other=0.0), axis=0)
-    sum_s = tl.sum(tl.load(part_s_ptr + matrix * REDUCE_BLOCKS + idx, mask=bmask, other=0.0), axis=0)
+    sum_r = tl.full((), 0.0, dtype=tl.float64)
+    for chunk in range(0, tl.cdiv(tiles_r, CHUNK)):
+        at = chunk * CHUNK + idx
+        sum_r += tl.sum(tl.load(sc + off_r + at, mask=at < tiles_r, other=0.0), axis=0)
+    sum_s = tl.full((), 0.0, dtype=tl.float64)
+    for chunk in range(0, tl.cdiv(tiles_s, CHUNK)):
+        at = chunk * CHUNK + idx
+        sum_s += tl.sum(tl.load(sc + off_s + at, mask=at < tiles_s, other=0.0), axis=0)
     norm_r = tl.sqrt(sum_r)
     norm_s = tl.sqrt(sum_s)
     ok = (norm_r == norm_r) & (norm_r < 1e308) & (norm_s == norm_s) & (norm_s < 1e308)
@@ -530,80 +650,73 @@ def _fold_and_row0_axpy_kernel(
     e64 = zero64 + e
     prescale64 = zero64 + prescale
     alpha64 = zero64 + alpha
+    inv_alpha64 = zero64 + inv_alpha
     u_safe64 = zero64 + u_safe
     slack64 = zero64 + slack
-    res64 = zero64 + residual
 
     trace_bound = prescale64 * prescale64 * (1.0 + u64) * (1.0 + u64) * slack64
-    schatten8 = tl.sqrt(((1.0 + u64) * norm_s * slack64 + n * e64) / alpha64)
+    schatten8 = tl.sqrt(((1.0 + u64) * norm_s * slack64 + n * e64) * inv_alpha64)
     res_bound = u64 * norm_r * slack64 + n * e64
     schatten_upper = tl.where(norm_s > 0.0, tl.minimum(schatten8 + res_bound, trace_bound), trace_bound)
     upper = tl.where(use_frobenius != 0, trace_bound, schatten_upper)
+    w = tl.where(ok, u_safe64 * u_safe64 * upper, 1.0)
 
-    kappa = tl.where(ok, 1.0 / (u_safe64 * u_safe64 * upper), 0.0)
-    k_safe = tl.where(ok, kappa, 1.0)
-    sqrt_k = tl.sqrt(k_safe)
+    if pid == num_programs:
+        # Row j reads buffers with the scales 1 / g: g = kappa for buffer 0, kappa^2 / alpha
+        # for the first row, and 1 for a later destination (the codes of ``_seg1_table``).
+        # The last row carries sqrt(kappa), so that Q @ X_h has the singular values f(x).
+        kappa = 1.0 / w
+        sqrt_k = tl.sqrt(kappa)
+        g1 = kappa * kappa * inv_alpha64
+        ok_flag = tl.where(ok, 1.0, 0.0) + zero64
+        coeff = sc + off_c
+        tl.store(coeff, tl.where(ok, (zero64 + residual) * sqrt_k, 0.0))
+        tl.store(coeff + 3, ok_flag)
 
-    b0_raw = tl.load(tbl_ptr + 1)
-    c0_raw = tl.load(tbl_ptr + 2)
-    b0_t = tl.where(ok, alpha64 * b0_raw / k_safe, 0.0).to(tl.float32)
-    c0_t = tl.where(ok, alpha64 * c0_raw / (k_safe * k_safe), 0.0).to(tl.float32)
-    ok_f32 = tl.where(ok, 1.0, 0.0).to(tl.float32)
-
-    if pid == 0:
-        tl.store(out_coeffs_ptr + matrix * 4 + 0, tl.where(ok, res64 * sqrt_k, 0.0).to(tl.float32))
-        tl.store(out_coeffs_ptr + matrix * 4 + 1, tl.full((), 0.0, dtype=tl.float32))
-        tl.store(out_coeffs_ptr + matrix * 4 + 2, tl.full((), 0.0, dtype=tl.float32))
-        tl.store(out_coeffs_ptr + matrix * 4 + 3, ok_f32)
-
-        f0 = 1.0 / k_safe
-        f1 = alpha64 / (k_safe * k_safe)
-        f2 = tl.full((), 1.0, dtype=tl.float64)
-        for j in range(1, num_rows):
-            dst = tl.load(regs_ptr + j * 3 + 0)
-            src = tl.load(regs_ptr + j * 3 + 1)
-            add = tl.load(regs_ptr + j * 3 + 2)
-            a = tl.load(tbl_ptr + j * 3 + 0)
-            b = tl.load(tbl_ptr + j * 3 + 1)
-            c = tl.load(tbl_ptr + j * 3 + 2)
-            f_src = tl.where(src == 0, f0, tl.where(src == 1, f1, f2))
-            f_add = tl.where(add == 0, f0, tl.where(add == 1, f1, f2))
-            t = tl.where(j == num_rows - 1, sqrt_k, 1.0)
-            fa = tl.where(ok, a * t / (f_src * f_src), 0.0).to(tl.float32)
-            fb = tl.where(ok, b * t / f_add, 0.0).to(tl.float32)
-            fc = tl.where(ok, c * t, 0.0).to(tl.float32)
-            base_c = (j.to(tl.int64) * batch + matrix) * 4
-            tl.store(out_coeffs_ptr + base_c + 0, fa)
-            tl.store(out_coeffs_ptr + base_c + 1, fb)
-            tl.store(out_coeffs_ptr + base_c + 2, fc)
-            tl.store(out_coeffs_ptr + base_c + 3, ok_f32)
-            f0 = tl.where(dst == 0, t, f0)
-            f1 = tl.where(dst == 1, t, f1)
-            f2 = tl.where(dst == 2, t, f2)
-
-    if (has_b0 != 0) | (has_c0 != 0):
-        local = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-        mask = local < nn
-        s_val = tl.load(s_ptr + matrix * nn + local, mask=mask, other=0.0).to(tl.float32)
-        if has_b0 != 0:
-            r_val = tl.load(r_ptr + matrix * nn + local, mask=mask, other=0.0).to(tl.float32)
-            s_val = s_val + b0_t * r_val
-        if has_c0 != 0:
-            row = local // n
-            col = local - row * n
-            s_val = s_val + tl.where(row == col, c0_t, 0.0)
-        s_val = tl.where(ok, s_val, 0.0)
-        tl.store(s_ptr + matrix * nn + local, s_val.to(s_ptr.dtype.element_ty), mask=mask)
+        rows = tl.arange(0, ROWS)
+        folded = (rows >= 1) & (rows < num_rows)
+        a = tl.load(tbl_ptr + rows * 5 + 0, mask=folded, other=0.0)
+        b = tl.load(tbl_ptr + rows * 5 + 1, mask=folded, other=0.0)
+        c = tl.load(tbl_ptr + rows * 5 + 2, mask=folded, other=0.0)
+        src = tl.load(tbl_ptr + rows * 5 + 3, mask=folded, other=2.0)
+        add = tl.load(tbl_ptr + rows * 5 + 4, mask=folded, other=2.0)
+        g_src = tl.where(src == 0.0, kappa, tl.where(src == 1.0, g1, 1.0))
+        g_add = tl.where(add == 0.0, kappa, tl.where(add == 1.0, g1, 1.0))
+        t = tl.where(rows == num_rows - 1, sqrt_k, 1.0)
+        tl.store(coeff + rows * 4 + 0, tl.where(ok, a * t * (g_src * g_src), 0.0), mask=folded)
+        tl.store(coeff + rows * 4 + 1, tl.where(ok, b * t * g_add, 0.0), mask=folded)
+        tl.store(coeff + rows * 4 + 2, tl.where(ok, c * t, 0.0), mask=folded)
+        tl.store(coeff + rows * 4 + 3, ok_flag + tl.zeros((ROWS,), dtype=tl.float64), mask=folded)
+    else:
+        b0_t = tl.where(ok, alpha64 * tl.load(tbl_ptr + 1) * w, 0.0).to(tl.float32)
+        c0_t = tl.where(ok, alpha64 * tl.load(tbl_ptr + 2) * (w * w), 0.0).to(tl.float32)
+        span_i32 = num_programs * BLOCK
+        span = span_i32.to(tl.int64)
+        for step in range(0, tl.cdiv(nn, span_i32)):
+            local = step.to(tl.int64) * span + pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+            mask = local < nn
+            s_val = tl.load(s_ptr + matrix * nn + local, mask=mask, other=0.0).to(tl.float32)
+            if has_b0 != 0:
+                r_val = tl.load(r_ptr + matrix * nn + local, mask=mask, other=0.0).to(tl.float32)
+                s_val = s_val + b0_t * r_val
+            if has_c0 != 0:
+                row = local // n
+                col = local - row * n
+                s_val = s_val + tl.where(row == col, c0_t, 0.0)
+            s_val = tl.where(ok, s_val, 0.0)
+            tl.store(s_ptr + matrix * nn + local, s_val.to(s_ptr.dtype.element_ty), mask=mask)
 
 
 # restore_value: the output can alias C, so autotune trials must not accumulate into it.
+# coeff_off selects the coefficient row: it changes per launch and must not specialize.
 @triton.autotune(configs=_CONFIGS, key=["N"], restore_value=["o_ptr"])
-@triton.jit
+@triton.jit(do_not_specialize=["coeff_off"])
 def _symprod_ptr_kernel(
-    a_ptr, b_ptr, c_ptr, o_ptr, coeff_ptr, N,
+    a_ptr, b_ptr, c_ptr, o_ptr, sc_ptr, N, sc_stride, coeff_off,
     BLOCK: tl.constexpr, BK: tl.constexpr,
 ):
-    """Per-matrix device-coefficient variant of ``_symprod_kernel``."""
+    """``_symprod_kernel`` with the coefficients ``(a, b, c, ok)`` of each matrix read from its
+    scratch row at ``coeff_off`` (FP64 values, rounded to FP32 here)."""
     bidx = tl.program_id(1).to(tl.int64)
     offset = bidx * N * N
     i, j = _tri_tile(tl.program_id(0), tl.cdiv(N, BLOCK))
@@ -622,13 +735,40 @@ def _symprod_ptr_kernel(
         r_ptrs += BK * N
     tile = (rm[:, None] < N) & (rn[None, :] < N)
     c = tl.load(c_ptr + offset + rm[:, None].to(tl.int64) * N + rn[None, :], mask=tile, other=0.0)
-    alpha = tl.load(coeff_ptr + bidx * 4 + 0)
-    beta = tl.load(coeff_ptr + bidx * 4 + 1)
-    gamma = tl.load(coeff_ptr + bidx * 4 + 2)
-    ok = tl.load(coeff_ptr + bidx * 4 + 3)
+    coeff = sc_ptr + bidx * sc_stride + coeff_off
+    alpha = tl.load(coeff + 0).to(tl.float32)
+    beta = tl.load(coeff + 1).to(tl.float32)
+    gamma = tl.load(coeff + 2).to(tl.float32)
+    ok = tl.load(coeff + 3)
     raw = alpha * acc + beta * c.to(tl.float32) + gamma * (rm[:, None] == rn[None, :]).to(tl.float32)
     out = tl.where(ok != 0.0, raw, 0.0)
     _store_sym(o_ptr + offset, out, i, j, N, BLOCK)
+
+
+def _fold_segment1(circuit: SchattenSwitchCircuit, R: Tensor, S: Tensor, scratch: Tensor, tiles_r: int,
+                   tiles_s: int, *, k: int, use_frobenius: bool) -> None:
+    """Launch ``_fold_and_row0_axpy_kernel`` on the stored ``R_h`` and ``S`` of shape (batch, n, n).
+
+    ``scratch`` holds ``tiles_r`` and ``tiles_s`` tile partials per matrix (``_scratch_layout``).
+    The kernel writes the coefficient rows there and updates ``S`` in place. ``k`` is the long
+    side of the input: above 2^16 columns the slack grows with the FP32 Gram bias (Fable M1).
+    """
+    batch, n, _ = R.shape
+    nn = n * n
+    seg1_residual, seg1_rows = circuit.table[0]
+    prescale, alpha = _prescale(n)
+    u, e = _ROUNDING[R.dtype]
+    k_slack = 1.0 if k <= 65536 else 1.0 / max(1.0 - 1.2e-8 * k, 0.2)
+    off_r, off_s, off_c, stride = _scratch_layout(n, len(seg1_rows))
+    has_b0 = int(seg1_rows[0][4] != 0.0)
+    has_c0 = int(seg1_rows[0][5] != 0.0)
+    programs = min(_FOLD_PROGRAMS, -(-nn // _ELEMENTWISE_BLOCK)) if (has_b0 or has_c0) else 0
+    _launch(_fold_and_row0_axpy_kernel, lambda c: (programs + 1, batch, 1),
+            R, S, scratch, _seg1_table(circuit, R.device),
+            n, nn, programs, stride, off_r, tiles_r, off_s, tiles_s, off_c, len(seg1_rows),
+            int(use_frobenius), has_b0, has_c0,
+            float(u), float(e), float(prescale), float(alpha), 1.0 / alpha,
+            float(circuit.u_safe), float(_SLACK * k_slack), float(seg1_residual))
 
 
 @torch.compiler.disable
@@ -662,61 +802,45 @@ def schatten_switch_blackwell(G: Tensor, variant=None, *, dtype: torch.dtype = t
     device = X32.device
     n, k = min(rows, columns), max(rows, columns)
     size = rows * columns
-    nn = n * n
     prescale, alpha = _prescale(n)
-    u, e = _ROUNDING[dtype]
     dtype_max = float(torch.finfo(dtype).max)
-    k_slack = 1.0 if k <= 65536 else 1.0 / max(1.0 - 1.2e-8 * k, 0.2)
+    table = circuit.table
+    seg1_residual, seg1_rows = table[0]
 
-    m_part = torch.empty((batch, _REDUCE_BLOCKS), dtype=torch.float64, device=device)
-    s_part = torch.empty_like(m_part)
-    nf_part = torch.empty((batch, _REDUCE_BLOCKS), dtype=torch.int32, device=device)
+    off_r, off_s, off_c, stride = _scratch_layout(n, len(seg1_rows))
+    scratch = torch.empty((batch, stride), dtype=torch.float64, device=device)
     if sigma_hat is not None:
         factors = torch.tensor(_explicit_factors(circuit, sigma_hat, batch, n, dtype),
                                dtype=torch.float64, device=device)
         has_factors = 1
     else:
-        factors = m_part
+        factors = scratch
         has_factors = 0
 
-    size_blocks = min(_REDUCE_BLOCKS, triton.cdiv(size, 4096))
-    _launch(_safe_norm_part_kernel, lambda c: (size_blocks, batch, 1),
-            X32, m_part, s_part, nf_part, size, size_blocks)
+    size_blocks = min(_REDUCE_BLOCKS, -(-size // _NORM_BLOCK))
+    _launch(_safe_norm_part_kernel, lambda c: (size_blocks, batch, 1), X32, scratch, size, size_blocks, stride)
     X = torch.empty(X32.shape, dtype=dtype, device=device)
-    _launch(_normalize_safe_kernel, lambda c: (triton.cdiv(size, c["BLOCK"]), batch, 1),
-            X32, m_part, s_part, nf_part, factors, X,
-            size, size_blocks, has_factors, float(prescale), float(FRO_FLOOR), dtype_max)
+    programs = min(_NORMALIZE_PROGRAMS, -(-size // _ELEMENTWISE_BLOCK))
+    _launch(_normalize_safe_kernel, lambda c: (programs, batch, 1),
+            X32, scratch, factors, X,
+            size, size_blocks, programs, stride, has_factors, float(prescale), float(FRO_FLOOR), dtype_max)
 
-    work = X.new_empty(circuit.buffers, batch, n, n)
+    work = X.new_empty(circuit.buffers, batch, n, n).unbind(0)
     grid = _triangle_grid(n, batch)
-    table = circuit.table
-    seg1_residual, seg1_rows = table[0]
-    out_coeffs = torch.empty((len(seg1_rows), batch, 4), dtype=torch.float32, device=device)
-
     view = X.mT if rows > columns else X
-    _launch(_syrk_kernel, grid, view, work[0], n, k, *view.stride())
-    _launch(_symprod_kernel, grid, work[0], work[0], work[0], work[1], n, float(alpha), 0.0, 0.0)
+    tiles_r = _tile_count(n, _launch(_syrk_norm_kernel, grid, view, work[0], scratch, n, k, *view.stride(),
+                                     off_r, stride))
+    tiles_s = _tile_count(n, _launch(_square_norm_kernel, grid, work[0], work[1], scratch, n, float(alpha),
+                                     off_s, stride))
 
-    nn_blocks = min(_REDUCE_BLOCKS, triton.cdiv(nn, 4096))
-    _launch(_dual_norm_part_kernel, lambda c: (nn_blocks, batch, 1),
-            work[0], work[1], m_part, s_part, nn, nn_blocks)
-
-    tbl_coeffs, tbl_regs = _seg1_table_tensors(circuit, device)
-    has_b0 = int(seg1_rows[0][4] != 0.0)
-    has_c0 = int(seg1_rows[0][5] != 0.0)
-    use_frobenius = int(has_factors != 0 or scaling == "frobenius")
-    row0_grid = (lambda c: (triton.cdiv(nn, c["BLOCK"]), batch, 1)) if (has_b0 or has_c0) else (lambda c: (1, batch, 1))
-    _launch(_fold_and_row0_axpy_kernel, row0_grid,
-            work[0], work[1], m_part, s_part, tbl_coeffs, tbl_regs, out_coeffs,
-            n, nn, batch, nn_blocks, len(seg1_rows), use_frobenius, has_b0, has_c0,
-            float(u), float(e), float(prescale), float(alpha),
-            float(circuit.u_safe), float(_SLACK * k_slack), float(seg1_residual))
-
+    _fold_segment1(circuit, work[0], work[1], scratch, tiles_r, tiles_s, k=k,
+                   use_frobenius=has_factors != 0 or scaling == "frobenius")
     for j, (dst, src, add, *_rest) in enumerate(seg1_rows[1:], 1):
-        _launch(_symprod_ptr_kernel, grid, work[src], work[src], work[add], work[dst], out_coeffs[j], n)
+        _launch(_symprod_ptr_kernel, grid, work[src], work[src], work[add], work[dst], scratch,
+                n, stride, off_c + 4 * j)
 
     if sigma_hat is not None:
-        X = torch.where((out_coeffs[0, :, 3] != 0.0)[:, None, None], X, 0.0)
+        X = torch.where((scratch[:, off_c + 3] != 0.0)[:, None, None], X, 0.0)
 
     last = len(table) - 1
     seg1_out_dtype = out_dtype if last == 0 else dtype
@@ -724,7 +848,7 @@ def schatten_switch_blackwell(G: Tensor, variant=None, *, dtype: torch.dtype = t
         X = _apply(work[dst], X, 0.0, seg1_out_dtype)
     else:
         prod = _apply(work[dst], X, 0.0, torch.float32)
-        res_scale = out_coeffs[0, :, 0].view(-1, 1, 1)
+        res_scale = scratch[:, off_c].float().view(-1, 1, 1)
         X = (prod + res_scale * X.float()).to(seg1_out_dtype)
     if sigma_hat is not None:
         X = torch.where(torch.isfinite(X).all(dim=(-2, -1), keepdim=True), X, 0.0)

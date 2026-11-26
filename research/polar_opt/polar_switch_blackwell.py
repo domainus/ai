@@ -34,6 +34,8 @@ import torch
 import triton
 import triton.language as tl
 from torch import Tensor
+from triton import knobs
+from triton.runtime import driver
 
 from research.polar_opt.baselines import POLAR_EXPRESS_COEFFICIENTS, _SWITCH_TABLES, _take_steps
 from research.polar_opt.kernels_blackwell import (
@@ -110,17 +112,53 @@ def _autotune_key(kernel, args) -> tuple:
     return tuple(key)
 
 
-def _launch(kernel, grid, *args):
-    """Launch an autotuned kernel on ``grid(config)`` programs.
+def _config_of(kernel, args) -> dict:
+    """Keyword arguments of the config the autotuner uses for ``args`` (after one run)."""
+    if len(kernel.configs) > 1:
+        return kernel.cache.get(_autotune_key(kernel, args), kernel.best_config).kwargs
+    return kernel.configs[0].kwargs
+
+
+def _c_launcher(compiled):
+    """``(launch, head)`` to call Triton's C launcher without its Python wrappers, or None.
+
+    ``CompiledKernel.__getitem__`` and ``CudaLauncher.__call__`` cost about 3 us per launch. For
+    a kernel without scratch memory, sanitizer, or tensor descriptors they only read the current
+    stream and pass constants. The argument layout is the one of Triton 3.8. Another version,
+    or a kernel that needs the wrappers, keeps the public path.
+    """
+    try:
+        launcher = compiled.run
+        plain = (triton.__version__.startswith("3.8.") and type(launcher).__name__ == "CudaLauncher"
+                 and launcher.launch is driver.active.utils.launch and not launcher.gsan_enabled
+                 and not launcher.global_scratch_size and not launcher.profile_scratch_size)
+        if not plain:
+            return None
+        # launch(grid x, y, z, stream, *head, kernel arguments): no launch metadata, no hooks,
+        # and no global or profile scratch.
+        return launcher.launch, (compiled.function, launcher.launch_cooperative_grid, launcher.launch_pdl,
+                                 compiled.packed_metadata, None, None, None, None, None,
+                                 launcher.arg_annotations, launcher.kernel_signature)
+    except AttributeError:
+        return None
+
+
+def _launch(kernel, grid, *args) -> dict:
+    """Launch an autotuned kernel on ``grid(config)`` programs and return ``config``.
+
+    ``config`` holds the keyword arguments of the autotuned configuration (for example the tile
+    ``BLOCK``), so a caller can size what the kernel wrote.
 
     The first call for a specialization runs Triton's autotuner. Later calls reuse its
-    CompiledKernel. This skips about 12 us of Python argument binding per launch, which
-    otherwise dominates small matrices. The key holds everything Triton specializes on: integer
-    values, dtypes, and 16-byte pointer alignment. Float arguments never specialize.
+    CompiledKernel and, when possible, call Triton's C launcher directly (``_c_launcher``).
+    This skips the Python argument binding that otherwise dominates small matrices. The key
+    holds everything Triton specializes on: integer values, dtypes, and 16-byte pointer
+    alignment. Float arguments never specialize. The C launcher still receives the tensors, so
+    it checks every pointer. Launch hooks (profilers) use the public path.
     """
     if torch.compiler.is_compiling():
         kernel[grid](*args)
-        return
+        return _config_of(kernel, args)
     key = (kernel, args[0].device, *[
         (a.dtype, a.data_ptr() % 16) if isinstance(a, Tensor) else None if isinstance(a, float) else a
         for a in args
@@ -128,22 +166,26 @@ def _launch(kernel, grid, *args):
     plan = _PLANS.get(key)
     if plan is None:
         compiled = kernel[grid](*args)
-        if compiled is None or not hasattr(compiled, "__getitem__"):
-            return
-        if len(kernel.configs) > 1:
-            autotune_config = kernel.cache.get(_autotune_key(kernel, args), kernel.best_config)
-        else:
-            autotune_config = kernel.configs[0]
-        config = autotune_config.kwargs
-        _PLANS[key] = compiled, config, tuple(config[n] for n in kernel.arg_names if n in config)
+        config = _config_of(kernel, args)
+        if compiled is not None and hasattr(compiled, "__getitem__"):
+            constants = tuple(config[n] for n in kernel.arg_names if n in config)
+            _PLANS[key] = compiled, config, constants, _c_launcher(compiled)
+        return config
+    compiled, config, constants, direct = plan
+    x, y, z = grid(config)
+    hooks = knobs.runtime
+    if direct is None or hooks.launch_enter_hook.calls or hooks.launch_exit_hook.calls:
+        compiled[x, y, z](*args, *constants)
     else:
-        compiled, config, constants = plan
-        compiled[grid(config)](*args, *constants)
+        launch, head = direct
+        active = driver.active
+        launch(x, y, z, active.get_current_stream(active.get_current_device()), *head, (*args, *constants))
+    return config
 
 
 def _triangle_grid(n: int, batch: int):
     def grid(config):
-        tiles = triton.cdiv(n, config["BLOCK"])
+        tiles = -(-n // config["BLOCK"])
         return tiles * (tiles + 1) // 2, batch, 1
 
     return grid
@@ -162,7 +204,7 @@ def _prepare(G: Tensor, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
     norm = torch.linalg.vector_norm(X, dim=(-2, -1))
     out = torch.empty(X.shape, dtype=dtype, device=X.device)
     size = X.shape[-2] * X.shape[-1]
-    _launch(_normalize_kernel, lambda c: (triton.cdiv(size, c["BLOCK"]), len(X), 1),
+    _launch(_normalize_kernel, lambda c: (-(-size // c["BLOCK"]), len(X), 1),
             X, norm, out, size, _EPS)
     return out, norm
 
