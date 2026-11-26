@@ -1200,6 +1200,10 @@ def run_early_search(args) -> None:
     began = time.perf_counter()
     artifact = json.loads(args.seed_artifact.read_text())
     cache = json.loads(args.fit_cache.read_text()) if args.fit_cache and args.fit_cache.exists() else {}
+    cache_note = "used" if cache else "none"
+    if cache and not all(isinstance(v, dict) and "mode" in v and "rungs" in v for v in cache.values()):
+        cache, cache_note = {}, "ignored: not a Schatten Switch family cache (run_fits format)"
+        print(f"--fit-cache {args.fit_cache} {cache_note}; starts are the registered circuits only", flush=True)
     cycle1 = harvested_spectra(args.trajectories)
     early = early_srank_spectra()
     ps3_c1 = np.array(harvested_score(ps3_scalar, cycle1, None)["errors"])
@@ -1288,7 +1292,7 @@ def run_early_search(args) -> None:
         "settings": {"u_safe": U_FP16, "cap": CAP, "splits": [list(s) for s in EARLY_SPLITS],
                      "jobs": [list(j) for j in EARLY_JOBS], "evaluations": args.early_evaluations,
                      "cache_starts_per_split": args.early_cache_starts, "validate_per_split": args.early_validate,
-                     "seed_artifact": str(args.seed_artifact), "fit_cache": str(args.fit_cache) if args.fit_cache else None,
+                     "seed_artifact": str(args.seed_artifact), "fit_cache": str(args.fit_cache) if args.fit_cache else None, "fit_cache_status": cache_note,
                      "targets": "Cycle 1 momenta: min(max(start error, PS3_MEDIAN / 2), 0.97 max(PS3_55 error, "
                                 "PS3_MEDIAN)); early spectra: weight * PS3_55 error",
                      "selection": "safe, Cycle 1 parity with PS3_55, early median < 0.9 x registered circuit",
