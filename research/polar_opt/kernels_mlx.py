@@ -229,6 +229,10 @@ _METAL_AFFINE = """
 """
 
 
+_METAL_MAX_N = 65535
+_METAL_FAST_DTYPES = ("float16", "bfloat16")
+
+
 def _launch_metal(kernel, x, *extra, tile_size):
     import mlx.core as mx
     n = x.shape[0]
@@ -253,15 +257,24 @@ def _metal_kernel(dtype, fused, tiny=False):
         # The SIMD-group shader can read either address space.
         if tiny and tile_size == 64:
             continue
+        suffix = f"tiny_{tile_size}" if tiny else str(tile_size)
         try:
             kernel = mx.fast.metal_kernel(
-                name=f"polar_{name}_{tile_size}", input_names=["x", "addend", "coeff"] if fused else ["x"],
+                name=f"polar_{name}_{suffix}", input_names=["x", "addend", "coeff"] if fused else ["x"],
                 output_names=["out"], ensure_row_contiguous=True,
                 header=header + "\nusing namespace metal;", source=body + epilogue + _METAL_MIRROR)
             launch = partial(_launch_metal, kernel, tile_size=tile_size)
-            probe = mx.ones((1, 1) if tiny else (tile_size, tile_size), dtype=dtype)
+            m = 1 if tiny else tile_size
+            probe = mx.ones((m, m), dtype=dtype)
             extra = (probe, mx.ones((3,))) if fused else ()
-            mx.eval(launch(probe, *extra))
+            out = launch(probe, *extra)
+            mx.eval(out)
+            actual = as_numpy(out).astype(np.float32)
+            expected = np.full((m, m), float(m), dtype=np.float32)
+            if fused:
+                expected = expected + 1.0 + np.eye(m, dtype=np.float32)
+            if actual.shape != (m, m) or not np.array_equal(actual, expected):
+                raise RuntimeError(f"Metal {name} tile={tile_size} probe numerical mismatch")
             return launch
         except (RuntimeError, ValueError, AttributeError) as exc:
             if tile_size == 32:
@@ -274,7 +287,7 @@ def metal_syrk(x):
     """Row Gram on MLX GPU. Use native matmul if the shader cannot compile."""
     if x.ndim != 2 or min(x.shape) == 0:
         raise ValueError("Expected a nonempty 2-D Metal input")
-    kernel = _metal_kernel(x.dtype, False, x.size < 8)
+    kernel = _metal_kernel(x.dtype, False, x.size < 8) if x.shape[0] <= _METAL_MAX_N else None
     return kernel(x) if kernel is not None else x @ x.T
 
 
@@ -287,12 +300,15 @@ def _metal_coefficients(a, b, c):
 def metal_symprod(x, addend, a, b, c):
     """Fuse a*(x @ x.T) + b*addend + c*I for a symmetric addend.
 
-    Metal rounds once at the mirrored store. Dense fallback rounds the Gram first.
+    The Metal epilogue reads only the upper triangle (r <= c) of addend and
+    mirrors it, so callers must pass a symmetric addend. Metal rounds once at
+    the mirrored store, whereas the dense fallback rounds the Gram first.
     """
     import mlx.core as mx
     if x.ndim != 2 or min(x.shape) == 0 or addend.shape != (x.shape[0], x.shape[0]):
         raise ValueError("Expected a nonempty matrix and a square addend matching its row count")
-    kernel = _metal_kernel(x.dtype, True, x.size < 8)
+    kernel = (_metal_kernel(x.dtype, True, x.size < 8 or addend.size < 8)
+              if x.shape[0] <= _METAL_MAX_N else None)
     if kernel is not None:
         return kernel(x, addend, _metal_coefficients(a, b, c))
     return (a * (x @ x.T).astype(mx.float32) + b * addend.astype(mx.float32)
@@ -342,7 +358,7 @@ class _Work:
         if dtype not in DTYPES:
             raise ValueError(f"Unknown working dtype {dtype!r}")
         module = type(x).__module__.split(".")[0]
-        self.metal = use_metal_syrk and module == "mlx"
+        self.metal = use_metal_syrk and module == "mlx" and dtype in _METAL_FAST_DTYPES
         if module == "mlx":
             import mlx.core as mx
             self.cast = lambda value: value.astype(getattr(mx, dtype))
@@ -488,12 +504,17 @@ def _quality(output, reference):
 def _measure(x, reference, backend, dtype, requested, rng, warmups, repeats):
     calls = {name: partial(fn, x, dtype=dtype, use_metal_syrk=requested)
              for name, fn in METHODS.items()}
-    syrk = symprod = False
-    if requested and backend == "mlx":
+    syrk_fn = symprod_fn = None
+    if (requested and backend == "mlx" and dtype in _METAL_FAST_DTYPES
+            and min(x.shape) <= _METAL_MAX_N):
         import mlx.core as mx
         work_dtype = getattr(mx, dtype)
-        syrk = _metal_kernel(work_dtype, False, x.size < 8) is not None
-        symprod = _metal_kernel(work_dtype, True, min(x.shape) ** 2 < 8) is not None
+        syrk_fn = _metal_kernel(work_dtype, False, x.size < 8)
+        symprod_fn = _metal_kernel(work_dtype, True, min(x.shape) ** 2 < 8)
+    syrk = syrk_fn is not None
+    symprod = symprod_fn is not None
+    syrk_tile = syrk_fn.keywords["tile_size"] if syrk_fn is not None else None
+    symprod_tile = symprod_fn.keywords["tile_size"] if symprod_fn is not None else None
     for block in _block_orders(rng, warmups):
         for name in block:
             synchronize(calls[name](), backend)
@@ -512,6 +533,8 @@ def _measure(x, reference, backend, dtype, requested, rng, warmups, repeats):
         p25, median, p75 = np.percentile(samples, [25, 50, 75]).tolist()
         rows.append(dict(method=name, shape=list(x.shape), backend=backend, dtype=dtype,
                          use_metal_syrk=syrk, use_metal_symprod=symprod and name.startswith("PS"),
+                         metal_syrk_tile=syrk_tile,
+                         metal_symprod_tile=symprod_tile if name.startswith("PS") else None,
                          output_dtype=str(outputs[name].dtype), median_ms=median, latency_ms=median,
                          iqr_ms=p75-p25, p25_ms=p25, p75_ms=p75, min_ms=min(samples),
                          samples_ms=samples, **_quality(outputs[name], reference)))

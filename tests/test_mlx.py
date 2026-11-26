@@ -160,6 +160,7 @@ def test_interleaved_benchmark(monkeypatch):
     for row in data["results"]:
         assert row["backend"] == "cpu" and row["dtype"] in kernels.DTYPES
         assert not row["use_metal_syrk"] and not row["use_metal_symprod"]
+        assert row["metal_syrk_tile"] is None and row["metal_symprod_tile"] is None
         samples = row["samples_ms"]
         assert len(samples) == repeats
         p25, median, p75 = np.percentile(samples, [25, 50, 75])
@@ -226,9 +227,15 @@ def test_live_metal_syrk_and_fused_symprod(dtype):
     import mlx.core as mx
     fmt = getattr(mx, dtype)
     # Fail if these calls fall back. Dense matmul can also produce exact symmetry.
-    for shape in ((1, 1), (32, 32), (33, 17), (67, 35)):
+    for shape in ((1, 1), (32, 32), (33, 17), (17, 33), (67, 35), (35, 67)):
+        tiny = int(np.prod(shape)) < 8
         for fused in (False, True):
-            assert kernels._metal_kernel(fmt, fused, np.prod(shape) < 8) is not None
+            launch = kernels._metal_kernel(fmt, fused, tiny)
+            assert launch is not None
+            tile = launch.keywords["tile_size"]
+            assert tile in (32, 64)
+            if tiny:
+                assert tile == 32
         # Transposed input also checks the custom kernel's row-contiguous copy.
         x = mx.array(np.random.default_rng(4).normal(size=shape[::-1]).astype(np.float32)).astype(fmt).T
         xf = kernels.as_numpy(x).astype(np.float64)
@@ -243,9 +250,9 @@ def test_live_metal_syrk_and_fused_symprod(dtype):
             np.testing.assert_allclose(kernels.as_numpy(actual), target, rtol=tol, atol=tol)
 
     # Repeated integer-valued rows give an exact, inexpensive FP64 oracle
-    # for every output element, including the bottom-right tile.
-    for n in (2048, 4096):
-        basis = np.random.default_rng(n).integers(-1, 2, size=(19, n)).astype(np.float64)
+    # for every output element, including rectangular K != N and bottom-right tiles.
+    for n, k in ((2048, 2048), (2048, 4096), (4096, 4096)):
+        basis = np.random.default_rng(n + k).integers(-1, 2, size=(19, k)).astype(np.float64)
         gram = mx.array((basis @ basis.T).astype(np.float32))
         indices = mx.arange(n) % len(basis)
         x = mx.array(basis.astype(np.float32)).astype(fmt)[indices]
@@ -257,3 +264,80 @@ def test_live_metal_syrk_and_fused_symprod(dtype):
         ):
             assert mx.max(mx.abs(actual - actual.T)).item() == 0
             assert mx.all(actual == target.astype(fmt)).item()
+
+
+def test_fp32_stays_dense_under_use_metal_syrk():
+    MlxArray = type("MlxArray", (), {"__module__": "mlx.core"})
+    core = SimpleNamespace(float32="f32", float16="f16", bfloat16="bf16")
+    with patch.dict(sys.modules, {"mlx": SimpleNamespace(core=core), "mlx.core": core}):
+        x = MlxArray()
+        assert kernels._Work(x, "float32", True).metal is False
+        assert kernels._Work(x, "float16", True).metal is True
+        assert kernels._Work(x, "bfloat16", True).metal is True
+        assert kernels._Work(x, "float16", False).metal is False
+
+
+def test_metal_probe_mismatch_falls_back_and_tiny_names_distinct(monkeypatch):
+    built = []
+    def make_kernel(**kwargs):
+        built.append(kwargs["name"])
+        return kwargs["name"]
+    def fake_launch(kernel_name, x, *extra, tile_size):
+        n = x.shape[0]
+        if tile_size == 64:
+            return np.zeros((n, n), dtype=np.float32)
+        expected = np.full((n, n), float(n), dtype=np.float32)
+        return expected + 1.0 + np.eye(n, dtype=np.float32) if extra else expected
+    core = SimpleNamespace(fast=SimpleNamespace(metal_kernel=make_kernel),
+                           ones=np.ones, eval=lambda v: None, float32=np.float32)
+    monkeypatch.setattr(kernels, "_launch_metal", fake_launch)
+    kernels._metal_kernel.cache_clear()
+    try:
+        with patch.dict(sys.modules, {"mlx": SimpleNamespace(core=core), "mlx.core": core}):
+            for fused, base in ((False, "syrk"), (True, "symprod")):
+                normal = kernels._metal_kernel("float16", fused, tiny=False)
+                tiny = kernels._metal_kernel("float16", fused, tiny=True)
+                assert normal is not None and tiny is not None
+                assert normal.keywords["tile_size"] == 32
+                assert tiny.keywords["tile_size"] == 32
+        assert built == [
+            "polar_syrk_64", "polar_syrk_32", "polar_syrk_tiny_32",
+            "polar_symprod_64", "polar_symprod_32", "polar_symprod_tiny_32",
+        ]
+    finally:
+        kernels._metal_kernel.cache_clear()
+
+
+def test_metal_overflow_and_tiny_addend_guards(monkeypatch):
+    seen = []
+    monkeypatch.setattr(kernels, "_metal_kernel",
+                        lambda dtype, fused, tiny=False: seen.append((dtype, fused, tiny)) or None)
+    n_big = kernels._METAL_MAX_N + 1
+    class FakeMat:
+        ndim = 2
+        shape = (n_big, 1)
+        size = n_big
+        dtype = np.float16
+        @property
+        def T(self):
+            return self
+        def __matmul__(self, other):
+            return np.ones((2, 2), dtype=np.float16)
+    class FakeAddend:
+        shape = (n_big, n_big)
+        def astype(self, _):
+            return 0
+    core = SimpleNamespace(float32=np.float32,
+                           eye=lambda n: 0.0 if n > 16 else np.eye(n, dtype=np.float32))
+    with patch.dict(sys.modules, {"mlx": SimpleNamespace(core=core), "mlx.core": core}):
+        big = FakeMat()
+        assert kernels.metal_syrk(big).shape == (2, 2)
+        assert kernels.metal_symprod(big, FakeAddend(), 1.0, 2.0, 3.0).dtype == np.float16
+        assert seen == []
+
+    x = np.arange(8, dtype=np.float32).reshape(2, 4)
+    addend = np.eye(2, dtype=np.float32)
+    with patch.dict(sys.modules, {"mlx": SimpleNamespace(core=core), "mlx.core": core}):
+        out = kernels.metal_symprod(x, addend, 1.0, 2.0, 3.0)
+    np.testing.assert_allclose(out, x @ x.T + 5.0 * addend)
+    assert seen == [(np.dtype("float32"), True, True)]
