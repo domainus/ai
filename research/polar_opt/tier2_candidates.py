@@ -8,6 +8,7 @@ from torch import Tensor
 from research.polar_opt.circuits import SpectralPrescaledPolar
 from research.polar_opt.kernels_blackwell import polar_express_triton
 from research.polar_opt.polar_switch_blackwell import polar_switch_blackwell
+from research.polar_opt.schatten_switch_blackwell import schatten_switch_blackwell
 
 
 def pe_triton_bf16(G: Tensor) -> Tensor:
@@ -20,6 +21,22 @@ def ps2_blackwell_fp16(G: Tensor) -> Tensor:
 
 def ps3_blackwell_fp16(G: Tensor) -> Tensor:
     return polar_switch_blackwell(G, "PS3_55", dtype=torch.float16)
+
+
+def ss3_54_blackwell_fp16(G: Tensor) -> Tensor:
+    return schatten_switch_blackwell(G, "SS3_54", dtype=torch.float16)
+
+
+def ss3_53_blackwell_fp16(G: Tensor) -> Tensor:
+    return schatten_switch_blackwell(G, "SS3_53", dtype=torch.float16)
+
+
+def ss3_35_blackwell_fp16(G: Tensor) -> Tensor:
+    return schatten_switch_blackwell(G, "SS3_35", dtype=torch.float16)
+
+
+def ss3_34_blackwell_fp16(G: Tensor) -> Tensor:
+    return schatten_switch_blackwell(G, "SS3_34", dtype=torch.float16)
 
 
 class ShapeKeyedSpectralPolar:

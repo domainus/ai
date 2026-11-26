@@ -1,7 +1,10 @@
 import json
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -47,3 +50,200 @@ def test_quick_cli(tmp_path):
         assert len(row["samples_ms"]) == 2
         assert all(t > 0 and np.isfinite(t) for t in row["samples_ms"])
         assert row["latency_ms"] == pytest.approx(np.median(row["samples_ms"]))
+
+
+def _has_mlx():
+    try:
+        import mlx.core as mx
+        return mx.metal.is_available()
+    except (ImportError, OSError):
+        return False
+
+
+BACKENDS = ["cpu"] + (["mlx"] if _has_mlx() else [])
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("dtype", kernels.DTYPES)
+@pytest.mark.parametrize("name", kernels.METHODS)
+def test_work_precision_quality(backend, dtype, name):
+    method = kernels.METHODS[name]
+    # Five-step approximations have different accuracy even in full precision.
+    fro_limit, orth_limit = {"jordan_ns5": (.34, .48), "polar_express": (.18, .30),
+                             "gram_ns": (.19, .32), "PS2_55": (.18, .30),
+                             "PS3_55": (.16, .26)}[name]
+    for shape in ((7, 19), (19, 7), (8, 8)):
+        matrix = np.random.default_rng(874).standard_normal(shape, dtype=np.float32)
+        u, _, vt = np.linalg.svd(matrix.astype(np.float64), full_matrices=False)
+        x = kernels.native_array(matrix, backend)
+        for use_metal in ([False, True] if backend == "mlx" else [False]):
+            out = method(x, dtype=dtype, use_metal_syrk=use_metal)
+            assert out.dtype == x.dtype and out.shape == x.shape
+            q = kernels._quality(out, u @ vt)
+            assert q["finite"] and not q["diverged"]
+            assert q["polar_error"] < fro_limit
+            assert q["orthogonality_err"] < orth_limit
+    # Restore the actual input dtype, including non-FP32 inputs.
+    if backend == "mlx":
+        import mlx.core as mx
+        half = x.astype(mx.float16)
+    else:
+        half = x.astype(np.float16)
+    assert method(half, dtype=dtype).dtype == half.dtype
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("dtype", kernels.DTYPES)
+@pytest.mark.parametrize("name", kernels.METHODS)
+def test_zero_and_rank_deficient(backend, dtype, name):
+    matrix = np.zeros((5, 3), np.float32)
+    for magnitude in (0., 1., 1e-9):
+        matrix[2, 1] = magnitude
+        x = kernels.native_array(matrix, backend)
+        y = kernels.as_numpy(kernels.METHODS[name](x, dtype=dtype, use_metal_syrk=True))
+        assert np.isfinite(y).all()
+        np.testing.assert_array_equal(y[matrix == 0], 0)
+        if magnitude:
+            assert 0. < y[2, 1] < 2.
+
+
+@pytest.mark.parametrize("dtype,mantissa", [("float16", 10), ("bfloat16", 7)])
+def test_cpu_round_to_nearest_even(dtype, mantissa):
+    ulp = 2. ** -mantissa
+    values = np.array([1., 1. + .5 * ulp, 1. + 1.5 * ulp, -1. - .5 * ulp,
+                       np.inf, -np.inf, np.nan], np.float32)
+    expected = [1., 1., 1. + 2 * ulp, -1., np.inf, -np.inf, np.nan]
+    np.testing.assert_array_equal(kernels._cpu_round(values, dtype), expected)
+
+
+@pytest.mark.parametrize("dtype", kernels.DTYPES)
+def test_norm_in_fp32_before_work_cast(dtype):
+    # Early FP16 conversion overflows. Early BF16 conversion changes the ratio.
+    x = np.array([[0.5242, 0.8301, 0.1307], [0.7128, 0.6302, 0.9205]], np.float32) * 1e6
+    work = kernels._Work(x, dtype, False)
+    expected = kernels._cpu_round(x / (np.linalg.norm(x) + 1e-7), dtype)
+    np.testing.assert_array_equal(work.cast(kernels._normalized(x)), expected)
+    with pytest.raises(ValueError, match="nonempty"):
+        kernels.polar_switch(np.empty((0, 1), dtype=np.float32), dtype=dtype)
+    with pytest.raises(ValueError, match="working dtype"):
+        kernels.polar_express(x, dtype="fp8")
+
+
+def test_interleaved_benchmark(monkeypatch):
+    observed = []
+    for name, method in kernels.METHODS.copy().items():
+        def run(x, name=name, method=method, **options):
+            observed.append(name)
+            return method(x, **options)
+        monkeypatch.setitem(kernels.METHODS, name, run)
+    repeats = 7
+    data = kernels.benchmark(backend="cpu", shapes=[(7, 19)], seeds=[0, 2], dtypes=kernels.DTYPES,
+                             repeats=repeats, warmups=2, use_metal_syrk=True)
+    assert data["git_sha"] == subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    assert datetime.fromisoformat(data["timestamp"]).utcoffset().total_seconds() == 0
+    assert data["use_metal_syrk_requested"] and not data["use_metal_syrk"]
+    assert data["divergences"] == 0
+    assert len(data["results"]) == 2 * 3 * len(kernels.METHODS)
+    assert len(data["method_order"]) == 6
+    pos = 0
+    for case in data["method_order"]:
+        blocks = case["blocks"]
+        assert len(blocks) == repeats
+        assert all(set(block) == set(kernels.METHODS) for block in blocks)
+        # A complete five-block cycle puts every method in every position.
+        assert all(set(column) == set(kernels.METHODS) for column in zip(*blocks[:5]))
+        pos += 2 * len(kernels.METHODS)
+        for block in blocks:
+            assert observed[pos:pos + len(block)] == block
+            pos += len(block)
+    assert pos == len(observed)
+    for row in data["results"]:
+        assert row["backend"] == "cpu" and row["dtype"] in kernels.DTYPES
+        assert not row["use_metal_syrk"] and not row["use_metal_symprod"]
+        samples = row["samples_ms"]
+        assert len(samples) == repeats
+        p25, median, p75 = np.percentile(samples, [25, 50, 75])
+        np.testing.assert_allclose([row["p25_ms"], row["median_ms"], row["p75_ms"], row["iqr_ms"],
+                                    row["min_ms"]], [p25, median, p75, p75-p25, min(samples)])
+
+
+def test_quality_detects_finite_and_nonfinite_divergence():
+    reference = np.eye(3)
+    for factor in (0., 1., 2., 2.5):
+        row = kernels._quality(reference * factor, reference)
+        assert row["diverged"] == (factor > 2.)
+        assert row["sigma_max"] == pytest.approx(factor)
+        assert row["orthogonality_err"] == pytest.approx(abs(factor ** 2 - 1.))
+        assert row["relative_frobenius_error"] == pytest.approx(abs(factor - 1.))
+    row = kernels._quality(np.full((3, 3), np.inf), reference)
+    assert row["diverged"] and not row["finite"] and row["sigma_max"] is None
+
+
+def test_metal_tile_contract():
+    for source in (kernels._METAL_SYRK_SOURCE, kernels._METAL_SYMPROD_SOURCE):
+        assert "const uint row = tile - col * (col + 1) / 2" in source
+        assert "r < n && h < k" in source and "c < n && h < k" in source
+        assert "threadgroup float left" in source and "threadgroup_barrier" in source
+        assert "simdgroup_float8x8 acc" in source and "simdgroup_multiply_accumulate" in source
+        assert "r < n && c < n && r <= c" in source
+        assert "out[r * n + c] = value" in source and "if (r != c) out[c * n + r] = value" in source
+    for n, k in ((1, 1), (33, 17), (2048, 2048), (4096, 4096)):
+        # Capture the actual MLX dispatch geometry even on Linux.
+        core = SimpleNamespace(gpu=object())
+        def kernel(**kwargs):
+            group_count, rem = divmod(kwargs["grid"][0], kwargs["threadgroup"][0])
+            assert rem == 0 and kwargs["threadgroup"] == (128, 1, 1)
+            tiles = (n + 31) // 32
+            assert group_count == tiles * (tiles + 1) // 2
+            assert kwargs["output_shapes"] == [(n, n)]
+            return ["tile launch"]
+        with patch.dict(sys.modules, {"mlx": SimpleNamespace(core=core), "mlx.core": core}):
+            assert kernels._launch_metal(kernel, SimpleNamespace(shape=(n, k), dtype="T")) == "tile launch"
+
+
+def test_lazy_metal_compile_failure_falls_back_once(monkeypatch):
+    # MLX may report a compile error at evaluation, after dispatch succeeded.
+    probes = []
+    def fail_evaluation(value):
+        probes.append(value)
+        raise RuntimeError("compiler unavailable")
+    core = SimpleNamespace(fast=SimpleNamespace(metal_kernel=lambda **kwargs: object()),
+                           ones=np.ones, eval=fail_evaluation, float32=np.float32, eye=np.eye)
+    x = np.arange(15, dtype=np.float32).reshape(3, 5)
+    gram = x @ x.T
+    bias = np.eye(3, dtype=np.float32)
+    monkeypatch.setattr(kernels, "_launch_metal", lambda *args: "probe")
+    kernels._metal_kernel.cache_clear()
+    try:
+        with patch.dict(sys.modules, {"mlx": SimpleNamespace(core=core), "mlx.core": core}):
+            with pytest.warns(RuntimeWarning, match="SYRK unavailable"):
+                np.testing.assert_array_equal(kernels.metal_syrk(x), gram)
+            np.testing.assert_array_equal(kernels.metal_syrk(x), gram)
+            with pytest.warns(RuntimeWarning, match="symprod unavailable"):
+                np.testing.assert_array_equal(kernels.metal_symprod(x, bias, 1, 2, 3), gram + 5 * bias)
+            assert probes == ["probe", "probe"]
+    finally:
+        kernels._metal_kernel.cache_clear()
+
+
+@pytest.mark.skipif(not _has_mlx(), reason="Requires native Apple Metal")
+@pytest.mark.parametrize("dtype", kernels.DTYPES)
+def test_live_metal_syrk_and_fused_symprod(dtype):
+    import mlx.core as mx
+    fmt = getattr(mx, dtype)
+    # Fail if these calls fall back. Dense matmul can also produce exact symmetry.
+    assert kernels._metal_kernel(fmt, False) is not None
+    assert kernels._metal_kernel(fmt, True) is not None
+    for shape in ((1, 1), (32, 32), (67, 35)):
+        # Transposed input also checks the custom kernel's row-contiguous copy.
+        x = mx.array(np.random.default_rng(4).normal(size=shape[::-1]).astype(np.float32)).astype(fmt).T
+        xf = kernels.as_numpy(x).astype(np.float64)
+        reference = xf @ xf.T
+        g = kernels.metal_syrk(x)
+        eye = mx.eye(shape[0], dtype=fmt)
+        fused = kernels.metal_symprod(x, eye, -.5, 2., -.25)
+        for actual, target in ((g, reference), (fused, -.5 * reference + 1.75 * np.eye(shape[0]))):
+            assert actual.dtype == fmt
+            assert mx.max(mx.abs(actual - actual.T)).item() == 0
+            tol = {"float32": 5e-5, "float16": 1e-3, "bfloat16": 5e-3}[dtype]
+            np.testing.assert_allclose(kernels.as_numpy(actual), target, rtol=tol, atol=tol)
