@@ -159,3 +159,21 @@ for target in (b.CANONICAL_OUTPUT, Path("/home/ryan/Documents/projects/ai/result
         print("rejected", target, exc.code)
 PY
 ```
+
+## Post-Remediation Live-GPU Re-Audit Addendum
+
+**Updated verdict — PASS. HOLD LIFTED.** All seven baseline findings are resolved for the audited snapshot. The two requested test files completed on the RTX 5080 with **224 passed, 0 failed, 0 skipped**, and 83 warnings in 244.28 seconds.
+
+Snapshot `5e060aa663c2212238a9ee1f772eb243f1da29d1` contains only the updated result JSON relative to its parent. The committed bytes match the worktree file. Its SHA-256 is `5889cb6795f73aca861e7bde02fdd10574062770570c05081667437417741b8e`. Schema `cycle4_c4_02.v2` records `git_dirty: false` and producer SHA `b8851829656575f3abf6817930bdd399ef00beef`, the exact parent. The live probes used an RTX 5080 (sm_120), driver 615.78.08, PyTorch 2.14.1+cu130 and CUDA 13.0.
+
+| Baseline finding | Re-audit evidence |
+|---|---|
+| Raw timings and derived metrics | An independent standard-library calculation reduced 69,960 event durations to 6,996 ten-event means. Every stored round mean matched exactly. Those means and 13,404 wall samples reproduced all 2,196 summary fields across 366 distributions. Maximum absolute error was below `3.56e-15` ms. All 30 Williams squares across 15 timing passes balanced both position and ordered predecessor counts. |
+| FP32 scale underflow | On 17×96 inputs with a zero group, all six powers of two (exponents −149, −145, −140, −138, −137 and −126) passed for all three rotations. Packed bytes, swizzled scales and global-scale bits matched the eager reference in 18/18 cases. All 18 global scales were positive and finite. All 18,432 E4M3 scale entries and all 14,688 outputs from the 48×96 all-ones hardware layer were finite. |
+| Butterfly tables | The (64, 16, 2) views matched contiguous tables in all six active amax partials. The public quantizer and standalone quant launch each had zero differences across 816 packed bytes, 1,024 scale bytes and four global-scale bytes. Each of the three entry points raised `ValueError` for a bad sine shape, FP16 sine table, CPU sine table and one-element tuple (12/12 rejections). |
+| Canonical output guard | Parsing a Part A run against the main checkout's canonical file and a differently named symlink to that file exited with code 2 in both cases. A simulated sm_89 failed the device check before experiment setup. The live sm_120 passed the same check. |
+| Part A workspaces | A live call to `part_a_shape` exposed six distinct GPU allocations. Each of the three quant workspaces was primed with its own rotation's partials. Running all three amax stages in reverse order reproduced their matching partials and preserved every quant workspace. |
+| Part C weight equality | The producer compares both FP32 matrices through `.view(torch.int32)` for every layer and projection. The canonical artifact records `hw_weights_checked_matrices == 60` and exact equality for each of five methods (300 matrix comparisons). |
+| Part C checkpoint and selection | The recorded post-training checkpoint fingerprint is `bbf3912196d12e7728e5bead5a0f0d7157b83a670b62f5c8bbebf68ae07bb9e4`. Among five dynamic hardware candidates, validation selected `adaptive_butterfly_b16_gptq` (val NLL 5.372480948562817, confirmatory test NLL 5.407671517490791). An in-memory case with conflicting winners selected GPTQ on validation and reported RTN separately on test. All three read-only shard hashes matched the canonical JSON and the hashes listed above. |
+
+The raw medians reproduced all 78 Part A method rows, 48 stage breakdowns and 21 Part B rows, including TFLOP/s, throughput retained, tokens/s and speedups. Both splits' NLLs reproduced PPL and the reported deltas for all 16 Part C rows. The top-level summaries agreed throughout. Maximum absolute error across these derived checks was below `2.09e-14`. Part C evidence comes from the committed run and producer code. The re-audit did not retrain the checkpoint.
