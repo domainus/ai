@@ -41,6 +41,19 @@ def _methods() -> dict:
     }
 
 
+def _candidate_methods(path: Path) -> dict:
+    """``cand_<name>_fp16`` (and ``_bf16`` if verified) for each validated circuit of a search JSON."""
+    from research.polar_opt.schatten_switch_blackwell import SchattenSwitchCircuit
+
+    out = {}
+    for name, record in json.loads(path.read_text()).get("validated", {}).items():
+        circuit = SchattenSwitchCircuit.from_dict(record["circuit"])
+        out[f"cand_{name}_fp16"] = lambda g, c=circuit: schatten_switch_blackwell(g, c, dtype=torch.float16)
+        if circuit.bf16_verified:
+            out[f"cand_{name}_bf16"] = lambda g, c=circuit: schatten_switch_blackwell(g, c, dtype=torch.bfloat16)
+    return out
+
+
 def _summarize(rows: list[dict]) -> dict:
     errs = [r["relative_frobenius_error"] for r in rows if "relative_frobenius_error" in r]
     sig_hi = [r["sigma_max"] for r in rows if "sigma_max" in r]
@@ -62,6 +75,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--input", type=Path, default=ROOT / "artifacts" / "harvested_nesterov_real.pt")
     parser.add_argument("--output", type=Path, default=ROOT / "results" / "cycle2_heldout_nesterov_eval.json")
     parser.add_argument("--divergence-limit", type=float, default=2.0)
+    parser.add_argument("--methods", nargs="+", default=None,
+                        help="subset of the built-in methods (default: all)")
+    parser.add_argument("--candidates", type=Path, default=None,
+                        help="search JSON whose 'validated' circuits are evaluated out of sample")
     args = parser.parse_args(argv)
 
     if not torch.cuda.is_available():
@@ -82,6 +99,13 @@ def main(argv: list[str] | None = None) -> None:
         targets.append((pair["phase"], pair["name"], pair["step_t"], list(pair["shape"]), G, P, P.cpu()))
 
     methods = _methods()
+    if args.methods:
+        unknown = sorted(set(args.methods) - set(methods))
+        if unknown:
+            raise ValueError(f"Unknown methods {unknown}; available: {sorted(methods)}")
+        methods = {name: methods[name] for name in args.methods}
+    if args.candidates:
+        methods.update(_candidate_methods(args.candidates))
     summary, by_phase, cases = {}, {}, {}
     for method_name, fn in methods.items():
         all_rows = []
@@ -124,6 +148,7 @@ def main(argv: list[str] | None = None) -> None:
         "layers": bundle.get("layers"),
         "pair_count": len(targets),
         "divergence_limit": args.divergence_limit,
+        "candidates": str(args.candidates) if args.candidates else None,
         "summary": summary,
         "by_phase": by_phase,
         "cases": cases,

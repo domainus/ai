@@ -35,6 +35,12 @@ Pipeline
    8192, the 117 Tier-1 cases, and a short latency check against ``ps3_55_blackwell_fp16``.
    Per number of squarings, the best-scoring candidate that passes the FP16 checks is selected.
 
+Early-spectrum re-polish (opt-in, ``--include-early-srank``, Cycle 3 C3-02): the registered 5+4,
+5+3, 3+5 and 3+4 circuits (and the best fit-cache composites of those splits) are polished again
+with purely synthetic near-rank-1 spectra (stable rank 1.03-1.60) added to the targets, then
+checked on the GPU (Fable R1 at n = 1023..8192, R2 sweeps, R3 at K = 2^20, CUDA-graph replay).
+It replaces the full search and takes a few minutes. Real held-out momenta are never read here.
+
 Run (about 50 minutes on 8 cores and one GPU for a full search):
     OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=. .venv/bin/python \
         research/polar_opt/schatten_switch_search.py --output results/schatten_switch_search_cycle2.json
@@ -50,6 +56,7 @@ for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
 
 import argparse
 import json
+import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -828,6 +835,7 @@ def latency(circuits: dict, shapes=((512, 2048), (1024, 4096), (2048, 8192), (40
                           "rel_fro_err": float(((Q - P).norm() / P.norm()).item())}
         out["shapes"]["x".join(map(str, shape))] = rows
         del G, P
+    out["kernel_launches_measured"] = {name: measure_launches(call) for name, call in calls.items()}
     out["host_load_end"] = os.getloadavg()[0]
     return out
 
@@ -964,12 +972,58 @@ def verify(circuit, dtype_name: str) -> dict:
 
 
 def kernel_launches(circuit, n: int) -> dict:
-    """GPU kernels for one FP32 matrix: Frobenius norm, (prescale), normalize, then per segment
-    SYRK + squares + ``Q @ X``, the norm of ``R`` and ``R^2``, and the elementwise first row."""
+    """GPU kernels of one natural call (``sigma_hat=None``) on a contiguous FP32 matrix.
+
+    Matrix products: per segment SYRK + squares + ``Q @ X``. Four reductions and elementwise
+    kernels: the safe norm partials, the normalize-and-prescale pass, the dual norm of ``R`` and
+    ``R^2``, and the fold kernel, which also applies the first-row ``b R + c I`` (so ``semi`` and
+    ``general`` first rows add no launch). The path is sync-free, so there are no host reads, and
+    the count does not depend on ``n``. ``measure_launches`` checks these numbers with the profiler.
+    """
     products = 2 * len(circuit.table) + sum(circuit.squarings)
-    extra = 3 + circuit.elementwise_passes + (n >= 1024)
-    return {"matrix_products": products, "total": products + extra, "host_reads": 1,
-            "ps3_55": {"matrix_products": 14, "total": 16, "host_reads": 0}}
+    return {"matrix_products": products, "total": products + 4, "host_reads": 0}
+
+
+def measure_launches(call, shape=(512, 2048)) -> dict:
+    """Profiled CUDA kernel count of one warm call, and whether it synchronizes with the host."""
+    import torch
+
+    G = torch.randn(*shape, device="cuda")
+    call(G)
+    torch.cuda.synchronize()
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        call(G)
+        torch.cuda.synchronize()
+    kernels = sum(1 for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
+                  and not e.name.startswith(("Memcpy", "Memset")))
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        call(G)
+        host_reads = 0
+    except RuntimeError:
+        host_reads = 1  # at least one synchronizing host read
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
+    torch.cuda.synchronize()
+    return {"shape": list(shape), "kernels": kernels, "host_reads": host_reads}
+
+
+def git_info() -> dict:
+    """Commit and dirty state of the checkout that ran the search (tracked files only)."""
+    import subprocess
+
+    root = Path(__file__).resolve().parents[2]
+
+    def git(*args):
+        try:
+            return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True,
+                                  timeout=10, check=True).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    status = git("status", "--porcelain", "--untracked-files=no")
+    return {"git_sha": git("rev-parse", "HEAD"), "git_dirty": bool(status) if status is not None else None}
 
 
 def _clean(value):
@@ -991,6 +1045,271 @@ def _strip(record: dict) -> dict:
     return {k: v for k, v in record.items() if k not in ("seg1", "seg2")}
 
 
+# --------------------------------------------------------------------------------------
+# 8. Opt-in early-spectrum re-polish (Cycle 3, C3-02: --include-early-srank)
+# --------------------------------------------------------------------------------------
+# Real step-20 momenta have stable rank about 1.2: one dominant singular value and a tail far
+# below it, where every Schatten Switch circuit lifts less than PS3_55. This mode adds purely
+# synthetic near-rank-1 spectra to the polish targets. It never reads real held-out momenta;
+# those are scored only out of sample by ``eval_heldout_nesterov.py``.
+EARLY_SRANKS = (1.03, 1.08, 1.15, 1.25, 1.4, 1.6)
+EARLY_SIZES = (512, 1024)
+EARLY_POWERS = (0.5, 1.0, 1.25)
+EARLY_SECONDARIES = (3, 10)
+EARLY_FLOORS = (1e-3, 2e-3, 4e-3)  # floor energy n f^2 stays below the smallest tail energy 0.03
+EARLY_SPLITS = ((5, 4), (5, 3), (3, 5), (3, 4))
+# Polish jobs (weight, band error): early target = weight * PS3_55 error on that spectrum; band
+# error None keeps the start's design error, 0.11 lets the band loosen to lift the tail.
+EARLY_JOBS = ((1.0, None), (1.6, None), (2.5, None), (1.0, 0.11), (0.7, 0.11))
+BF16_SPLITS = {(3, 5), (3, 4)}  # splits whose registered circuit passes the BF16 sweeps
+R1_SIZES = (1023, 1024, 2048, 4096, 8192)
+R1_RATIOS = (0.15, 0.175, 0.2, 0.246, 0.3)
+
+
+def early_srank_spectra(sizes=EARLY_SIZES, sranks=EARLY_SRANKS, seed: int = 0) -> list[dict]:
+    """Synthetic near-rank-1 spectra: a unit spike plus a tail of energy ``srank - 1``.
+
+    Two tail shapes, both with a wide dynamic range (as an early gradient has: a few strong
+    directions and a weak bulk):
+      ``pow{p}``         ``i^-p`` for ``p`` in 0.5, 1, 1.25
+      ``spk{r}_f{f}``    ``r`` geometric secondary values (1 down to 0.2) over a noise floor: the
+                         singular values of a Gaussian ``(n - 1 - r) x 2n`` matrix with RMS ``f``
+    Stable rank ``||s||^2 / s_1^2`` equals ``srank`` and the tail stays below the spike.
+    """
+    rng = np.random.default_rng(seed)
+    out = []
+    for n in sizes:
+        i = np.arange(1, n, dtype=np.float64)
+        bulk = np.sort(np.linalg.svd(rng.standard_normal((n - 1, 2 * n)), compute_uv=False))[::-1]
+        bulk /= np.sqrt(np.mean(bulk ** 2))
+        for srank in sranks:
+            energy = srank - 1.0
+            tails = {f"pow{p}": i ** -p * np.sqrt(energy / np.sum(i ** (-2 * p))) for p in EARLY_POWERS}
+            for r in EARLY_SECONDARIES:
+                for f in EARLY_FLOORS:
+                    floor = f * bulk[:n - 1 - r]
+                    secondary = np.geomspace(1.0, 0.2, r)
+                    secondary *= np.sqrt((energy - np.sum(floor ** 2)) / np.sum(secondary ** 2))
+                    tails[f"spk{r}_f{f}"] = np.r_[secondary, floor]
+            for kind, tail in tails.items():
+                s = np.r_[1.0, np.sort(tail)[::-1]]
+                out.append({"name": f"early/{kind}/n{n}/srank{srank}", "n": n, "s": s,
+                            "srank": float(np.sum(s ** 2))})
+    return out
+
+
+def _early_scores(f, cycle1, early, u) -> dict:
+    """Exact-arithmetic error on the Cycle 1 momenta and on the synthetic early spectra."""
+    a, b = harvested_score(f, cycle1, u), harvested_score(f, early, u)
+    e = np.array(b["errors"])
+    return {"cycle1_median": a["median"], "cycle1_max": a["max"], "early_median": b["median"],
+            "early_p90": float(np.quantile(e, 0.9)), "early_max": b["max"], "early_errors": b["errors"]}
+
+
+def _early_polish_job(job):
+    tag, weight, seg1, seg2, spectra, targets, band_lo, band_error, evaluations = job
+    try:
+        with np.errstate(all="ignore"):
+            new1, new2, log = polish(seg1, seg2, U_FP16, spectra, targets, band_lo=band_lo, band_error=band_error,
+                                     evaluations=evaluations)
+    except (ValueError, np.linalg.LinAlgError, FloatingPointError) as error:
+        return tag, weight, band_error, None, None, {"error": str(error)}
+    return tag, weight, band_error, new1, new2, log
+
+
+def early_starts(artifact: dict, cache: dict, cycle1, early, workers: int, per_split: int) -> list[dict]:
+    """Start points: the registered circuits' segments and the best cache composites per split."""
+    starts = []
+    for name, record in artifact["selected"].items():
+        split = tuple(record["circuit"]["squarings"])
+        if split in EARLY_SPLITS:
+            starts.append({"tag": name, "split": split, "first": record["first_row"],
+                           "seg1": record["segments"]["seg1"], "seg2": record["segments"]["seg2"],
+                           "band_lo": record["scalar"]["band_lo"], "band_error": record["scalar"]["band_error"]})
+    if cache and per_split:
+        grid = composites(cache, cycle1 + early, U_FP16, workers, EARLY_SPLITS)
+        for split in EARLY_SPLITS:
+            rows = sorted((r for r in grid if (r["k1"], r["k2"]) == split), key=lambda r: r["harvested_median"])
+            for i, row in enumerate(rows[:per_split]):
+                starts.append({"tag": f"cache_{split[0]}{split[1]}_{i}", "split": split, "first": row["first"],
+                               "seg1": row["seg1"], "seg2": row["seg2"], "band_lo": 1.3 * row["seg1"]["lo"],
+                               "band_error": max(0.1, 1.05 * row["seg2"]["E"])})
+    return starts
+
+
+def r1_extended(circuit, dtype, sizes=R1_SIZES, ratios=R1_RATIOS) -> dict:
+    """Fable R1 over ``n = 1023..8192`` (``8192`` with two ratios to bound the run time)."""
+    rows = {str(n): subnormal_family(circuit, dtype, n=n, ratios=ratios if n < 8192 else (0.175, 0.3))
+            for n in sizes}
+    return {"passed": all(r["passed"] for r in rows.values()),
+            "max_sigma_bound": max((r["max_sigma_bound"] or float("inf")) for r in rows.values()),
+            "by_n": {n: {k: r[k] for k in ("cases", "nonfinite", "max_sigma_bound", "passed")} for n, r in rows.items()}}
+
+
+def r3_long_k(circuit, dtype, k: int = 1 << 20) -> dict:
+    """Fable R3 / M1: long inner dimension ``K = 2^20`` stays bounded; tiny and dead inputs give zeros."""
+    import torch
+
+    from research.polar_opt.schatten_switch_blackwell import schatten_switch_blackwell
+
+    ones = schatten_switch_blackwell(torch.ones(1, k, device="cuda"), circuit, dtype=dtype, allow_unsafe_bf16=True)
+    G = torch.randn(16, k, device="cuda", generator=torch.Generator(device="cuda").manual_seed(7))
+    Q = schatten_switch_blackwell(G, circuit, dtype=dtype, allow_unsafe_bf16=True).double()
+    top = float(torch.linalg.eigvalsh(Q @ Q.mT).max().clamp_min(0).sqrt())
+    tiny = schatten_switch_blackwell(torch.full((64, 128), 1e-20, device="cuda"), circuit, dtype=dtype,
+                                     allow_unsafe_bf16=True)
+    dead = schatten_switch_blackwell(torch.zeros(64, 128, device="cuda"), circuit, dtype=dtype, allow_unsafe_bf16=True)
+    out = {"k": k, "rank1_norm": float(ones.double().norm()), "random_sigma_max": top,
+           "finite": bool(torch.isfinite(ones).all() and torch.isfinite(Q).all()),
+           "tiny_and_dead_are_zero": bool(not tiny.any() and not dead.any())}
+    out["passed"] = out["finite"] and out["tiny_and_dead_are_zero"] and out["rank1_norm"] <= CAP and top <= CAP
+    return out
+
+
+def graph_replay(circuit, dtype, shapes=((512, 2048), (4, 256, 512))) -> dict:
+    """CUDA-graph capture after warm-up; replay must equal the eager call bit for bit."""
+    import torch
+
+    from research.polar_opt.schatten_switch_blackwell import schatten_switch_blackwell
+
+    call = lambda x: schatten_switch_blackwell(x, circuit, dtype=dtype, allow_unsafe_bf16=True)  # noqa: E731
+    rows = []
+    for shape in shapes:
+        static = torch.randn(*shape, device="cuda", generator=torch.Generator(device="cuda").manual_seed(31))
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                call(static)
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = call(static)
+        static.copy_(torch.randn(*shape, device="cuda", generator=torch.Generator(device="cuda").manual_seed(32)) * 1e3)
+        graph.replay()
+        torch.cuda.synchronize()
+        rows.append({"shape": list(shape), "bitwise_equal": bool(torch.equal(out, call(static)))})
+    return {"passed": all(r["bitwise_equal"] for r in rows), "shapes": rows}
+
+
+def run_early_search(args) -> None:
+    """Targeted re-polish of the 5+4, 5+3, 3+5 and 3+4 circuits with synthetic early spectra."""
+    import torch
+    from dataclasses import replace
+
+    began = time.perf_counter()
+    artifact = json.loads(args.seed_artifact.read_text())
+    cache = json.loads(args.fit_cache.read_text()) if args.fit_cache and args.fit_cache.exists() else {}
+    cycle1 = harvested_spectra(args.trajectories)
+    early = early_srank_spectra()
+    ps3_c1 = np.array(harvested_score(ps3_scalar, cycle1, None)["errors"])
+    ps3_early = np.array(harvested_score(ps3_scalar, early, None)["errors"])
+    starts = early_starts(artifact, cache, cycle1, early, args.workers, args.early_cache_starts)
+    print(f"early re-polish: {len(starts)} starts, {len(early)} synthetic spectra "
+          f"(PS3_55 early median {np.median(ps3_early):.4f})", flush=True)
+
+    jobs = []
+    for start in starts:
+        f = compose(start["seg1"], start["seg2"], U_FP16, "start", start["band_lo"], start["band_error"]).scalar
+        start["scores"] = _early_scores(f, cycle1, early, U_FP16)
+        # Cycle 1 targets keep the start's own error (its mid/late win) and PS3_55 parity.
+        own = np.array(harvested_score(f, cycle1, U_FP16)["errors"])
+        t1 = np.minimum(np.maximum(own, 0.5 * PS3_MEDIAN), 0.97 * np.maximum(ps3_c1, PS3_MEDIAN))
+        for weight, band_error in EARLY_JOBS:
+            targets = np.r_[t1, weight * np.maximum(ps3_early, 1e-3)]
+            jobs.append((start["tag"], weight, start["seg1"], start["seg2"], cycle1 + early, targets,
+                         start["band_lo"], band_error or start["band_error"], args.early_evaluations))
+    by_tag = {s["tag"]: s for s in starts}
+    records = []
+    with ProcessPoolExecutor(min(args.workers, MAX_WORKERS)) as pool:
+        for tag, weight, band_error, seg1, seg2, log in pool.map(_early_polish_job, jobs, chunksize=1):
+            start = by_tag[tag]
+            row = {"start": tag, "split": list(start["split"]), "first": start["first"], "weight": weight,
+                   "design_band_error": band_error, "polish": log, "start_scores": {k: v for k, v in start["scores"].items() if k != "early_errors"}}
+            if seg1 is not None:
+                circuit = compose(seg1, seg2, U_FP16, "early", start["band_lo"], band_error)
+                facts = describe(circuit, cycle1)
+                safe = (facts["min_on_unit"] >= -1e-9 and facts["max_on_unit"] <= 1 + band_error + 0.01
+                        and facts["band_error"] <= band_error + 0.01)
+                scores = _early_scores(circuit.scalar, cycle1, early, U_FP16)
+                row.update({"seg1": seg1, "seg2": seg2, "band_lo": start["band_lo"],
+                            "band_error": max(band_error, facts["band_error"]), "scalar": facts, "safe": safe,
+                            "scores": {k: v for k, v in scores.items() if k != "early_errors"},
+                            "cycle1_parity": scores["cycle1_median"] <= PS3_MEDIAN
+                            and scores["cycle1_max"] <= PS3_MAX + 2e-3})
+            records.append(row)
+            s = row.get("scores")
+            print(f"  {tag:<12} w={weight} E={band_error:.3f}: " + (f"early median {start['scores']['early_median']:.4f} -> "
+                  f"{s['early_median']:.4f}, cycle1 median {start['scores']['cycle1_median']:.4f} -> "
+                  f"{s['cycle1_median']:.4f}, safe {row['safe']}" if s else f"failed {log}"), flush=True)
+    search_seconds = time.perf_counter() - began
+
+    # GPU validation: per split, the best safe polished circuits at Cycle 1 parity.
+    validated = {}
+    for split in EARLY_SPLITS:
+        pool_rows = sorted((r for r in records if tuple(r["split"]) == split and r.get("safe") and r["cycle1_parity"]),
+                           key=lambda r: r["scores"]["early_median"])
+        base = min((s["scores"]["early_median"] for s in starts if s["split"] == split and s["tag"].startswith("SS")),
+                   default=np.inf)
+        for i, row in enumerate([r for r in pool_rows if r["scores"]["early_median"] < 0.9 * base][:args.early_validate]):
+            buffers = 1 + max(max(op) for op in row["seg1"]["topo"] + row["seg2"]["topo"])
+            name = f"SS{buffers}_{split[0]}{split[1]}E{i}"
+            circuit = compose(row["seg1"], row["seg2"], U_FP16, name, row["band_lo"], row["band_error"])
+            check = {"fp16": verify(circuit, "fp16"), "r1_fp16": r1_extended(circuit, torch.float16),
+                     "r3_fp16": r3_long_k(circuit, torch.float16), "graph_fp16": graph_replay(circuit, torch.float16)}
+            gates = [check[k]["passed"] for k in ("fp16", "r1_fp16", "r3_fp16", "graph_fp16")]
+            if split in BF16_SPLITS:
+                check.update({"bf16": verify(circuit, "bf16"), "r1_bf16": r1_extended(circuit, torch.bfloat16)})
+                bf16_ok = check["bf16"]["passed"] and check["r1_bf16"]["passed"]
+                if bf16_ok:
+                    circuit = replace(circuit, bf16_verified=True)
+                    check["graph_bf16"] = graph_replay(circuit, torch.bfloat16)
+                    bf16_ok = check["graph_bf16"]["passed"]
+                    circuit = replace(circuit, bf16_verified=bf16_ok)
+            passed = all(gates)
+            validated[name] = {"circuit": circuit.to_dict(), "start": row["start"], "weight": row["weight"],
+                               "split": list(split), "first_row": row["first"], "scores": row["scores"],
+                               "scalar": row["scalar"], "segments": {"seg1": row["seg1"], "seg2": row["seg2"]},
+                               "checks": check, "fp16_passed": passed, "bf16_verified": circuit.bf16_verified,
+                               "kernel_launches": kernel_launches(circuit, 512)}
+            print(f"validate {name} (from {row['start']}, w={row['weight']}): early median "
+                  f"{row['scores']['early_median']:.4f}, FP16 gates {gates}, BF16 {circuit.bf16_verified}", flush=True)
+
+    from research.polar_opt.schatten_switch_blackwell import SCHATTEN_SWITCH_CIRCUITS, SchattenSwitchCircuit
+
+    timed = {name: (SCHATTEN_SWITCH_CIRCUITS[name], torch.float16) for name in sorted(SCHATTEN_SWITCH_CIRCUITS)}
+    timed.update({name: (SchattenSwitchCircuit.from_dict(v["circuit"]), torch.float16)
+                  for name, v in validated.items() if v["fp16_passed"]})
+    timing = latency(timed, shapes=((512, 512), (512, 1408), (1024, 4096), (4096, 4096)), iters=10, warmup=3)
+    result = {
+        "schema_version": 1, "mode": "early_srank_repolish", **git_info(),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "device": torch.cuda.get_device_name(),
+        "torch": torch.__version__, "command": [os.path.basename(__file__), *sys.argv[1:]],
+        "settings": {"u_safe": U_FP16, "cap": CAP, "splits": [list(s) for s in EARLY_SPLITS],
+                     "jobs": [list(j) for j in EARLY_JOBS], "evaluations": args.early_evaluations,
+                     "cache_starts_per_split": args.early_cache_starts, "validate_per_split": args.early_validate,
+                     "seed_artifact": str(args.seed_artifact), "fit_cache": str(args.fit_cache) if args.fit_cache else None,
+                     "targets": "Cycle 1 momenta: min(max(start error, PS3_MEDIAN / 2), 0.97 max(PS3_55 error, "
+                                "PS3_MEDIAN)); early spectra: weight * PS3_55 error",
+                     "selection": "safe, Cycle 1 parity with PS3_55, early median < 0.9 x registered circuit",
+                     "held_out": "real Nesterov momenta are never read here"},
+        "early_spectra": [{"name": e["name"], "n": e["n"], "srank": e["srank"]} for e in early],
+        "ps3_55_reference": {"cycle1_median": float(np.median(ps3_c1)), "cycle1_max": float(ps3_c1.max()),
+                             "early_median": float(np.median(ps3_early)), "early_p90": float(np.quantile(ps3_early, 0.9)),
+                             "early_max": float(ps3_early.max())},
+        "starts": [{"tag": s["tag"], "split": list(s["split"]), "first": s["first"], "band_lo": s["band_lo"],
+                    "band_error": s["band_error"], "scores": {k: v for k, v in s["scores"].items() if k != "early_errors"}}
+                   for s in starts],
+        "polish_records": [{k: v for k, v in r.items() if k not in ("seg1", "seg2")} for r in records],
+        "validated": validated,
+        "registered_kernel_launches": {name: kernel_launches(c, 512) for name, (c, _) in timed.items()},
+        "latency_sanity": timing, "search_seconds": search_seconds, "seconds": time.perf_counter() - began,
+    }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(_clean(result), indent=1, allow_nan=False) + "\n")
+    print(f"wrote {args.output} in {result['seconds']:.0f}s", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--output", type=Path, default=Path("results/schatten_switch_search_cycle2.json"))
@@ -1003,7 +1322,22 @@ def main():
     parser.add_argument("--ils-rounds", type=int, default=2)
     parser.add_argument("--skip-search", action="store_true", help="use the fit cache as it is")
     parser.add_argument("--fits-only", action="store_true")
+    early = parser.add_argument_group("early-spectrum re-polish (opt-in; replaces the full search)")
+    early.add_argument("--include-early-srank", action="store_true",
+                       help="re-polish the 5+4, 5+3, 3+5, 3+4 circuits with synthetic near-rank-1 spectra "
+                            "(stable rank 1.03-1.60) added to the polish targets, then validate on the GPU")
+    early.add_argument("--seed-artifact", type=Path, default=Path("results/schatten_switch_search_cycle2.json"),
+                       help="search JSON whose selected circuits seed the re-polish")
+    early.add_argument("--early-cache-starts", type=int, default=2,
+                       help="extra starts per split from the fit cache composites (needs --fit-cache)")
+    early.add_argument("--early-evaluations", type=int, default=200)
+    early.add_argument("--early-validate", type=int, default=2, help="GPU-validated candidates per split")
     args = parser.parse_args()
+    if args.include_early_srank:
+        if args.fit_cache and not args.fit_cache.exists():
+            parser.error(f"--fit-cache {args.fit_cache} does not exist")
+        run_early_search(args)
+        return
     began = time.perf_counter()
     cache = json.loads(args.fit_cache.read_text()) if args.fit_cache and args.fit_cache.exists() else {}
 
@@ -1117,12 +1451,12 @@ def main():
             record["tier1_bf16"] = {suite: rows[name + "@bf16"] for suite, rows in tier["summary"].items()}
             if record["tier1_bf16"]["all"]["diverged"]:
                 record["circuit"] = replace(record["circuit"], bf16_verified=False)
-        record["kernel_launches"] = {str(n): kernel_launches(record["circuit"], n) for n in (512, 4096)}
+        record["kernel_launches"] = kernel_launches(record["circuit"], 512)
     timing = latency({name: run for name, run in runs.items() if "@" not in name})
     probe = gram_restart_probe(args.trajectories)
 
     result = {
-        "schema_version": 1, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "schema_version": 1, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"), **git_info(),
         "device": torch.cuda.get_device_name(), "torch": torch.__version__,
         "settings": {"u_safe_fp16": U_FP16, "u_safe_bf16": U_BF16, "cap": CAP, "workers": min(args.workers, MAX_WORKERS),
                      "starts": args.starts, "ils_iterations": args.ils_iterations, "ils_rounds": args.ils_rounds,
