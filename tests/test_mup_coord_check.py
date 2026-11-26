@@ -135,6 +135,25 @@ def test_sp_table(kwargs):
             assert spec.muon_scale == 1.0
 
 
+@pytest.mark.parametrize(
+    "bad_kwargs",
+    [
+        {"d_base": 0},
+        {"mlp_mult": 0},
+        {"layers": 0},
+        {"num_batches": 0},
+        {"width": 0},
+        {"head_dim": 0},
+        {"vocab_size": -1},
+        {"seq_len": 0},
+        {"batch_size": 0},
+    ],
+)
+def test_model_config_rejects_nonpositive_fields(bad_kwargs):
+    with pytest.raises(ValueError, match="positive"):
+        ModelConfig(**bad_kwargs)
+
+
 def test_readout_lr_power_is_the_task_text_control():
     config = ModelConfig(width=512, d_base=128, readout_lr_power=1.0)
     assert parameter_specs(build_model(config, 0))["head.weight"].lr_mult == 128 / 512
@@ -257,6 +276,15 @@ def test_svd_exact():
     assert torch.allclose(singular[:6], torch.ones(6, dtype=torch.float64), atol=1e-12)
     assert singular[6:].max() < 1e-12
     assert torch.linalg.svdvals(svd_exact(low_rank, rtol=0.0)).min() > 0.99
+
+
+def test_svd_exact_preserves_genuine_small_singular_values_at_large_width():
+    sv = np.concatenate([np.geomspace(1.0, 5e-5, 256), np.zeros(256)])
+    G, _, _, _ = with_spectrum(sv, 512, seed=7)
+    G32 = G.float()
+    singular = torch.linalg.svdvals(svd_exact(G32))
+    assert torch.allclose(singular[:256], torch.ones(256, dtype=torch.float64), atol=1e-4)
+    assert singular[256:].max() < 1e-12
 
 
 @pytest.mark.parametrize("method", mcc.POLAR_METHODS)
@@ -421,6 +449,24 @@ def test_lr_transfer_summary():
     assert out["regret_at_base_best_lr"]["512"] == pytest.approx(math.log(0.02 / 0.07) ** 2 - math.log(0.04 / 0.07) ** 2)
 
 
+def test_summarize_lr_transfer_all_diverged():
+    trials = [
+        {"width": w, "lr": lr, "seed": s, "final_loss": None, "eval_loss": None}
+        for w in (128, 256)
+        for lr in (0.01, 0.04)
+        for s in (0, 1)
+    ]
+    out = summarize_lr_transfer(trials, d_base=128)
+    assert out["same_best_lr"] is False
+    assert out["best_lr"] == {"128": None, "256": None}
+    assert out["best_loss"] == {"128": None, "256": None}
+    assert out["best_lr_log2_shift"] is None
+    assert out["best_lr_interpolated_log2_shift"] is None
+    assert out["regret_at_base_best_lr"] == {"128": None, "256": None}
+    text = json.dumps(mcc._clean(out), allow_nan=False)
+    assert "NaN" not in text and "Infinity" not in text
+
+
 # --------------------------------------------------------------------------------------
 # Runs
 # --------------------------------------------------------------------------------------
@@ -441,6 +487,22 @@ def test_runs_are_deterministic():
     a, b = build_model(wide, 3), build_model(wide, 3)
     assert all(torch.equal(p, q) for p, q in zip(a.parameters(), b.parameters()))
     assert not torch.equal(a.emb.weight, build_model(wide, 4).emb.weight)
+
+
+def test_make_tokens_val_split_is_disjoint_same_chain_and_eval_loss_recorded():
+    config = ModelConfig(width=64, d_base=64, head_dim=16)
+    train_t = make_tokens(config, 2, split="train")
+    val_t = make_tokens(config, 2, split="val")
+    assert train_t.shape == val_t.shape
+    assert not torch.equal(train_t, val_t)
+    gen = torch.Generator().manual_seed(1_000_003 * 3)
+    successors = torch.randint(config.vocab_size, (config.vocab_size, 4), generator=gen)
+    # Every transition in val_t comes from the exact same transition table as train_t.
+    nxt = successors[val_t[:, :, :-1]]
+    assert (nxt == val_t[:, :, 1:].unsqueeze(-1)).any(dim=-1).all()
+    trial = run_trial(config, optimizer="muon", lr=0.02, lr_aux=0.01, polar="SS3_54", seed=2, steps=4, probe_steps=(0, 4))
+    assert trial["eval_loss"] is not None and math.isfinite(trial["eval_loss"])
+    assert trial["final_loss"] is not None and trial["eval_loss"] != trial["final_loss"]
 
 
 def test_probe_statistics():
@@ -512,6 +574,18 @@ def test_gradients_finite():
     assert not mcc.gradients_finite(loss * float("nan"), model)
     model.blocks[1].mlp.up.weight.grad[3, 5] = float("inf")
     assert not mcc.gradients_finite(loss, model)
+
+
+def test_muon_lr_zero_and_update_scaling_without_step_zero():
+    config = ModelConfig(width=64, d_base=64, head_dim=16)
+    trial = run_trial(config, optimizer="muon", lr=0.0, lr_aux=0.0, seed=0, steps=2, probe_steps=(2,))
+    assert trial["nonfinite_step"] is None
+    assert trial["updates"]["blocks.0.attn.q"]["polar_mean_sq_sv"] == [0.0]
+    wide = run_trial(ModelConfig(width=128, d_base=64, head_dim=16), optimizer="muon", lr=0.0, lr_aux=0.0,
+                     seed=0, steps=2, probe_steps=(2,))
+    scaled = mcc.update_scaling([trial, wide], steps=(2,))
+    assert "2" in scaled["blocks.0.attn.q"]["update_rms"]
+    assert "2" in scaled["blocks.0.attn.q"]["polar_mean_sq_sv"]
 
 
 # --------------------------------------------------------------------------------------
@@ -604,16 +678,38 @@ def test_cli_quick_writes_valid_json(tmp_path, capsys):
              "mup_muon_readout_lr_power1/PS3_55", *(f"mup_muon/{polar}" for polar in mcc.POLAR_METHODS)}
     assert set(payload["coord_check"]) == names
     assert set(payload["lr_transfer"]) == {name for name in names if "readout" not in name}
+    assert set(payload["lr_transfer_val"]) == set(payload["lr_transfer"])
     assert set(payload["orthogonalizer_comparison"]) == {f"mup_muon/{polar}" for polar in mcc.POLAR_METHODS}
     for name, entry in payload["coord_check"].items():
         assert isinstance(entry["gate"]["passed"], bool) and entry["nonfinite_trials"] == 0
+        assert isinstance(entry["steady_gate"]["passed"], bool)
         assert len(entry["trials"]) == 2 and set(entry["delta_rms"]) == set(entry["trials"][0]["delta_rms"])
         assert entry["delta_rms"]["logits"]["12"]["beta"] is not None
+        if entry["optimizer"] == "muon":
+            assert all("hidden_polar_mean_sq_sv" in t for t in entry["trials"])
     assert payload["coord_check"]["mup_muon/polar_express"]["polar_dtype"] == "bfloat16"
     assert payload["coord_check"]["sp_adamw"]["gate"]["fails_clearly"]
     row = payload["orthogonalizer_comparison"]["mup_muon/SS3_34"]
     assert row["max_abs_beta_difference_from_svd_exact"] < 0.05 and set(row["best_lr"]) == {"128", "256"}
+    assert set(row["val_best_lr"]) == {"128", "256"}
     assert payload["orthogonalizer_comparison"]["mup_muon/svd_exact"]["max_abs_beta_difference_from_svd_exact"] == 0
+
+
+def test_cli_quick_honors_explicit_overrides(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_run(**kwargs):
+        captured.update(kwargs)
+        return {"coord_check": {}, "lr_transfer": {}, "lr_transfer_val": {}}
+
+    monkeypatch.setattr(mcc, "run", fake_run)
+    monkeypatch.setattr(mcc, "write_json", lambda *args, **kwargs: None)
+    mcc.main(["--quick", "--d-base", "64", "--widths", "64", "128", "256",
+              "--seeds", "0", "1", "--lr-seeds", "0", "2", "--out", str(tmp_path / "x.json")])
+    assert captured["widths"] == (64, 128, 256)
+    assert captured["seeds"] == (0, 1)
+    assert captured["lr_seeds"] == (0, 2)
+    assert captured["lr_widths"] == (64, 128)
 
 
 @pytest.mark.skipif(not ARTIFACT.exists(), reason="results/cycle3_mup_coord_check_cpu.json is not generated yet")
@@ -622,14 +718,23 @@ def test_artifact_is_consistent_with_its_trials():
     assert payload["git_dirty"] is False and re.fullmatch(r"[0-9a-f]{40}", payload["git_sha"])
     assert payload["quick"] is False
     assert payload["config"]["widths"] == list(WIDTHS) and payload["config"]["seeds"] == [0, 1, 2]
+    assert set(payload["lr_transfer_val"]) == set(payload["lr_transfer"])
     for name, entry in payload["coord_check"].items():
-        assert len(entry["trials"]) == len(WIDTHS) * 3
+        assert len(entry["trials"]) == len(WIDTHS) * len(payload["config"]["seeds"])
         recomputed = gate(width_scaling(entry["trials"], "delta_rms"))
         assert recomputed["passed"] == entry["gate"]["passed"], name
         assert recomputed["fails_clearly"] == entry["gate"]["fails_clearly"], name
         assert recomputed["max_abs_beta"] == pytest.approx(entry["gate"]["max_abs_beta"], abs=1e-4), name
-    for name, entry in payload["lr_transfer"].items():
-        for width in entry["widths"]:
-            losses = [t["final_loss"] for t in entry["trials"] if t["width"] == width and t["seed"] == 0]
-            if len(payload["config"]["lr_transfer"]["seeds"]) == 1:
-                assert losses == entry["final_loss"][str(width)], name
+        recomputed_steady = gate(width_scaling(entry["trials"], "delta_rms"), mcc.STEADY_GATE_STEPS)
+        assert recomputed_steady["passed"] == entry["steady_gate"]["passed"], name
+        assert recomputed_steady["max_abs_beta"] == pytest.approx(entry["steady_gate"]["max_abs_beta"], abs=1e-4), name
+        if entry["optimizer"] == "muon":
+            assert all(len(t["hidden_polar_mean_sq_sv"]) == len(PROBE_STEPS) for t in entry["trials"]), name
+    for key, loss_field in (("lr_transfer", "final_loss"), ("lr_transfer_val", "eval_loss")):
+        for name, entry in payload[key].items():
+            trials = payload["lr_transfer"][name]["trials"]
+            recomputed = summarize_lr_transfer(trials, payload["config"]["model"]["d_base"], loss_key=loss_field)
+            assert recomputed["best_lr"] == entry["best_lr"], (key, name)
+            assert recomputed["same_best_lr"] == entry["same_best_lr"], (key, name)
+            for width in entry["widths"]:
+                assert recomputed["final_loss"][str(width)] == pytest.approx(entry["final_loss"][str(width)], rel=1e-4), (key, name, width)

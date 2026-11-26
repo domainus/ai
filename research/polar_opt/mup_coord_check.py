@@ -25,9 +25,13 @@ attention     1/sqrt(head_dim)     1/head_dim                      1/head_dim
 ============  ===================  ==============================  =======================
 
 ``sp`` with Muon (``sp_muon``) is the naive control: ``dW = -eta polar(M)`` without the
-``sqrt(d_out / d_in)`` factor, on the SP initialization, readout and attention scale. Under
-Muon, ``eta_aux`` is fixed (0.01, the best muP AdamW learning rate of this model) while the
-learning-rate check sweeps ``eta``.
+``sqrt(d_out / d_in)`` factor, on the SP initialization, readout and attention scale. Because
+every hidden matrix in this model keeps a fixed aspect ratio (``1``, ``mlp_mult``, or
+``1 / mlp_mult``) and ``head_dim = 32`` is fixed across widths ``d``, ``sp_muon``'s
+coordinate-check failure isolates SP initialization (``std = 0.02``) and unscaled readout
+(``logit_scale = 1.0``), while ``sqrt(d_out / d_in)`` spectral scaling across rectangular shapes
+is verified independently in unit tests. Under Muon, ``eta_aux`` is fixed (0.01, the best
+muP AdamW learning rate of this model) while the learning-rate check sweeps ``eta``.
 
 Readout learning rate
 ---------------------
@@ -88,6 +92,7 @@ WIDTHS = (128, 256, 512, 1024)
 SEEDS = (0, 1, 2)
 PROBE_STEPS = (0, 1, 2, 4, 8, 12)
 GATE_STEPS = (2, 4, 8, 12)
+STEADY_GATE_STEPS = (4, 8, 12)
 LR_GRIDS = {"muon": (0.005, 0.01, 0.02, 0.04, 0.08), "adamw": (0.001, 0.003, 0.01, 0.03)}
 LR_WIDTHS = (128, 256, 512)
 LR_STEPS = 20
@@ -116,6 +121,10 @@ class ModelConfig:
     readout_lr_power: float = 0.0  # muP readout lr = eta * (d_base / width) ** power
 
     def __post_init__(self):
+        for field_name in ("width", "d_base", "layers", "head_dim", "mlp_mult",
+                           "vocab_size", "seq_len", "batch_size", "num_batches"):
+            if getattr(self, field_name) <= 0:
+                raise ValueError(f"{field_name} must be positive")
         if self.parameterization not in ("sp", "mup"):
             raise ValueError("parameterization must be 'sp' or 'mup'")
         if self.width % self.head_dim or self.head_dim % 2:
@@ -275,14 +284,19 @@ def build_model(config: ModelConfig, seed: int) -> CoordTransformer:
     return model
 
 
-def make_tokens(config: ModelConfig, seed: int) -> Tensor:
+def make_tokens(config: ModelConfig, seed: int, *, split: str = "train") -> Tensor:
     """``(num_batches, batch_size, seq_len + 1)`` tokens of a seeded Markov chain.
 
     Each token has four successors with probabilities 0.5, 0.25, 0.15 and 0.1. The tokens depend
-    on the seed and not on the width, so every width trains on the same data.
+    on the seed and not on the width, so every width trains on the same data. ``split="val"``
+    draws unseen sequences from the exact same transition table.
     """
+    if split not in ("train", "val"):
+        raise ValueError("split must be 'train' or 'val'")
     generator = torch.Generator().manual_seed(1_000_003 * (seed + 1))
     successors = torch.randint(config.vocab_size, (config.vocab_size, 4), generator=generator)
+    if split == "val":
+        generator = torch.Generator().manual_seed(1_000_003 * (seed + 1) + 99_991)
     count = config.num_batches * config.batch_size
     choice = torch.multinomial(torch.tensor([0.5, 0.25, 0.15, 0.1]), count * config.seq_len,
                                replacement=True, generator=generator).view(count, config.seq_len)
@@ -314,14 +328,14 @@ def _stored(X: Tensor, dtype: torch.dtype) -> Tensor:
 def svd_exact(G: Tensor, rtol: float | None = None) -> Tensor:
     """FP64 ``U @ Vh`` on the numerical row space of ``G``.
 
-    Singular values at or below ``rtol * sigma_max`` are treated as zero. The default is the
-    numerical rank at the precision of the input, ``max(rows, columns) * eps(G.dtype)``: a
-    gradient of fewer tokens than the width has exact zeros that FP32 rounding fills with noise,
-    and ``U @ Vh`` would turn that noise into unit singular values. A zero matrix returns zeros.
+    Singular values at or below ``rtol * sigma_max`` are treated as zero. For FP32/FP64 inputs the
+    default is a width-independent ``1e-6`` noise floor (avoiding width-growing over-truncation of
+    genuine small singular values at wide layers while still suppressing FP32 rounding noise).
+    A zero matrix returns zeros.
     """
     U, S, Vh = torch.linalg.svd(G.double(), full_matrices=False)
     if rtol is None:
-        rtol = max(G.shape[-2:]) * torch.finfo(G.dtype).eps
+        rtol = 1e-6 if G.dtype in (torch.float32, torch.float64) else max(G.shape[-2:]) * torch.finfo(G.dtype).eps
     return (U * (S > rtol * S[..., :1])[..., None, :]) @ Vh
 
 
@@ -332,8 +346,8 @@ def polar_express_reference(G: Tensor, steps: int = 5, dtype: torch.dtype = torc
     X = _stored(X / (1.01 * X.norm() + 1e-7), dtype)
     for a, b, c in _take_steps(_AMSEL_COEFFICIENTS, steps):
         A = _stored(X @ X.mT, dtype)
-        B = _stored(b * A + _stored(c * A, dtype) @ A, dtype)
-        X = _stored(a * X + B @ X, dtype)
+        B = _stored(_stored(b * A, dtype) + _stored(_stored(c * A, dtype) @ A, dtype), dtype)
+        X = _stored(_stored(a * X, dtype) + _stored(B @ X, dtype), dtype)
     return X.mT if tall else X
 
 
@@ -558,14 +572,20 @@ def run_trial(config: ModelConfig, *, optimizer: str, lr: float, seed: int, step
                 if "polar_mean_sq_sv" in entry:
                     # Mean squared singular value of the polar output: 1 for an exact full-rank
                     # polar factor, lower for missing rank or under-lifted singular values.
-                    entry["polar_mean_sq_sv"][i] = _finite(delta.double().square().sum().item() / (
-                        min(delta.shape) * (lr * specs[name].muon_scale) ** 2))
+                    denom = min(delta.shape) * (lr * specs[name].muon_scale) ** 2
+                    entry["polar_mean_sq_sv"][i] = (
+                        0.0 if denom == 0.0 else _finite(delta.double().square().sum().item() / denom)
+                    )
 
     final_loss = None
+    eval_loss = None
     if nonfinite_step is None:
+        val_tokens = make_tokens(config, seed, split="val")
         with torch.no_grad():
             final_loss = _finite(torch.stack([_loss(model, batch) for batch in tokens]).mean().item())
-    return {"width": config.width, "seed": seed, "lr": lr, "losses": losses, "final_loss": final_loss,
+            eval_loss = _finite(torch.stack([_loss(model, batch) for batch in val_tokens]).mean().item())
+    return {"width": config.width, "seed": seed, "lr": lr, "losses": losses,
+            "final_loss": final_loss, "eval_loss": eval_loss,
             "nonfinite_step": nonfinite_step, **stats, "updates": updates}
 
 
@@ -638,7 +658,9 @@ def update_scaling(trials: list[dict], steps=PROBE_STEPS) -> dict:
         out[name] = {}
         for key in entry:
             out[name][key] = {}
-            for i, step in enumerate(steps[1:], 1):
+            for i, step in enumerate(steps):
+                if step <= 0:
+                    continue
                 by_width = [geometric_mean(t["updates"][name][key][i] for t in trials if t["width"] == w)
                             for w in widths]
                 out[name][key][str(step)] = {"by_width": by_width, "beta": loglog_slope(widths, by_width)}
@@ -647,7 +669,9 @@ def update_scaling(trials: list[dict], steps=PROBE_STEPS) -> dict:
 
 def summarize_coord(trials: list[dict], probe_steps=PROBE_STEPS, gate_steps=GATE_STEPS) -> dict:
     scaling = width_scaling(trials, "delta_rms", probe_steps)
+    steady_steps = tuple(s for s in gate_steps if s >= 4) or tuple(gate_steps)
     return {"gate": gate(scaling, gate_steps),
+            "steady_gate": gate(scaling, steady_steps),
             "nonfinite_trials": sum(t["nonfinite_step"] is not None for t in trials),
             "delta_rms": scaling,
             "step_delta_rms": width_scaling(trials, "step_delta_rms", probe_steps),
@@ -655,8 +679,8 @@ def summarize_coord(trials: list[dict], probe_steps=PROBE_STEPS, gate_steps=GATE
             "updates": update_scaling(trials, probe_steps)}
 
 
-def summarize_lr_transfer(trials: list[dict], d_base: int) -> dict:
-    """Seed-mean final loss per width and learning rate, and how the best learning rate moves.
+def summarize_lr_transfer(trials: list[dict], d_base: int, loss_key: str = "final_loss") -> dict:
+    """Seed-mean loss (``final_loss`` or ``eval_loss``) per width and learning rate, and how the best learning rate moves.
 
     A diverged run counts as an infinite loss. ``best_lr_interpolated`` is the vertex of the
     parabola through the best grid point and its neighbours in ``log(lr)``. ``regret`` is the
@@ -664,16 +688,24 @@ def summarize_lr_transfer(trials: list[dict], d_base: int) -> dict:
     """
     widths = sorted({t["width"] for t in trials})
     lrs = sorted({t["lr"] for t in trials})
-    table, best, interpolated = {}, {}, {}
+    table, best, interpolated, best_loss, at_edge = {}, {}, {}, {}, {}
     for w in widths:
         row = []
         for lr in lrs:
-            values = [t["final_loss"] for t in trials if t["width"] == w and t["lr"] == lr]
-            finite = all(v is not None and math.isfinite(v) for v in values)
+            values = [t.get(loss_key) for t in trials if t["width"] == w and t["lr"] == lr]
+            finite = bool(values) and all(v is not None and math.isfinite(v) for v in values)
             row.append(sum(values) / len(values) if finite else math.inf)
         table[w] = row
+        if not any(math.isfinite(v) for v in row):
+            best[w] = None
+            interpolated[w] = None
+            best_loss[w] = None
+            at_edge[w] = False
+            continue
         i = min(range(len(lrs)), key=row.__getitem__)
         best[w], interpolated[w] = lrs[i], lrs[i]
+        best_loss[w] = row[i]
+        at_edge[w] = best[w] in (lrs[0], lrs[-1])
         if 0 < i < len(lrs) - 1 and all(math.isfinite(v) for v in row[i - 1:i + 2]):
             x0, x1, x2 = (math.log(lr) for lr in lrs[i - 1:i + 2])
             y0, y1, y2 = row[i - 1:i + 2]
@@ -682,23 +714,47 @@ def summarize_lr_transfer(trials: list[dict], d_base: int) -> dict:
                 slope = (y2 - y1) / (x2 - x1) - curvature * (x2 - x1)  # derivative at x1
                 interpolated[w] = math.exp(min(max(x1 - slope / (2 * curvature), x0), x2))
     base = d_base if d_base in best else widths[0]
-    base_index = lrs.index(best[base])
+    all_finite_best = bool(widths) and all(best[w] is not None for w in widths)
+    same_best_lr = all_finite_best and len(set(best.values())) == 1
+    log2_shift = (
+        math.log2(best[widths[-1]] / best[widths[0]])
+        if widths and best[widths[0]] is not None and best[widths[-1]] is not None
+        else None
+    )
+    interp_log2_shift = (
+        math.log2(interpolated[widths[-1]] / interpolated[widths[0]])
+        if widths and interpolated[widths[0]] is not None and interpolated[widths[-1]] is not None
+        else None
+    )
+    if not widths or best[base] is None:
+        regret = {str(w): None for w in widths}
+    else:
+        base_index = lrs.index(best[base])
+        regret = {
+            str(w): (
+                table[w][base_index] - best_loss[w]
+                if best_loss[w] is not None and math.isfinite(table[w][base_index])
+                else None
+            )
+            for w in widths
+        }
     return {
         "widths": widths, "lr_grid": lrs,
         "final_loss": {str(w): table[w] for w in widths},
         "best_lr": {str(w): best[w] for w in widths},
-        "best_loss": {str(w): min(table[w]) for w in widths},
+        "best_loss": {str(w): best_loss[w] for w in widths},
         "best_lr_interpolated": {str(w): interpolated[w] for w in widths},
-        "best_at_grid_edge": {str(w): best[w] in (lrs[0], lrs[-1]) for w in widths},
-        "same_best_lr": len(set(best.values())) == 1,
-        "best_lr_log2_shift": math.log2(best[widths[-1]] / best[widths[0]]),
-        "best_lr_interpolated_log2_shift": math.log2(interpolated[widths[-1]] / interpolated[widths[0]]),
-        "regret_at_base_best_lr": {str(w): table[w][base_index] - min(table[w]) for w in widths},
+        "best_at_grid_edge": {str(w): at_edge[w] for w in widths},
+        "same_best_lr": same_best_lr,
+        "best_lr_log2_shift": log2_shift,
+        "best_lr_interpolated_log2_shift": interp_log2_shift,
+        "regret_at_base_best_lr": regret,
     }
 
 
 def orthogonalizer_comparison(coord: dict, lr_transfer: dict, gate_steps=GATE_STEPS,
-                              reference: str = "mup_muon/svd_exact") -> dict:
+                              reference: str = "mup_muon/svd_exact",
+                              lr_transfer_val: dict | None = None) -> dict:
     """muP Muon per orthogonalizer: the gate, the distance of ``beta`` from ``svd_exact``, the
     lift of the update and the best learning rate per width.
 
@@ -711,6 +767,9 @@ def orthogonalizer_comparison(coord: dict, lr_transfer: dict, gate_steps=GATE_ST
         if not name.startswith("mup_muon/"):
             continue
         row = {"gate_passed": entry["gate"]["passed"], "max_abs_beta": entry["gate"]["max_abs_beta"]}
+        if "steady_gate" in entry:
+            row["steady_gate_passed"] = entry["steady_gate"]["passed"]
+            row["steady_max_abs_beta"] = entry["steady_gate"]["max_abs_beta"]
         if reference in coord:
             mine, exact = entry["delta_rms"], coord[reference]["delta_rms"]
             pairs = [(mine[probe][str(step)]["beta"], exact[probe][str(step)]["beta"])
@@ -725,9 +784,26 @@ def orthogonalizer_comparison(coord: dict, lr_transfer: dict, gate_steps=GATE_ST
             row["hidden_polar_mean_sq_sv"][str(step)] = {"by_width": by_width, "beta": loglog_slope(widths, by_width)}
         if name in lr_transfer:
             lr = lr_transfer[name]
+            finite_regrets = [v for v in lr["regret_at_base_best_lr"].values() if v is not None]
+            max_regret = (
+                max(finite_regrets)
+                if finite_regrets and len(finite_regrets) == len(lr["regret_at_base_best_lr"])
+                else None
+            )
             row |= {"best_lr": lr["best_lr"], "same_best_lr": lr["same_best_lr"],
                     "best_lr_interpolated_log2_shift": lr["best_lr_interpolated_log2_shift"],
-                    "max_regret_at_base_best_lr": max(lr["regret_at_base_best_lr"].values())}
+                    "max_regret_at_base_best_lr": max_regret}
+        if lr_transfer_val and name in lr_transfer_val:
+            lrv = lr_transfer_val[name]
+            finite_val_regrets = [v for v in lrv["regret_at_base_best_lr"].values() if v is not None]
+            max_val_regret = (
+                max(finite_val_regrets)
+                if finite_val_regrets and len(finite_val_regrets) == len(lrv["regret_at_base_best_lr"])
+                else None
+            )
+            row |= {"val_best_lr": lrv["best_lr"], "val_same_best_lr": lrv["same_best_lr"],
+                    "val_best_lr_interpolated_log2_shift": lrv["best_lr_interpolated_log2_shift"],
+                    "val_max_regret_at_base_best_lr": max_val_regret}
         out[name] = row
     return out
 
@@ -814,10 +890,17 @@ def run_tasks(tasks: list[dict], jobs: int) -> list[tuple[dict, dict]]:
     return [results[i] for i in range(len(tasks))]
 
 
+def _trial_hidden_lift(trial: dict, steps=PROBE_STEPS) -> list[float | None]:
+    lifts = [entry["polar_mean_sq_sv"] for entry in trial["updates"].values() if "polar_mean_sq_sv" in entry]
+    if not lifts:
+        return []
+    return [geometric_mean(lift[i] for lift in lifts) if step > 0 else None for i, step in enumerate(steps)]
+
+
 def run(*, base: ModelConfig = ModelConfig(), variants: list[Variant] | None = None,
         widths=WIDTHS, seeds=SEEDS, probe_steps=PROBE_STEPS, gate_steps=GATE_STEPS,
         lr_adamw: float = 0.003, lr_muon: float = 0.02, lr_aux: float = 0.01,
-        lr_grids: dict | None = None, lr_widths=LR_WIDTHS, lr_seeds=(0,), lr_steps: int = LR_STEPS,
+        lr_grids: dict | None = None, lr_widths=LR_WIDTHS, lr_seeds=SEEDS, lr_steps: int = LR_STEPS,
         jobs: int = 1) -> dict:
     """Coordinate check and learning-rate transfer for every variant."""
     variants = default_variants() if variants is None else variants
@@ -834,7 +917,7 @@ def run(*, base: ModelConfig = ModelConfig(), variants: list[Variant] | None = N
                        "probe_steps": ()} for w in lr_widths for s in lr_seeds for lr in lr_grids[variant.optimizer]]
     results = run_tasks(tasks, jobs)
 
-    coord, lr_transfer = {}, {}
+    coord, lr_transfer, lr_transfer_val = {}, {}, {}
     for variant in variants:
         mine = [(task, trial) for task, trial in results if task["variant"] == variant]
         trials = [trial for task, trial in mine if task["check"] == "coord"]
@@ -842,18 +925,31 @@ def run(*, base: ModelConfig = ModelConfig(), variants: list[Variant] | None = N
             summary = summarize_coord(trials, probe_steps, gate_steps)
             verdict = summary["gate"]
             matches = {"pass": verdict["passed"], "fail": verdict["fails_clearly"]}.get(variant.expected)
+            trial_rows = []
+            for t in trials:
+                row = {k: v for k, v in t.items() if k not in ("lr", "updates")}
+                if variant.optimizer == "muon":
+                    row["hidden_polar_mean_sq_sv"] = _trial_hidden_lift(t, probe_steps)
+                trial_rows.append(row)
             coord[variant.name] = {
                 **variant.describe(), "lr": trials[0]["lr"],
                 "lr_aux": lr_aux if variant.optimizer == "muon" else None,
                 "matches_expectation": matches, **summary,
-                "trials": [{k: v for k, v in t.items() if k not in ("lr", "updates")} for t in trials]}
+                "trials": trial_rows}
         trials = [trial for task, trial in mine if task["check"] == "lr"]
         if trials:
+            trial_rows = [
+                {k: t[k] for k in ("width", "seed", "lr", "final_loss", "eval_loss", "nonfinite_step", "seconds")}
+                | {"first_loss": t["losses"][0] if t["losses"] else None}
+                for t in trials
+            ]
             lr_transfer[variant.name] = {
                 **variant.describe(), "lr_aux": lr_aux if variant.optimizer == "muon" else None,
-                **summarize_lr_transfer(trials, base.d_base),
-                "trials": [{k: t[k] for k in ("width", "seed", "lr", "final_loss", "nonfinite_step", "seconds")}
-                           | {"first_loss": t["losses"][0] if t["losses"] else None} for t in trials]}
+                **summarize_lr_transfer(trials, base.d_base, loss_key="final_loss"),
+                "trials": trial_rows}
+            lr_transfer_val[variant.name] = {
+                **variant.describe(), "lr_aux": lr_aux if variant.optimizer == "muon" else None,
+                **summarize_lr_transfer(trials, base.d_base, loss_key="eval_loss")}
 
     return {
         "schema": "cycle3_mup_coord_check/v1",
@@ -864,14 +960,16 @@ def run(*, base: ModelConfig = ModelConfig(), variants: list[Variant] | None = N
             "model": {k: v for k, v in asdict(base).items()
                       if k not in ("width", "parameterization", "readout_lr_power")},
             "widths": list(widths), "seeds": list(seeds), "probe_steps": list(probe_steps),
-            "gate_steps": list(gate_steps), "pass_beta": PASS_BETA, "fail_beta": FAIL_BETA,
+            "gate_steps": list(gate_steps), "steady_gate_steps": list(STEADY_GATE_STEPS),
+            "pass_beta": PASS_BETA, "fail_beta": FAIL_BETA,
             "gate_statistic": "OLS slope of log(seed geometric mean of ||h(t) - h(0)||_RMS) on log(width)",
             "lr_adamw": lr_adamw, "lr_muon": lr_muon, "lr_aux": lr_aux,
             "adam_betas": list(ADAM_BETAS), "adam_eps": ADAM_EPS, "weight_decay": 0.0,
             "muon_beta": MUON_BETA, "muon_nesterov": True,
             "lr_transfer": {"lr_grids": {k: list(v) for k, v in lr_grids.items()}, "widths": list(lr_widths),
                             "seeds": list(lr_seeds), "steps": lr_steps,
-                            "loss": "mean cross-entropy over the training batches after the last step"},
+                            "loss": "mean cross-entropy over the training batches after the last step",
+                            "eval_loss": "mean cross-entropy over held-out unseen Markov validation batches after the last step"},
             "precision": {
                 "model_and_gradients": "float32",
                 "polar_native_dtype": {k: str(v).removeprefix("torch.") for k, v in NATIVE_POLAR_DTYPE.items()},
@@ -879,9 +977,11 @@ def run(*, base: ModelConfig = ModelConfig(), variants: list[Variant] | None = N
                              "stored result; svd_exact is FP64 on the numerical row space",
             },
         },
-        "orthogonalizer_comparison": orthogonalizer_comparison(coord, lr_transfer, gate_steps),
+        "orthogonalizer_comparison": orthogonalizer_comparison(coord, lr_transfer, gate_steps,
+                                                               lr_transfer_val=lr_transfer_val),
         "coord_check": coord,
         "lr_transfer": lr_transfer,
+        "lr_transfer_val": lr_transfer_val,
     }
 
 
@@ -918,9 +1018,9 @@ def main(argv: list[str] | None = None) -> dict:
                         help="smoke run: widths 128 and 256, one seed, short learning-rate check")
     parser.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2),
                         help="worker processes, one BLAS thread each")
-    parser.add_argument("--widths", type=int, nargs="+", default=list(WIDTHS))
-    parser.add_argument("--seeds", type=int, nargs="+", default=list(SEEDS))
-    parser.add_argument("--lr-seeds", type=int, nargs="+", default=[0])
+    parser.add_argument("--widths", type=int, nargs="+", default=None)
+    parser.add_argument("--seeds", type=int, nargs="+", default=None)
+    parser.add_argument("--lr-seeds", type=int, nargs="+", default=None)
     parser.add_argument("--d-base", type=int, default=128)
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--head-dim", type=int, default=32)
@@ -932,10 +1032,20 @@ def main(argv: list[str] | None = None) -> dict:
     args = parser.parse_args(argv)
 
     base = ModelConfig(d_base=args.d_base, layers=args.layers, head_dim=args.head_dim, mlp_mult=args.mlp_mult)
-    options = {"widths": tuple(args.widths), "seeds": tuple(args.seeds), "lr_seeds": tuple(args.lr_seeds)}
     if args.quick:
-        options = {"widths": (128, 256), "seeds": (0,), "lr_seeds": (0,), "lr_widths": (128, 256), "lr_steps": 4,
+        widths = tuple(args.widths) if args.widths is not None else (args.d_base, 2 * args.d_base)
+        seeds = tuple(args.seeds) if args.seeds is not None else (0,)
+        lr_seeds = tuple(args.lr_seeds) if args.lr_seeds is not None else (0,)
+        lr_widths = tuple(widths[:2]) if len(widths) >= 2 else tuple(widths)
+        options = {"widths": widths, "seeds": seeds, "lr_seeds": lr_seeds,
+                   "lr_widths": lr_widths, "lr_steps": 4,
                    "lr_grids": {"muon": (0.01, 0.04), "adamw": (0.003, 0.01)}}
+    else:
+        options = {
+            "widths": tuple(args.widths) if args.widths is not None else WIDTHS,
+            "seeds": tuple(args.seeds) if args.seeds is not None else SEEDS,
+            "lr_seeds": tuple(args.lr_seeds) if args.lr_seeds is not None else SEEDS,
+        }
     payload = run(base=base, lr_adamw=args.lr_adamw, lr_muon=args.lr_muon, lr_aux=args.lr_aux,
                   jobs=args.jobs, **options)
     payload["quick"] = args.quick
@@ -946,6 +1056,8 @@ def main(argv: list[str] | None = None) -> dict:
               f"max|beta|={verdict['max_abs_beta']}")
     for name, entry in payload["lr_transfer"].items():
         print(f"{name:40s} best_lr={entry['best_lr']} same={entry['same_best_lr']}")
+    for name, entry in payload["lr_transfer_val"].items():
+        print(f"{name:40s} val_best_lr={entry['best_lr']} same={entry['same_best_lr']}")
     return payload
 
 
