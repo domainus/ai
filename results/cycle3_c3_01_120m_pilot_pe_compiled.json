@@ -1,0 +1,303 @@
+{
+  "meta": {
+    "git_sha": "02c9a3419e37f8651364382871a3db8935094974",
+    "git_dirty": false,
+    "command": [
+      "/home/ryan/Documents/projects/ai/.venv/bin/python",
+      "research/polar_opt/harness_tier2_real.py",
+      "--preset",
+      "120m",
+      "--data-dir",
+      "/home/ryan/Documents/projects/ai/artifacts/real_text",
+      "--compile-model",
+      "--update-dtype",
+      "fp32",
+      "--seeds",
+      "0",
+      "--budget",
+      "tokens",
+      "--tokens",
+      "4194304",
+      "--lr-warmup-steps",
+      "16",
+      "--optimizers",
+      "muon_pe_compiled",
+      "--muon-lrs",
+      "0.02",
+      "--muon-aux-lr",
+      "0.001",
+      "--reference",
+      "muon_pe_compiled",
+      "--output",
+      "results/cycle3_c3_01_120m_pilot_pe_compiled.json"
+    ],
+    "args": {
+      "preset": "120m",
+      "micro_batch": "None",
+      "grad_accum": "None",
+      "data_dir": "/home/ryan/Documents/projects/ai/artifacts/real_text",
+      "device": "cuda",
+      "optimizers": "['muon_pe_compiled']",
+      "extra_optimizer": "[]",
+      "adamw_lrs": "[0.0005, 0.001, 0.002, 0.004]",
+      "muon_lrs": "[0.02]",
+      "muon_aux_lr": "0.001",
+      "weight_decay": "0.01",
+      "update_dtype": "fp32",
+      "seeds": "[0]",
+      "budget": "tokens",
+      "tokens": "4194304",
+      "seconds": "120.0",
+      "lr_warmup_steps": "16",
+      "wall_warmup_fraction": "0.0625",
+      "min_lr_ratio": "0.1",
+      "compile_warmup_steps": "3",
+      "eval_tokens": "1048576",
+      "compile_model": "True",
+      "reference": "muon_pe_compiled",
+      "output": "results/cycle3_c3_01_120m_pilot_pe_compiled.json",
+      "resume": "False",
+      "log_every": "10",
+      "telemetry_every": "100",
+      "harvest_nesterov": "False",
+      "harvest_optimizer": "muon_pe_eager",
+      "harvest_lr": "0.02",
+      "harvest_steps": "400",
+      "harvest_seed": "999",
+      "harvest_output": "/var/home/ryan/.t3/worktrees/ai/t3-771f6100-7a263f94a4e38726/artifacts/harvested_nesterov_real.pt"
+    },
+    "preset": "120m",
+    "config": {
+      "vocab_size": 50304,
+      "width": 768,
+      "layers": 12,
+      "heads": 12,
+      "hidden": 2048,
+      "sequence_length": 512,
+      "micro_batch": 8,
+      "grad_accum": 8
+    },
+    "step_tokens": 32768,
+    "parameters": {
+      "total": 123587328,
+      "embedding": 38633472,
+      "non_embedding": 84953856,
+      "muon_matrices": 84934656
+    },
+    "data": {
+      "source": {
+        "dataset": "HuggingFaceFW/fineweb-edu",
+        "config": "sample-10BT",
+        "split": "train",
+        "streaming": true,
+        "name": "fineweb-edu",
+        "fallback_from": null
+      },
+      "encoding": "gpt2",
+      "splits": {
+        "train": {
+          "tokens": 26004518,
+          "sha256": "015ab83ceb742555c2398963a0bd1f3c5502dc52cf70a22bf173f1571326ca3a"
+        },
+        "val": {
+          "tokens": 2002330,
+          "sha256": "371b64a537f7b1e306ea174a868b05932a254a98b7fbdbf4146648d93180b0b1"
+        },
+        "test": {
+          "tokens": 2000081,
+          "sha256": "4eb46f1424856849d2973923dbf3c886d37eb743cf22053fc7e1eea1f41ab92a"
+        }
+      }
+    },
+    "device": "NVIDIA GeForce RTX 5080",
+    "torch": "2.14.1+cu130",
+    "cuda": "13.0",
+    "host_cpus": 16,
+    "timestamp": "2026-11-25T23:16:09-0700",
+    "loadavg_start": [
+      2.27490234375,
+      2.5830078125,
+      3.236328125
+    ],
+    "loadavg_end": [
+      2.30029296875,
+      2.5400390625,
+      3.17529296875
+    ]
+  },
+  "summary": {
+    "grid": [
+      {
+        "budget": "tokens",
+        "optimizer": "muon_pe_compiled",
+        "update_dtype": "fp32",
+        "lr": 0.02,
+        "runs": 1,
+        "diverged": 0,
+        "val_loss_mean": 6.072853105142713,
+        "test_loss_mean": 6.110735988244414,
+        "tokens_per_second_mean": 83713.91121066376
+      }
+    ],
+    "best_lr": [
+      {
+        "budget": "tokens",
+        "optimizer": "muon_pe_compiled",
+        "update_dtype": "fp32",
+        "lr": 0.02,
+        "runs": 1,
+        "diverged": 0,
+        "val_loss_mean": 6.072853105142713,
+        "test_loss_mean": 6.110735988244414,
+        "tokens_per_second_mean": 83713.91121066376,
+        "lr_grid": [
+          0.02
+        ],
+        "lr_at_grid_edge": true
+      }
+    ],
+    "paired_vs_reference": [],
+    "note": "Negative loss differences favour the optimizer. LR is chosen on validation loss only; test loss is reported for the chosen LR."
+  },
+  "runs": [
+    {
+      "optimizer": "muon_pe_compiled",
+      "lr": 0.02,
+      "seed": 0,
+      "budget": "tokens",
+      "update_dtype": "fp32",
+      "auxiliary_lr": 0.001,
+      "init_fingerprint": "7401cff643fe5a57",
+      "stream_fingerprint": "c799a807f454d68f",
+      "timestamp_start": "2026-11-25T23:16:16-0700",
+      "loadavg_start": [
+        2.3330078125,
+        2.59033203125,
+        3.23486328125
+      ],
+      "gpu_start": {
+        "time": 1795673776.5529628,
+        "clocks.sm": 2857.0,
+        "clocks.mem": 14801.0,
+        "temperature.gpu": 46.0,
+        "power.draw": 224.91,
+        "utilization.gpu": 100.0,
+        "pstate": "P1",
+        "memory.used": 9270.0,
+        "clocks_event_reasons.active": "0x0000000000000400"
+      },
+      "gpu_end": {
+        "time": 1795673826.8205578,
+        "clocks.sm": 2827.0,
+        "clocks.mem": 14801.0,
+        "temperature.gpu": 65.0,
+        "power.draw": 302.87,
+        "utilization.gpu": 100.0,
+        "pstate": "P1",
+        "memory.used": 9263.0,
+        "clocks_event_reasons.active": "0x0000000000000400"
+      },
+      "loadavg_end": [
+        2.35546875,
+        2.55859375,
+        3.1884765625
+      ],
+      "steps": 128,
+      "tokens": 4194304,
+      "target_tokens": 4194304,
+      "target_seconds": null,
+      "train_seconds": 50.102831648197025,
+      "discarded_step_seconds": null,
+      "wall_budget_overshoot_seconds": null,
+      "tokens_per_second": 83713.91121066376,
+      "last_train_loss": 6.037199020385742,
+      "val_loss": 6.072853105142713,
+      "val_ppl": 433.9169277838291,
+      "test_loss": 6.110735988244414,
+      "test_ppl": 450.670281167361,
+      "diverged": false,
+      "timing": {
+        "steps_timed": 127,
+        "fwd_bwd_ms": 364.897705078125,
+        "polar_ortho_ms": 19.40847957134247,
+        "layout_cast_ms": 0.5937280021607876,
+        "foreach_update_ms": 2.0168320164084435,
+        "momentum_ms": 3.156351998448372,
+        "auxiliary_adamw_ms": 1.3236479759216309,
+        "adamw_fused_ms": null,
+        "optimizer_step_ms": 26.50009559467435,
+        "step_wall_ms": 391.452174866572
+      },
+      "train_curve": [
+        [
+          1,
+          10.96778
+        ],
+        [
+          10,
+          8.40763
+        ],
+        [
+          20,
+          7.44294
+        ],
+        [
+          30,
+          7.1467
+        ],
+        [
+          40,
+          6.82941
+        ],
+        [
+          50,
+          6.71421
+        ],
+        [
+          60,
+          6.44131
+        ],
+        [
+          70,
+          6.40687
+        ],
+        [
+          80,
+          6.30007
+        ],
+        [
+          90,
+          6.17353
+        ],
+        [
+          100,
+          6.12962
+        ],
+        [
+          110,
+          6.05473
+        ],
+        [
+          120,
+          6.14734
+        ]
+      ],
+      "gpu_samples": [
+        {
+          "time": 1795673815.8079536,
+          "clocks.sm": 2827.0,
+          "clocks.mem": 14801.0,
+          "temperature.gpu": 66.0,
+          "power.draw": 303.19,
+          "utilization.gpu": 100.0,
+          "pstate": "P1",
+          "memory.used": 9263.0,
+          "clocks_event_reasons.active": "0x0000000000000400"
+        }
+      ],
+      "timestamp_end": "2026-11-25T23:17:16-0700",
+      "run_config_hash": "81f54f0068a291fb",
+      "order_in_block": 0
+    }
+  ]
+}
