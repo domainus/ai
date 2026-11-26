@@ -49,6 +49,8 @@ CLOCKS = ("eager_event", "cuda_graph")
 REFERENCES = ("ps3_blackwell", "pe_compiled")
 CROSSOVER_METHODS = ("ss3_54", "ss3_53")
 QUICK = {"widths": [64, 128], "layers": 2, "blocks": 2, "iters": 2}
+CANONICAL_OUTPUT = ROOT / "results" / "cycle3_c3_01_wide_crossover.json"
+QUICK_OUTPUT = ROOT / "results" / "cycle3_c3_01_wide_crossover_quick.json"
 _INT_VIEW = {2: torch.int16, 4: torch.int32, 8: torch.int64}
 
 
@@ -227,17 +229,38 @@ def bench_step(methods: dict, config: dict, *, flush: torch.Tensor, warmups: int
 def crossover(steps: list[dict], method: str, clock: str, reference: str = "ps3_blackwell") -> dict:
     """Speedup of ``method`` over ``reference`` on the width grid, and where it crosses 1.00x.
 
-    A crossing lies between two adjacent grid widths with speedups on opposite sides of 1.
-    ``width_estimate`` interpolates log(speedup) linearly in log(width). It is an estimate between
-    two measured widths, not a measurement.
+    A crossing lies between two adjacent grid widths with speedups on opposite sides of 1, or at
+    an exact-1.0 plateau flanked by opposite sides. ``width_estimate`` interpolates log(speedup)
+    linearly in log(width). It is an estimate between two measured widths, not a measurement.
     """
-    points = sorted((s["width"], s["methods"][method][f"speedup_vs_{reference}"][clock])
-                    for s in steps if s["grid"])
+    raw = [(s["width"], s["methods"][method][f"speedup_vs_{reference}"][clock])
+           for s in steps if s["grid"]]
+    for w, s in raw:
+        if not (math.isfinite(w) and w > 0 and math.isfinite(s) and s > 0):
+            raise ValueError(f"Grid width and speedup must be finite and positive, got ({w!r}, {s!r})")
+    points = sorted(raw)
+    for k in range(len(points) - 1):
+        if points[k][0] == points[k + 1][0]:
+            raise ValueError(f"Duplicate grid width {points[k][0]}")
     crossings = []
-    for (w0, s0), (w1, s1) in zip(points, points[1:]):
-        if (s0 < 1.0) != (s1 < 1.0):
-            fraction = math.log(s0) / (math.log(s0) - math.log(s1))
-            crossings.append({"between_widths": [w0, w1], "width_estimate": w0 * (w1 / w0) ** fraction})
+    i = 0
+    while i < len(points):
+        if points[i][1] == 1.0:
+            j = i
+            while j + 1 < len(points) and points[j + 1][1] == 1.0:
+                j += 1
+            if i > 0 and j < len(points) - 1 and (points[i - 1][1] - 1.0) * (points[j + 1][1] - 1.0) < 0.0:
+                w0, w1 = points[i][0], points[j][0]
+                crossings.append({"between_widths": [w0, w1],
+                                  "width_estimate": float(w0) if w0 == w1 else math.sqrt(w0 * w1)})
+            i = j + 1
+        else:
+            if i + 1 < len(points):
+                (w0, s0), (w1, s1) = points[i], points[i + 1]
+                if (s0 - 1.0) * (s1 - 1.0) < 0.0:
+                    fraction = math.log(s0) / (math.log(s0) - math.log(s1))
+                    crossings.append({"between_widths": [w0, w1], "width_estimate": w0 * (w1 / w0) ** fraction})
+            i += 1
     return {"speedup_by_width": {str(w): s for w, s in points},
             "first_width_at_or_above_1x": next((w for w, s in points if s >= 1.0), None),
             "crossings": crossings}
@@ -295,7 +318,7 @@ def run(names: list[str] | None = None, *, widths=WIDTHS, layers: int = LAYERS, 
     return result
 
 
-def main(argv: list[str] | None = None) -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--methods", nargs="+", choices=list(method_factories()))
     parser.add_argument("--widths", nargs="+", type=int, default=WIDTHS)
@@ -306,13 +329,51 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--quick", action="store_true",
                         help=f"fast check that overrides widths, layers, blocks and iters: {QUICK}")
     parser.add_argument("--output", type=Path)
+    return parser
+
+
+def _is_canonical_args(args: argparse.Namespace) -> bool:
+    all_methods = list(method_factories())
+    return (
+        not args.quick
+        and (args.methods is None or list(args.methods) == all_methods)
+        and list(args.widths) == list(WIDTHS)
+        and (args.blocks is None or args.blocks == default_blocks(len(all_methods)))
+        and args.iters == 5
+        and args.warmups >= 5
+    )
+
+
+def _resolve_output(args: argparse.Namespace) -> Path:
+    canonical = _is_canonical_args(args)
+    if args.output is None:
+        if args.quick:
+            return QUICK_OUTPUT
+        if canonical:
+            return CANONICAL_OUTPUT
+        raise ValueError(
+            "Non-canonical subset run requires an explicit --output path to avoid "
+            f"overwriting {CANONICAL_OUTPUT.name}"
+        )
+    if args.output.resolve() == CANONICAL_OUTPUT.resolve() and not canonical:
+        raise ValueError(
+            f"Refusing to overwrite canonical {CANONICAL_OUTPUT.name} from a --quick or "
+            "subset run; choose a different --output path"
+        )
+    return args.output
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
     args = parser.parse_args(argv)
+    try:
+        output = _resolve_output(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     shape = QUICK if args.quick else {"widths": args.widths, "blocks": args.blocks, "iters": args.iters}
     result = run(args.methods, warmups=args.warmups, seed=args.seed, **shape)
     result["settings"]["quick"] = args.quick
     result["command"] = [sys.executable, *sys.argv]
-    name = "cycle3_c3_01_wide_crossover_quick.json" if args.quick else "cycle3_c3_01_wide_crossover.json"
-    output = args.output or ROOT / "results" / name
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
     print(f"\nWrote {output}")

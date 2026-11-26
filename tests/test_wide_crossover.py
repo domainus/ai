@@ -2,6 +2,7 @@
 
 import itertools
 import json
+import math
 
 import pytest
 import torch
@@ -126,3 +127,82 @@ def test_quick_cli_writes_strict_json(tmp_path):
                        for reference in wide.REFERENCES for clock in wide.CLOCKS)
     assert set(result["crossover_vs_ps3_blackwell"]) == {"ss3_54", "ss3_53"}
     assert set(result["crossover_vs_ps3_blackwell"]["ss3_54"]["cuda_graph"]["speedup_by_width"]) == {"64", "128"}
+
+
+def _crossover_steps(speedups):
+    return [{"width": w, "grid": True,
+             "methods": {"ss3_54": {"speedup_vs_ps3_blackwell": {"cuda_graph": s}}}}
+            for w, s in speedups]
+
+
+def test_crossover_exact_tie_plateau_and_invalid_inputs():
+    empty = wide.crossover([], "ss3_54", "cuda_graph")
+    assert empty == {"speedup_by_width": {}, "first_width_at_or_above_1x": None, "crossings": []}
+
+    tangent_below = wide.crossover(_crossover_steps([(512, 0.9), (1024, 1.0), (2048, 0.95)]), "ss3_54", "cuda_graph")
+    assert tangent_below["crossings"] == []
+    assert tangent_below["first_width_at_or_above_1x"] == 1024
+
+    tangent_above = wide.crossover(_crossover_steps([(512, 1.1), (1024, 1.0), (2048, 1.1)]), "ss3_54", "cuda_graph")
+    assert tangent_above["crossings"] == []
+    assert tangent_above["first_width_at_or_above_1x"] == 512
+
+    exact_up = wide.crossover(_crossover_steps([(512, 0.9), (1024, 1.0), (2048, 1.1)]), "ss3_54", "cuda_graph")
+    assert exact_up["crossings"] == [{"between_widths": [1024, 1024], "width_estimate": 1024.0}]
+    assert exact_up["first_width_at_or_above_1x"] == 1024
+
+    exact_down = wide.crossover(_crossover_steps([(512, 1.1), (1024, 1.0), (2048, 0.9)]), "ss3_54", "cuda_graph")
+    assert exact_down["crossings"] == [{"between_widths": [1024, 1024], "width_estimate": 1024.0}]
+    assert exact_down["first_width_at_or_above_1x"] == 512
+
+    plateau = wide.crossover(_crossover_steps([(512, 0.9), (768, 1.0), (1024, 1.0), (2048, 1.1)]), "ss3_54", "cuda_graph")
+    assert len(plateau["crossings"]) == 1
+    assert plateau["crossings"][0]["between_widths"] == [768, 1024]
+    assert plateau["crossings"][0]["width_estimate"] == pytest.approx(math.sqrt(768 * 1024))
+
+    with pytest.raises(ValueError, match="Duplicate grid width"):
+        wide.crossover(_crossover_steps([(512, 0.9), (512, 1.1)]), "ss3_54", "cuda_graph")
+
+    for bad in ([(0, 1.0)], [(512, 0.0)], [(512, float("nan"))], [(512, float("inf"))]):
+        with pytest.raises(ValueError, match="finite and positive"):
+            wide.crossover(_crossover_steps(bad), "ss3_54", "cuda_graph")
+
+
+def test_cli_output_guard_protects_canonical_artifact(tmp_path, monkeypatch):
+    def fail_run(*args, **kwargs):
+        raise AssertionError("run() should not be called")
+
+    monkeypatch.setattr(wide, "run", fail_run)
+    parser = wide.build_parser()
+    assert wide._resolve_output(parser.parse_args([])) == wide.CANONICAL_OUTPUT
+    assert wide._resolve_output(parser.parse_args(["--quick"])) == wide.QUICK_OUTPUT
+    custom = tmp_path / "subset.json"
+    assert wide._resolve_output(parser.parse_args(["--widths", "64", "--output", str(custom)])) == custom
+
+    for argv in (
+        ["--widths", "64"],
+        ["--methods", "ps3_blackwell", "ss3_54"],
+        ["--blocks", "2"],
+        ["--iters", "1"],
+        ["--quick", "--output", str(wide.CANONICAL_OUTPUT)],
+        ["--widths", "64", "--output", str(wide.CANONICAL_OUTPUT)],
+    ):
+        with pytest.raises(SystemExit) as exc:
+            wide.main(argv)
+        assert exc.value.code == 2
+
+
+def test_recorded_wide_crossover_matches_recomputed_crossings():
+    if not wide.CANONICAL_OUTPUT.is_file():
+        pytest.skip("canonical wide crossover JSON not present")
+    data = json.loads(wide.CANONICAL_OUTPUT.read_text())
+    for method in wide.CROSSOVER_METHODS:
+        for clock in wide.CLOCKS:
+            recomputed = wide.crossover(data["steps"], method, clock)
+            recorded = data["crossover_vs_ps3_blackwell"][method][clock]
+            assert recomputed["speedup_by_width"] == recorded["speedup_by_width"]
+            assert recomputed["first_width_at_or_above_1x"] == recorded["first_width_at_or_above_1x"]
+            assert len(recomputed["crossings"]) == len(recorded["crossings"])
+            for got, want in zip(recomputed["crossings"], recorded["crossings"]):
+                assert got["between_widths"] == want["between_widths"]
+                assert got["width_estimate"] == pytest.approx(want["width_estimate"])
