@@ -5853,13 +5853,14 @@
     ]
   },
   "promotion_gate": {
+    "source": "post_run_analysis",
     "criterion": "register only if step-20 held-out error improves sharply over the registered circuit of the same split while mid/late median <= PS3_55 and Fable R1/R2/R3 + CUDA-graph bitwise replay pass",
     "search_json": "results/cycle3_c3_02_early_polish_search.json",
     "search_git_sha": "674b0067a4344171851f815cb27f72e350a20544",
     "validated_candidates": [
       "SS3_54E0"
     ],
-    "splits_without_safe_candidate": [
+    "splits_without_qualifying_candidate": [
       "3+5",
       "3+4",
       "5+3"
@@ -5875,7 +5876,8 @@
         "mid_median": 0.04821759161998688,
         "late_median": 0.04743378882561423,
         "mid_late_at_or_below_ps3_55": true,
-        "parent_mid_late_win_retained": 0.47137323517657537,
+        "parent_mid_win_retained": 0.47137323517657537,
+        "parent_late_win_retained": 0.4701089703467401,
         "max_sigma_max": 1.1190594249456562,
         "design_error": 0.11777490213703246,
         "bf16_verified": false,
@@ -5890,6 +5892,6 @@
       }
     },
     "verdict": "no circuit promoted; SCHATTEN_SWITCH_CIRCUITS unchanged",
-    "why": "under-lift at x ~ 1e-3 is bounded by polynomial degree: the polished 5+4 slope at zero rises only from 584 to 650 (PS3_55: 1131) within the safety bounds; 3+k circuits cannot reach it at all without breaking the band"
+    "why": "under-lift at x ~ 1e-3 persists across the 20 tested polish starts and enforced safety bounds: SS3_54E0 (5+4) lifts slope_at_zero only from 584.3 to 650.0 (reducing step-20 held-out median from 0.2326 to 0.2024 vs PS3_55 0.0822) while surrendering 52.9% (mid) and 53.0% (late) of SS3_54's lead; among the tested starts, one 5+3 start passed scalar safety without qualifying for validation, and all tested 3+4 and 3+5 starts failed the safety band"
   }
 }

@@ -974,12 +974,17 @@ def verify(circuit, dtype_name: str) -> dict:
 def kernel_launches(circuit, n: int) -> dict:
     """GPU kernels of one natural call (``sigma_hat=None``) on a contiguous FP32 matrix.
 
+    Analytic launch count applies only to zero-residual segment-1 circuits
+    (``circuit.table[0][0] == 0.0``, where segment 1 has no identity residual so
+    its square reuses the SYRK matrix product count) on contiguous FP32 inputs.
     Matrix products: per segment SYRK + squares + ``Q @ X``. Four reductions and elementwise
     kernels: the safe norm partials, the normalize-and-prescale pass, the dual norm of ``R`` and
     ``R^2``, and the fold kernel, which also applies the first-row ``b R + c I`` (so ``semi`` and
     ``general`` first rows add no launch). The path is sync-free, so there are no host reads, and
     the count does not depend on ``n``. ``measure_launches`` checks these numbers with the profiler.
     """
+    if circuit.table[0][0] != 0.0:
+        raise ValueError("kernel_launches analytic count supports zero-residual segment-1 circuits only")
     products = 2 * len(circuit.table) + sum(circuit.squarings)
     return {"matrix_products": products, "total": products + 4, "host_reads": 0}
 
@@ -1192,11 +1197,27 @@ def graph_replay(circuit, dtype, shapes=((512, 2048), (4, 256, 512))) -> dict:
     return {"passed": all(r["bitwise_equal"] for r in rows), "shapes": rows}
 
 
+def _resolve_search_output(output: Path | None, include_early_srank: bool, seed_artifact: Path) -> Path:
+    """Resolve the search output path, keeping early re-polish distinct from its seed artifact."""
+    if include_early_srank:
+        resolved = Path("results/schatten_switch_early_polish.json") if output is None else output
+        if resolved.resolve() == seed_artifact.resolve():
+            raise ValueError(
+                f"Early search --output ({resolved}) must differ from --seed-artifact ({seed_artifact})"
+            )
+        return resolved
+    return Path("results/schatten_switch_search_cycle2.json") if output is None else output
+
+
 def run_early_search(args) -> None:
     """Targeted re-polish of the 5+4, 5+3, 3+5 and 3+4 circuits with synthetic early spectra."""
     import torch
     from dataclasses import replace
 
+    if args.output.resolve() == args.seed_artifact.resolve():
+        raise ValueError(
+            f"Early search --output ({args.output}) must differ from --seed-artifact ({args.seed_artifact})"
+        )
     began = time.perf_counter()
     artifact = json.loads(args.seed_artifact.read_text())
     cache = json.loads(args.fit_cache.read_text()) if args.fit_cache and args.fit_cache.exists() else {}
@@ -1316,7 +1337,9 @@ def run_early_search(args) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--output", type=Path, default=Path("results/schatten_switch_search_cycle2.json"))
+    parser.add_argument("--output", type=Path, default=None,
+                        help="output JSON path (defaults to results/schatten_switch_search_cycle2.json, or "
+                             "results/schatten_switch_early_polish.json with --include-early-srank)")
     parser.add_argument("--fit-cache", type=Path, default=None,
                         help="JSON with the segment fits: loaded if it exists, updated after every family")
     parser.add_argument("--trajectories", type=Path, default=Path("artifacts/harvested_trajectories.pt"))
@@ -1337,6 +1360,10 @@ def main():
     early.add_argument("--early-evaluations", type=int, default=200)
     early.add_argument("--early-validate", type=int, default=2, help="GPU-validated candidates per split")
     args = parser.parse_args()
+    try:
+        args.output = _resolve_search_output(args.output, args.include_early_srank, args.seed_artifact)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.include_early_srank:
         if args.fit_cache and not args.fit_cache.exists():
             parser.error(f"--fit-cache {args.fit_cache} does not exist")

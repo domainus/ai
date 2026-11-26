@@ -575,8 +575,12 @@ def test_heldout_eval_loads_validated_candidates(tmp_path):
     fp16_only = dataclasses.replace(SCHATTEN_SWITCH_CIRCUITS["SS3_54"], name="X_54")
     both = dataclasses.replace(SCHATTEN_SWITCH_CIRCUITS["SS3_35"], name="X_35")
     path = tmp_path / "search.json"
-    path.write_text(json.dumps({"validated": {"X_54": {"circuit": fp16_only.to_dict()},
-                                              "X_35": {"circuit": both.to_dict()}}}))
+    path.write_text(json.dumps({
+        "validated": {
+            "X_54": {"circuit": fp16_only.to_dict(), "fp16_passed": True, "bf16_verified": False},
+            "X_35": {"circuit": both.to_dict(), "fp16_passed": True, "bf16_verified": True},
+        }
+    }))
     methods = _candidate_methods(path)
     assert sorted(methods) == ["cand_X_35_bf16", "cand_X_35_fp16", "cand_X_54_fp16"]
     G = rand((256, 512), seed=3)
