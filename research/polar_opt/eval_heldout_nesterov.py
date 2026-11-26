@@ -41,6 +41,35 @@ def _methods() -> dict:
     }
 
 
+def _candidate_methods(path: Path, *, include_failed: bool = False) -> dict:
+    """``cand_<name>_fp16`` (and ``_bf16`` if verified) for passing validated circuits of a search JSON."""
+    from research.polar_opt.schatten_switch_blackwell import SchattenSwitchCircuit
+
+    out = {}
+    for name, record in json.loads(path.read_text()).get("validated", {}).items():
+        if not include_failed and not record.get("fp16_passed", False):
+            continue
+        circuit = SchattenSwitchCircuit.from_dict(record["circuit"])
+        out[f"cand_{name}_fp16"] = lambda g, c=circuit: schatten_switch_blackwell(g, c, dtype=torch.float16)
+        if circuit.bf16_verified and record.get("bf16_verified", circuit.bf16_verified):
+            out[f"cand_{name}_bf16"] = lambda g, c=circuit: schatten_switch_blackwell(g, c, dtype=torch.bfloat16)
+    return out
+
+
+def _resolve_eval_output(output: Path | None, candidates: Path | None) -> Path:
+    """Resolve the eval output path, requiring a distinct non-baseline path when --candidates is set."""
+    default_out = ROOT / "results" / "cycle2_heldout_nesterov_eval.json"
+    if candidates is not None:
+        if output is None:
+            raise ValueError("--output is required when --candidates is set so baseline results are not overwritten")
+        if output.resolve() == default_out.resolve():
+            raise ValueError(f"--output ({output}) must not overwrite baseline {default_out} when --candidates is set")
+        if output.resolve() == candidates.resolve():
+            raise ValueError(f"--output ({output}) must differ from --candidates ({candidates})")
+        return output
+    return default_out if output is None else output
+
+
 def _summarize(rows: list[dict]) -> dict:
     errs = [r["relative_frobenius_error"] for r in rows if "relative_frobenius_error" in r]
     sig_hi = [r["sigma_max"] for r in rows if "sigma_max" in r]
@@ -60,9 +89,21 @@ def _summarize(rows: list[dict]) -> dict:
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--input", type=Path, default=ROOT / "artifacts" / "harvested_nesterov_real.pt")
-    parser.add_argument("--output", type=Path, default=ROOT / "results" / "cycle2_heldout_nesterov_eval.json")
+    parser.add_argument("--output", type=Path, default=None,
+                        help="output JSON path (defaults to results/cycle2_heldout_nesterov_eval.json; "
+                             "explicit distinct path required when --candidates is set)")
     parser.add_argument("--divergence-limit", type=float, default=2.0)
+    parser.add_argument("--methods", nargs="+", default=None,
+                        help="subset of the built-in methods (default: all)")
+    parser.add_argument("--candidates", type=Path, default=None,
+                        help="search JSON whose 'validated' circuits are evaluated out of sample")
+    parser.add_argument("--include-failed-candidates", action="store_true",
+                        help="also load validated candidates whose fp16_passed is false or missing")
     args = parser.parse_args(argv)
+    try:
+        args.output = _resolve_eval_output(args.output, args.candidates)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required for Blackwell held-out Nesterov evaluation")
@@ -82,6 +123,13 @@ def main(argv: list[str] | None = None) -> None:
         targets.append((pair["phase"], pair["name"], pair["step_t"], list(pair["shape"]), G, P, P.cpu()))
 
     methods = _methods()
+    if args.methods:
+        unknown = sorted(set(args.methods) - set(methods))
+        if unknown:
+            raise ValueError(f"Unknown methods {unknown}; available: {sorted(methods)}")
+        methods = {name: methods[name] for name in args.methods}
+    if args.candidates:
+        methods.update(_candidate_methods(args.candidates, include_failed=args.include_failed_candidates))
     summary, by_phase, cases = {}, {}, {}
     for method_name, fn in methods.items():
         all_rows = []
@@ -124,6 +172,7 @@ def main(argv: list[str] | None = None) -> None:
         "layers": bundle.get("layers"),
         "pair_count": len(targets),
         "divergence_limit": args.divergence_limit,
+        "candidates": str(args.candidates) if args.candidates else None,
         "summary": summary,
         "by_phase": by_phase,
         "cases": cases,

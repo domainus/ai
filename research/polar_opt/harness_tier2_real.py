@@ -289,6 +289,8 @@ class Muon:
                                 alpha=-self.lr * math.sqrt(max(1, rows / columns)))
             mark("foreach_update")
         self.auxiliary.step()
+        if hasattr(self.orthogonalize, "on_step_end"):
+            self.orthogonalize.on_step_end()  # phase-switched schedules count optimizer steps
         mark("auxiliary_adamw")
 
 
@@ -544,6 +546,8 @@ def run_trial(config: ModelConfig, data: ShardData, *, device: torch.device, see
     # Untimed warmup on a disposable stream: compilation, autotuning and plan caches.
     if compile_warmup_steps:
         warm_optimizer = build_optimizer(optimizer_name, factory, model, **settings)
+        if hasattr(getattr(warm_optimizer, "orthogonalize", None), "set_warmup"):
+            warm_optimizer.orthogonalize.set_warmup(True)  # warm every phase before timed step 0
         warm_stream = BatchStream(data.train, config, seed + 1_000_000, device)
         for _ in range(compile_warmup_steps):
             train_step(forward, warm_stream.next_batch(), warm_optimizer)

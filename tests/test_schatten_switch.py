@@ -527,3 +527,61 @@ def test_custom_pure_square_and_nonzero_residual_circuits():
         ref = schatten_switch_reference(G, circuit, dtype=FP16)
         assert torch.isfinite(out).all()
         assert rel(out, ref) < 5e-3
+
+
+# ------------------------------------------------------------------ Cycle 3 C3-02: early-spectrum mode
+def test_early_srank_spectra_are_synthetic_and_near_rank_one():
+    from research.polar_opt import schatten_switch_search as search
+
+    spectra = search.early_srank_spectra()
+    again = search.early_srank_spectra()
+    assert len(spectra) == len(search.EARLY_SIZES) * len(search.EARLY_SRANKS) * (
+        len(search.EARLY_POWERS) + len(search.EARLY_SECONDARIES) * len(search.EARLY_FLOORS))
+    for row, other in zip(spectra, again):
+        s = row["s"]
+        assert np.array_equal(s, other["s"]) and len(s) == row["n"]
+        assert 1.03 - 1e-9 <= np.sum(s ** 2) / s[0] ** 2 <= 1.60 + 1e-9
+        assert s[0] == s.max() == 1.0 and s.min() > 0
+    # Anti-overfitting: the search never reads the held-out real momenta.
+    assert "harvested_nesterov_real" not in Path(search.__file__).read_text()
+
+
+@pytest.mark.parametrize("name", NAMES)
+def test_kernel_launch_record_matches_the_profiler_and_is_sync_free(name):
+    from research.polar_opt.schatten_switch_search import kernel_launches, measure_launches
+
+    circuit = SCHATTEN_SWITCH_CIRCUITS[name]
+    record = kernel_launches(circuit, 512)
+    assert record["matrix_products"] == theoretical_flops(name, (512, 2048))["matrix_kernel_launches"]
+    for shape in [(512, 2048), (1024, 1024)]:
+        measured = measure_launches(lambda G: schatten_switch_blackwell(G, name), shape)
+        assert measured["kernels"] == record["total"] and measured["host_reads"] == 0 == record["host_reads"]
+
+
+@pytest.mark.parametrize("name", ["SS3_54", "SS3_35"])
+def test_early_mode_gpu_gates_pass_for_registered_circuits(name):
+    from research.polar_opt.schatten_switch_search import graph_replay, r3_long_k
+
+    circuit = SCHATTEN_SWITCH_CIRCUITS[name]
+    assert r3_long_k(circuit, FP16)["passed"]
+    assert graph_replay(circuit, FP16)["passed"]
+    if circuit.bf16_verified:
+        assert graph_replay(circuit, BF16)["passed"]
+
+
+def test_heldout_eval_loads_validated_candidates(tmp_path):
+    from research.polar_opt.eval_heldout_nesterov import _candidate_methods
+
+    fp16_only = dataclasses.replace(SCHATTEN_SWITCH_CIRCUITS["SS3_54"], name="X_54")
+    both = dataclasses.replace(SCHATTEN_SWITCH_CIRCUITS["SS3_35"], name="X_35")
+    path = tmp_path / "search.json"
+    path.write_text(json.dumps({
+        "validated": {
+            "X_54": {"circuit": fp16_only.to_dict(), "fp16_passed": True, "bf16_verified": False},
+            "X_35": {"circuit": both.to_dict(), "fp16_passed": True, "bf16_verified": True},
+        }
+    }))
+    methods = _candidate_methods(path)
+    assert sorted(methods) == ["cand_X_35_bf16", "cand_X_35_fp16", "cand_X_54_fp16"]
+    G = rand((256, 512), seed=3)
+    assert torch.equal(methods["cand_X_54_fp16"](G), schatten_switch_blackwell(G, "SS3_54"))
