@@ -1,21 +1,21 @@
 {
   "program": "Autonomous Verifiable AI Research",
   "repo": "https://github.com/domainus/ai",
-  "cycle": 2,
-  "phase": "cycle2_audited_and_remediated",
-  "last_updated": "2026-11-25T20:40:00-07:00",
+  "cycle": 3,
+  "phase": "cycle3_audited_and_merged",
+  "last_updated": "2026-11-26T04:20:41-07:00",
   "fleet": {
     "bazzite": {
       "environment_id": "6fb39dcd-f3b7-4929-a1d5-637d67eb79bb",
       "hardware": "Linux x64 | RTX 5080 16GB (sm_120) | Ryzen 7 5800X3D",
       "status": "online",
-      "role": "CUDA/Triton kernels, CUDA-graph benchmarks, real-text 50M-120M LM pretraining"
+      "role": "CUDA/Triton kernels, CUDA-graph benchmarks, real-text 50M-120M LM pretraining & NVFP4 PTQ"
     },
     "macbook_pro": {
       "environment_id": "fbc39183-5d33-4276-af14-3cb027511e92",
       "hardware": "macOS arm64 | Apple M5 Max (40 GPU cores, 128 GiB unified, MLX 0.32.5)",
-      "status": "online",
-      "role": "Sole Apple Silicon host — 64x64 Metal 4 SYRK/symprod verified <= 2048^2 FP16/BF16 (open-lid 4096^2 rerun queued)"
+      "status": "unreachable",
+      "role": "Sole Apple Silicon host — 64x64 Metal 4 SYRK/symprod verified <= 2048^2 FP16/BF16 (C3-04 open-lid 4096^2 & post-merge pytest queued once reachable)"
     },
     "macbook_air": {
       "environment_id": "01096d9f-87f1-432f-b1d9-49c309d1458f",
@@ -25,121 +25,131 @@
     }
   },
   "kpis": {
-    "experiments_run": 16,
-    "verified_wins": 5,
-    "best_speedup_vs_pe": 2.65,
+    "experiments_run": 22,
+    "verified_wins": 9,
+    "best_speedup_vs_pe": 2.7,
     "best_speedup_vs_ps": 2.58,
-    "tests_passing": 742,
-    "audits_completed": 9
+    "tests_passing": 1054,
+    "audits_completed": 14
   },
   "completed": [
-    "VERIFIED KERNELS (SS3_54 / SS3_53): Sync-free CUDA-graph (0/55 err, 0.0 diff); 1.005-1.044x (SS3_54) & 1.036-1.113x (SS3_53) vs PS3_55_bw at n>=2048 & (4,1024,4096); 0/117 Tier-1 & 0/45 held-out div; -46% steady FineWeb-Edu err (0.0329 vs 0.0604)",
-    "VERIFIED REAL-TEXT 50M TRANSFER (5 seeds, compiled, FP32 updates, 0/70 div): SS3_54, SS3_53 & PS3_55_bw tie PE on tokens (+3.10-3.18% tok/s) & win 75s compute (-0.026 to -0.033 loss, Holm p<0.05); native <0.01% diff",
-    "VERIFIED M5 MAX <=2048^2 (Metal 4 64x64 SYRK, 79/79 Metal tests, 0/360 div): FP16/BF16 PS3_55 hits 3.059/3.042 ms at 2048^2 (2.58x/2.57x vs dense PS3, 2.20x/2.19x vs PE); 1.81x/1.76x at 1024x4096; FP32 gated off",
-    "AUDIT REMEDIATIONS APPLIED (742 passed, 3 Metal-skipped): Fixed long-K bias (k_slack, K=2^25<=1.25), sigma_hat NaN leak, REDUCE_BLOCKS, capture cache guard, compile_model/zero-step/leakage tests"
+    "C3-03 TILE-NORM LAUNCH FUSION & TIER-1 REFRESH (0/55 capture err, 0.0 diff, 0/117 div): SS3 launches 17->16 / 16->15 / 15->14; SS3_53 beats PS3_55 across all 5 shapes (1.034-1.132x graph, 2.700x vs PE @ 2048x8192); SS3_54 beats PS3_55 at n>=1024 (1.017-1.062x, wall 0.2256 vs 0.2289 ms @ 512x2048, 0.987x graph)",
+    "C3-01 WIDE CROSSOVER & 120M SHORT-BUDGET TRANSFER (0/33 div, 0.0s overshoot): Full 12-layer step SS3_53 beats PS3_55 across w512..w2048 (1.019-1.067x); SS3_54 crosses at w1024 (1.000x -> 1.020x @ w2048). 120m 3-seed FineWeb-Edu (256 tok / 100s wall): Blackwell +2.90-3.00% tok/s vs PE compiled (Holm p<=0.0018); SS3_54 wall test loss -0.0055 vs PS3 (Holm 10-pair p=0.0352, joint p=0.0810)",
+    "C3-02 HYBRID & EARLY-POLISH VERDICT (0/20 div): Falsified PS3/SS3_54->SS3_34 hybrid (+0.010/+0.011 50m loss regression); SS3_35 BF16 parity (+0.0026); early-polish SS3_54E0 not promoted (-13% step-20 err while losing 53% mid/late lead)",
+    "T4-01 MUP COORDINATE CHECK (CPU, 3 seeds, 128->1024): SP fails (max |beta| 2.599 AdamW / 1.553 Muon), readout_lr_power=1 fails (0.975-1.049), muP passes (0.116 AdamW, 0.078-0.082 Muon across svd_exact/PE/PS3/SS3 within 0.004); val LR transfer 0.08->0.04 for PS3/SS3 vs +2.0 log2 drift on SP",
+    "T5-01 BLACKWELL NVFP4/MXFP4/INT2 PTQ (40/40 GPTQ damp=0.01, 4x L2 flush): Native F.scaled_mm NVFP4 hits 511.8 TFLOPS (5.07x @ 1024x4096) & 757.5 TFLOPS (6.54x @ 2048x8192) pre-quant GEMM; GPTQ cuts full test.bin (2.0M tok) dNLL 3-5x vs RTN (Muon NVFP4 +0.0095->+0.0021 had_b64_gptq; INT2 g32 +0.268->+0.053 bfly_b16_gptq)",
+    "CYCLE 2 VERIFIED BASELINE: M5 Max 64x64 Metal SYRK <=2048^2 (2.58x FP16 / 2.57x BF16 vs dense MLX PS3; FP32 gated dense) & 50m 5-seed FineWeb-Edu (+3.10-3.18% tok/s vs PE eager, -0.026 to -0.033 75s loss, Holm p<0.05)"
   ],
   "wip": [
-    "C3-01: Scale real-text LM pretraining to 120m (width=768) & wider widths for SS3 vs PS3 crossover",
-    "C3-02: Hybrid post-warmup switching (PS3_55/SS3_54 -> SS3_34) & step-20 Nesterov re-polishing",
-    "C3-04: Open-lid caffeinate M5 Max 4096^2 single-session rerun + post-merge live pytest tests/test_mlx.py"
+    "C3-04: Open-lid caffeinate -dimsu M5 Max 4096^2 single-session rerun + post-merge live pytest tests/test_mlx.py (blocked while MacBook Pro unreachable)",
+    "C4-01: Longer-budget >=20M-token 120m pretraining & iso-loss quality-matched multi-seed Muon-vs-AdamW PTQ",
+    "C4-02: End-to-end Blackwell NVFP4 inference path with online activation quantization & micro-rotation"
   ],
   "blockers": [
-    "SS3_34 disqualified standalone (+0.042 50m test loss from step-20 0.5223 error); 50m (n=512) below SS3 crossover",
-    "M5 Max sustained 4096^2 benchmark provisional (~2.6x min BF16) from closed-lid sleeps; FP32 Metal gated off (0.77-0.94x)",
-    "Verified negative: gram_space_restart rejected (75/117 FP16 div, smax 73,058); seed-5 PS3_bw run kept 1.56s stall"
+    "SS3_54 remains 1.3% slower than PS3_55_blackwell in CUDA-graph at (512, 2048) (0.987x) & Tier-1 median (0.991x); w512 wide crossover had host-load tails (6.57->8.67)",
+    "C3-01 120m used short 8.39M-token / 100s budgets (<20M backlog target); PS3_55_blackwell retained as conservative 120m default",
+    "C3-02 hybrid PS3/SS3_54 -> SS3_34 falsified (+0.010/+0.011 50m loss); T5-01 Muon-vs-AdamW confounded by 1.86x PPL gap (220.1 vs 409.6); NVFP4 outliers favor unrotated GPTQ",
+    "Ryan's MacBook Pro unreachable (C3-04 deferred to Cycle 4); 3 Metal-only tests skipped on Linux"
   ],
   "audits": [
     {
-      "auditor": "Claude Opus 5.5 (bazzite & M5 Max, high)",
-      "verdict": "PASS_WITH_CAVEATS -> REMEDIATED",
+      "auditor": "Claude Opus 5.5 (C3-03 live GPU, high)",
+      "verdict": "PASS_WITH_CAVEATS -> REMEDIATED (L1/L3/L4)",
       "status": "DONE",
-      "report": "audits/AUDIT_cycle2_claude_opus.md",
-      "target": "Sync-free CUDA-graph kernels, Sweep A timing & M5 Max Metal 64x64 SYRK (t2_02)"
+      "report": "audits/AUDIT_cycle3_c3_03_claude_opus.md",
+      "target": "Small-n tile-norm launch fusion, direct Triton 3.8 C launcher & 117-case Tier-1 refresh"
     },
     {
-      "auditor": "Claude Fable 5.2 (high)",
+      "auditor": "GPT 6.2 Astra (C3-01 CPU, high)",
       "verdict": "PASS_WITH_CAVEATS -> REMEDIATED",
       "status": "DONE",
-      "report": "audits/AUDIT_cycle2_claude_fable.md",
-      "target": "Numerical rigor (Fable R1-R3), long-K bound & held-out FineWeb-Edu Nesterov eval"
+      "report": "audits/AUDIT_cycle3_c3_01_gpt62_astra.md",
+      "target": "Wide-layer crossover (w512..w2048) & 120m FineWeb-Edu 3-seed transfer"
     },
     {
-      "auditor": "GPT 6.2 Astra (high)",
+      "auditor": "GPT 6.2 Astra (C3-02 CPU, high)",
       "verdict": "PASS_WITH_CAVEATS -> REMEDIATED",
       "status": "DONE",
-      "report": "audits/AUDIT_cycle2_gpt62_astra.md",
-      "target": "100-run Tier-2 FineWeb-Edu statistics, CIs, pairing & native layout ablation"
+      "report": "audits/AUDIT_cycle3_c3_02_gpt62_astra.md",
+      "target": "Hybrid 50m 5-seed ablation, SS3_35 BF16 & early-spectrum re-polish"
     },
     {
-      "auditor": "Gemini 4 Neon (high)",
+      "auditor": "Gemini 4 Neon (T4-01 CPU, high)",
       "verdict": "PASS_WITH_CAVEATS -> REMEDIATED",
       "status": "DONE",
-      "report": "audits/AUDIT_cycle2_gemini_neon.md",
-      "target": "Pre-sweep H1-H4 verification, SOTA honesty, cross-artifact audit & Cycle 3 roadmap"
+      "report": "audits/AUDIT_cycle3_t4_01_gemini_neon.md",
+      "target": "muP width-transfer coordinate check (128->1024) & LR transfer"
+    },
+    {
+      "auditor": "Gemini 4 Neon (T5-01 CPU + re-check, high)",
+      "verdict": "PASS_WITH_CAVEATS -> HOLD LIFTED",
+      "status": "DONE",
+      "report": "audits/AUDIT_cycle3_t5_01_gemini_neon.md",
+      "target": "Blackwell NVFP4/MXFP4/INT2 micro-rotated PTQ & post-remediation FP64 Hessian regeneration"
     }
   ],
   "leaderboard": [
     {
       "method": "ss3_54_blackwell_fp16",
       "case": "RTX 5080 · 2048×8192 CUDA-Graph (ms) vs Held-Out FineWeb-Edu 45-Pair Error",
-      "latency_ms": 3.0935,
+      "latency_ms": 3.0177,
       "polar_error": 0.0389,
       "status": "VERIFIED"
     },
     {
       "method": "ss3_53_blackwell_fp16",
       "case": "RTX 5080 · 2048×8192 CUDA-Graph (ms) vs Held-Out FineWeb-Edu 45-Pair Error",
-      "latency_ms": 2.9999,
+      "latency_ms": 2.9278,
       "polar_error": 0.0548,
       "status": "VERIFIED"
     },
     {
       "method": "ps3_55_blackwell_fp16",
       "case": "RTX 5080 · 2048×8192 CUDA-Graph (ms) vs Held-Out FineWeb-Edu 45-Pair Error",
-      "latency_ms": 3.1087,
+      "latency_ms": 3.0954,
       "polar_error": 0.0619,
       "status": "VERIFIED"
     },
     {
       "method": "ps2_55_blackwell_fp16",
       "case": "RTX 5080 · 2048×8192 CUDA-Graph (ms) vs Held-Out FineWeb-Edu 45-Pair Error",
-      "latency_ms": 3.1089,
+      "latency_ms": 3.0956,
       "polar_error": 0.0802,
       "status": "VERIFIED"
     },
     {
       "method": "ss3_35_blackwell_fp16",
       "case": "RTX 5080 · 2048×8192 CUDA-Graph (ms) vs Held-Out FineWeb-Edu 45-Pair Error",
-      "latency_ms": 2.9892,
+      "latency_ms": 2.9172,
       "polar_error": 0.0640,
       "status": "CAVEATED"
     },
     {
       "method": "ss3_34_blackwell_fp16",
       "case": "RTX 5080 · 2048×8192 CUDA-Graph (ms) vs Held-Out FineWeb-Edu 45-Pair Error",
-      "latency_ms": 2.8853,
+      "latency_ms": 2.8164,
       "polar_error": 0.2146,
       "status": "CAVEATED"
     },
     {
       "method": "pe_triton_bf16",
       "case": "RTX 5080 · 2048×8192 CUDA-Graph (ms) vs Held-Out FineWeb-Edu 45-Pair Error",
-      "latency_ms": 5.6984,
+      "latency_ms": 5.6709,
       "polar_error": 0.0924,
       "status": "BASELINE"
     },
     {
       "method": "pe_eager",
       "case": "RTX 5080 · 2048×8192 CUDA-Graph (ms) vs Held-Out FineWeb-Edu 45-Pair Error",
-      "latency_ms": 7.9379,
+      "latency_ms": 7.9057,
       "polar_error": 0.0960,
       "status": "BASELINE"
     }
   ],
   "next_queue": [
-    "C3-01: Scale FineWeb-Edu Muon transfer to 120m (width=768) & wider widths for SS3 vs PS3 crossover",
-    "C3-02: Hybrid post-warmup SS3_54 -> SS3_34 schedule + early-step real-Nesterov circuit re-polishing",
-    "C3-03/04: Small-n auxiliary fusion & M5 Max open-lid 4096^2 rerun + live pytest tests/test_mlx.py",
-    "T4-01 / T5-01: uP width-transfer coordinate checks & Blackwell NVFP4/2-bit micro-rotated PTQ"
+    "C3-04: Open-lid caffeinate -dimsu M5 Max 4096^2 single-session rerun + post-merge live pytest tests/test_mlx.py (when MacBook Pro reachable)",
+    "C4-01: Longer-budget >=20M-token 120m FineWeb-Edu pretraining & iso-loss quality-matched multi-seed Muon-vs-AdamW PTQ",
+    "C4-02: End-to-end Blackwell NVFP4 quantized inference benchmark including online activation quantization & block-16 rotation",
+    "C4-03: Wide-layer (w >= 1536) training crossover & predeclared common-checkpoint SS3_54/53 vs PS3_55 quality replication"
   ]
 }

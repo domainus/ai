@@ -385,8 +385,9 @@ def build_parser() -> argparse.ArgumentParser:
 def _is_canonical_args(args: argparse.Namespace) -> bool:
     """True for the full default run. Only this run may write a canonical output."""
     return (not args.quick and args.blocks is None and args.max_cases is None
-            and args.iters == DEFAULTS["iters"] and args.warmups >= DEFAULTS["warmups"]
-            and args.seed == DEFAULTS["seed"] and args.baseline_commit == BASELINE_COMMIT)
+            and args.iters == DEFAULTS["iters"] and args.warmups == DEFAULTS["warmups"]
+            and args.seed == DEFAULTS["seed"] and args.baseline_commit == BASELINE_COMMIT
+            and args.trajectories.resolve() == TRAJECTORIES.resolve())
 
 
 def _resolve_outputs(args: argparse.Namespace) -> dict[str, Path]:

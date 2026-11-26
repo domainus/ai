@@ -791,6 +791,8 @@ def schatten_switch_blackwell(G: Tensor, variant=None, *, dtype: torch.dtype = t
     if dtype not in _WORK_DTYPES:
         raise TypeError(f"Working dtype must be float16 or bfloat16, received {dtype}")
     _check(circuit, dtype, scaling, allow_unsafe_bf16)
+    if len(circuit.table[0][1]) > _FOLD_ROWS:
+        raise ValueError(f"Segment 1 supports at most {_FOLD_ROWS} rows, got {len(circuit.table[0][1])}")
     if G.ndim < 2 or not G.is_cuda or not G.is_floating_point():
         raise ValueError("Expected a floating-point CUDA tensor of shape (..., rows, columns)")
     if G.numel() == 0:

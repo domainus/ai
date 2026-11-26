@@ -977,16 +977,16 @@ def kernel_launches(circuit, n: int) -> dict:
     Analytic launch count applies only to zero-residual segment-1 circuits
     (``circuit.table[0][0] == 0.0``, where segment 1 has no identity residual so
     its square reuses the SYRK matrix product count) on contiguous FP32 inputs.
-    Matrix products: per segment SYRK + squares + ``Q @ X``. Four reductions and elementwise
-    kernels: the safe norm partials, the normalize-and-prescale pass, the dual norm of ``R`` and
-    ``R^2``, and the fold kernel, which also applies the first-row ``b R + c I`` (so ``semi`` and
-    ``general`` first rows add no launch). The path is sync-free, so there are no host reads, and
-    the count does not depend on ``n``. ``measure_launches`` checks these numbers with the profiler.
+    Matrix products: per segment SYRK + squares + ``Q @ X``. Three auxiliary kernels: the
+    safe norm partials, the normalize-and-prescale pass, and the fold kernel (which reduces the
+    tile norms fused into ``_syrk_norm_kernel`` / ``_square_norm_kernel`` and applies the
+    first-row ``b R + c I``). The path is sync-free, so there are no host reads, and the count
+    does not depend on ``n``. ``measure_launches`` checks these numbers with the profiler.
     """
     if circuit.table[0][0] != 0.0:
         raise ValueError("kernel_launches analytic count supports zero-residual segment-1 circuits only")
     products = 2 * len(circuit.table) + sum(circuit.squarings)
-    return {"matrix_products": products, "total": products + 4, "host_reads": 0}
+    return {"matrix_products": products, "total": products + 3, "host_reads": 0}
 
 
 def measure_launches(call, shape=(512, 2048)) -> dict:

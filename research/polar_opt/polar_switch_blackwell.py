@@ -165,6 +165,15 @@ def _launch(kernel, grid, *args) -> dict:
     ])
     plan = _PLANS.get(key)
     if plan is None:
+        if (
+            len(kernel.configs) > 1
+            and torch.cuda.is_current_stream_capturing()
+            and _autotune_key(kernel, args) not in kernel.cache
+        ):
+            raise RuntimeError(
+                "Warm up Triton kernels eagerly once per (circuit, shape, dtype, device) "
+                "before CUDA-graph capture"
+            )
         compiled = kernel[grid](*args)
         config = _config_of(kernel, args)
         if compiled is not None and hasattr(compiled, "__getitem__"):

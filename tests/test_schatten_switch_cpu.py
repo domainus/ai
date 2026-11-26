@@ -109,7 +109,7 @@ def test_kernel_launches_matches_registered_zero_residual_circuits(name):
     circuit = SCHATTEN_SWITCH_CIRCUITS[name]
     record = search.kernel_launches(circuit, 512)
     assert record["matrix_products"] == theoretical_flops(name, (512, 2048))["matrix_kernel_launches"]
-    assert record["total"] == record["matrix_products"] + 4
+    assert record["total"] == record["matrix_products"] + 3
     assert record["host_reads"] == 0
 
 
