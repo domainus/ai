@@ -183,7 +183,7 @@ def test_fable_r1_bound_is_rigorous_on_cpu_and_cuda(device, n, dtype):
         assert info["cast_residual"][0] <= info["cast_residual_bound"][0]
     # Low stable rank: the Schatten-8 bound is tight (the Frobenius bound would be 1.0).
     _, info = schatten_switch_reference(two_level_rank_one(n, device), DEFAULT_VARIANT, dtype=dtype, return_info=True)
-    assert info["upper"][0] / info["sigma_max_operand"][0] < 1.003 if dtype == FP16 else 1.01
+    assert info["upper"][0] / info["sigma_max_operand"][0] < (1.003 if dtype == FP16 else 1.01)
 
 
 def test_fable_r1_cpu_and_cuda_bounds_agree():
@@ -444,9 +444,9 @@ def test_quick_gpu_latency_against_ps3_55(shape, record_property):
         record_property(f"{name}_ms", value)
     print(f"\n{shape}: ps3_55 {base:.3f} ms; " + "; ".join(
         f"{name} {times[name]:.3f} ms ({speedups[name]:.2f}x)" for name in times))
-    # Below about n = 2048 the call is bound by kernel launches and by the one host read of the
-    # scale, so the circuits are slower than PS3_55 there. That is a measured property, not a
-    # test failure; the bound only catches a gross regression.
+    # Below about n = 2048 the call is bound by host kernel-launch overhead of the extra
+    # norm/fold kernels, so the circuits are slower than PS3_55 there. That is a measured property,
+    # not a test failure; the bound only catches a gross regression.
     for name, value in speedups.items():
         assert value > 0.3, f"{name} is far slower than PS3_55 on {shape}"
     if min(shape) >= 2048:  # squarings dominate: fewer squarings must show
@@ -492,3 +492,38 @@ def test_cuda_graph_capture_and_replay_exact_match(name):
         assert (static_out - eager_fresh).abs().max().item() < 1e-5
         if len(shape) == 3:
             assert not static_out[1].any() and not static_out[3].any()
+
+
+def test_fable_m1_long_k_bound_rigor_and_stability():
+    """Fable M1: compensate Triton Gram downward bias for very long inner dimension K > 2^16."""
+    G = torch.ones(1, 1 << 25, device="cuda")
+    Q = schatten_switch_blackwell(G, "SS3_35")
+    assert torch.isfinite(Q).all()
+    assert Q.double().norm().item() <= 1.25
+
+
+def test_fable_l1_sigma_hat_overflow_returns_exact_zeros():
+    """Fable L1: overflowing sigma_hat paths return exact finite zeros with no 0*Inf NaNs."""
+    G = rand((64, 128), seed=41)
+    q_fp16 = schatten_switch_blackwell(G, "SS3_54", sigma_hat=1e-10)
+    q_bf16 = schatten_switch_blackwell(G, "SS3_35", dtype=BF16, sigma_hat=1e-3)
+    assert torch.isfinite(q_fp16).all() and not q_fp16.any()
+    assert torch.isfinite(q_bf16).all() and not q_bf16.any()
+
+
+def test_custom_pure_square_and_nonzero_residual_circuits():
+    """Opus L7: exercise pure-square (b0=0, c0=0) and non-zero residual branches."""
+    G = rand((3, 97, 331), seed=42)
+    pure = ssb.SchattenSwitchCircuit(
+        name="TEST_PURE", table=((0.0, ((1, 0, 0, 1.0, 0.0, 0.0), (0, 1, 0, 0.0, 0.5, 0.5))),),
+        buffers=2, u_safe=1.05, lo=0.5, error=0.5,
+    )
+    res_circuit = ssb.SchattenSwitchCircuit(
+        name="TEST_RES", table=((0.05, ((1, 0, 0, 1.0, -1.0, 0.0), (0, 1, 0, 0.0, 0.5, 0.45))),),
+        buffers=2, u_safe=1.05, lo=0.5, error=0.5,
+    )
+    for circuit in (pure, res_circuit):
+        out = schatten_switch_blackwell(G, circuit, dtype=FP16)
+        ref = schatten_switch_reference(G, circuit, dtype=FP16)
+        assert torch.isfinite(out).all()
+        assert rel(out, ref) < 5e-3

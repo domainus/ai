@@ -1,5 +1,6 @@
 """Fast checks for the Cycle 2 real-text Tier-2 harness, data shards and CUDA-graph benchmark."""
 
+import hashlib
 import json
 import math
 
@@ -63,13 +64,19 @@ def test_verify_manifest_detects_corruption_and_leakage(tmp_path):
                      source={"name": "synthetic"}, encoder=ByteEncoder())
     rtd.verify_manifest(tmp_path)
     hashes_path = tmp_path / "doc_hashes.json"
-    original = hashes_path.read_text()
-    hashes = json.loads(original)
-    hashes["val"].append(hashes["train"][0])
+    manifest_path = tmp_path / "manifest.json"
+    orig_hashes = hashes_path.read_text()
+    orig_manifest = manifest_path.read_text()
+    hashes = json.loads(orig_hashes)
+    manifest = json.loads(orig_manifest)
+    hashes["val"][0] = hashes["train"][0]
+    manifest["splits"]["val"]["doc_hash_digest"] = hashlib.sha256("\n".join(sorted(hashes["val"])).encode()).hexdigest()
     hashes_path.write_text(json.dumps(hashes))
-    with pytest.raises(ValueError):
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="share"):
         rtd.verify_manifest(tmp_path)
-    hashes_path.write_text(original)
+    hashes_path.write_text(orig_hashes)
+    manifest_path.write_text(orig_manifest)
     with (tmp_path / "val.bin").open("r+b") as handle:
         handle.seek(10)
         byte = handle.read(1)
@@ -346,9 +353,11 @@ def test_nested_output_resume_and_config_hash_guard(data, shard_dir, tmp_path):
     h.main([*base_args, "--resume"])
     resumed = json.loads(out.read_text())
     assert len(resumed["runs"]) == 2
-    # Resume with changed tokens fails fast rather than silently mixing runs
+    # Resume with changed tokens or different active budget fails fast rather than silently mixing runs
     with pytest.raises(ValueError, match="Cannot --resume"):
         h.main([*base_args, "--tokens", str(2 * TINY.step_tokens), "--resume"])
+    with pytest.raises(ValueError, match="Cannot --resume"):
+        h.main([*base_args, "--budget", "wall", "--seconds", "0.5", "--resume"])
 
 
 def test_summarize_deterministic_reference_and_zero_steps_guard():
@@ -418,3 +427,32 @@ def test_cuda_graph_bench_mutation_and_nan_guards():
     row = res["shapes"][0]["methods"]["nan_cand"]
     assert row["finite"] is False and row["graph_vs_eager_max_abs"] is None
     assert json.dumps(res, allow_nan=False)
+
+
+def test_wall_budget_zero_steps_marked_diverged(data):
+    init = h.initial_state(TINY, seed=0)
+    row = h.run_trial(TINY, data, device=torch.device("cpu"), seed=0, optimizer_name="adamw",
+                      factory=None, lr=1e-3, seconds=1e-9, eval_tokens=512,
+                      compile_warmup_steps=0, init=init)
+    assert row["steps"] == 0 and row["diverged"] is True and row["tokens_per_second"] is None
+
+
+@needs_cuda
+def test_compile_model_reusable_and_pe_compiled(data):
+    device = torch.device("cuda")
+    init = h.initial_state(TINY, seed=0)
+    with torch.device(device):
+        shared = h.Transformer(TINY)
+    reusable = (shared, torch.compile(shared))
+    factories = h.builtin_factories()
+    r1 = h.run_trial(TINY, data, device=device, seed=0, optimizer_name="muon_pe_compiled",
+                     factory=factories["muon_pe_compiled"], lr=0.02, tokens=2 * TINY.step_tokens,
+                     eval_tokens=512, compile_warmup_steps=1, init=init, compile_model=True,
+                     reusable_model=reusable)
+    r2 = h.run_trial(TINY, data, device=device, seed=0, optimizer_name="muon_ps3_blackwell",
+                     factory=factories["muon_ps3_blackwell"], lr=0.02, tokens=2 * TINY.step_tokens,
+                     eval_tokens=512, compile_warmup_steps=1, init=init, compile_model=True,
+                     reusable_model=reusable)
+    assert not r1["diverged"] and not r2["diverged"]
+    assert math.isfinite(r1["test_loss"]) and math.isfinite(r2["test_loss"])
+    assert r1["init_fingerprint"] == r2["init_fingerprint"]

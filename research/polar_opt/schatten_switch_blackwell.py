@@ -33,9 +33,12 @@ Scale handling (the Cycle 1 P0 findings & zero-sync CUDA-graph execution)
 * Normalization & zero-sync CUDA-graph path (Fable R3). All norm reductions, FP64 overflow/
   underflow-safe scaling, Schatten-8 ``kappa`` folding, and elementwise row-0 updates run in
   device-side Triton kernels with per-matrix coefficients stored in GPU memory. Zero device-to-host
-  synchronizations occur, making ``schatten_switch_blackwell`` 100% CUDA-graph capturable while
+  synchronizations occur in natural calls (``sigma_hat=None``), making ``schatten_switch_blackwell``
+  CUDA-graph capturable after one eager warm-up call per ``(circuit, shape, dtype, device)`` while
   giving each batch member its own exact scale and returning exact zeros for dead, tiny
-  (``||G||_F <= 1e-12``), or non-finite inputs.
+  (``||G||_F <= 1e-12``), or non-finite inputs (note: inputs are cast to FP32 before norm
+  reduction, so ``float64`` entries exceeding ``FLT_MAX`` are treated as non-finite). "FP32
+  accumulation, one rounding" applies to the Triton kernels; ``_apply`` uses cuBLAS.
 
 Inputs have shape ``(..., rows, columns)``; tall, wide, square, odd, and ``min(rows, columns)
 == 1`` are supported.
@@ -370,15 +373,23 @@ def _seg1_table_tensors(circuit: SchattenSwitchCircuit, device: torch.device) ->
     cached = _TABLE_CACHE.get(key)
     if cached is not None:
         return cached
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "Warm up schatten_switch_blackwell eagerly once per (circuit, shape, dtype, device) "
+            "before CUDA-graph capture"
+        )
     coeffs = torch.tensor([[row[3], row[4], row[5]] for row in seg1_rows], dtype=torch.float64, device=device)
     regs = torch.tensor([[row[0], row[1], row[2]] for row in seg1_rows], dtype=torch.int32, device=device)
     _TABLE_CACHE[key] = (coeffs, regs)
     return coeffs, regs
 
 
-@triton.autotune(configs=[triton.Config({"BLOCK": 4096}, num_warps=4)], key=[])
+@triton.autotune(configs=[triton.Config({"BLOCK": 4096, "REDUCE_BLOCKS": _REDUCE_BLOCKS}, num_warps=4)], key=[])
 @triton.jit
-def _safe_norm_part_kernel(x_ptr, m_ptr, s_ptr, nf_ptr, size, num_blocks, BLOCK: tl.constexpr):
+def _safe_norm_part_kernel(
+    x_ptr, m_ptr, s_ptr, nf_ptr, size, num_blocks,
+    BLOCK: tl.constexpr, REDUCE_BLOCKS: tl.constexpr,
+):
     """LAPACK/Blue-style overflow/underflow-safe partial Frobenius norm reduction per matrix."""
     pid = tl.program_id(0)
     matrix = tl.program_id(1).to(tl.int64)
@@ -414,28 +425,28 @@ def _safe_norm_part_kernel(x_ptr, m_ptr, s_ptr, nf_ptr, size, num_blocks, BLOCK:
         s_cur = s_cur * (r_old * r_old) + sc * (r_new * r_new)
         m_cur = m_new
 
-    out_idx = matrix * 64 + pid.to(tl.int64)
+    out_idx = matrix * REDUCE_BLOCKS + pid.to(tl.int64)
     tl.store(m_ptr + out_idx, m_cur)
     tl.store(s_ptr + out_idx, s_cur)
     tl.store(nf_ptr + out_idx, nf_cur)
 
 
-@triton.autotune(configs=[triton.Config({"BLOCK": 4096}, num_warps=4)], key=[])
+@triton.autotune(configs=[triton.Config({"BLOCK": 4096, "REDUCE_BLOCKS": _REDUCE_BLOCKS}, num_warps=4)], key=[])
 @triton.jit
 def _normalize_safe_kernel(
     x_ptr, m_ptr, s_ptr, nf_ptr, factors_ptr, o_ptr,
-    size, num_blocks, has_factors, prescale, fro_floor,
-    BLOCK: tl.constexpr,
+    size, num_blocks, has_factors, prescale, fro_floor, dtype_max,
+    BLOCK: tl.constexpr, REDUCE_BLOCKS: tl.constexpr,
 ):
     """Reduce partial scaled norms in FP64 and normalize to target operand norm (zeros if invalid)."""
     matrix = tl.program_id(1).to(tl.int64)
     local = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    idx = tl.arange(0, 64)
+    idx = tl.arange(0, REDUCE_BLOCKS)
     bmask = idx < num_blocks
 
-    m_vec = tl.load(m_ptr + matrix * 64 + idx, mask=bmask, other=0.0)
-    s_vec = tl.load(s_ptr + matrix * 64 + idx, mask=bmask, other=0.0)
-    nf_vec = tl.load(nf_ptr + matrix * 64 + idx, mask=bmask, other=0)
+    m_vec = tl.load(m_ptr + matrix * REDUCE_BLOCKS + idx, mask=bmask, other=0.0)
+    s_vec = tl.load(s_ptr + matrix * REDUCE_BLOCKS + idx, mask=bmask, other=0.0)
+    nf_vec = tl.load(nf_ptr + matrix * REDUCE_BLOCKS + idx, mask=bmask, other=0)
 
     any_nf = tl.sum(nf_vec, axis=0) > 0
     M = tl.max(m_vec, axis=0)
@@ -444,11 +455,16 @@ def _normalize_safe_kernel(
     ssq = tl.sum(s_vec * (ratios * ratios), axis=0)
     sqrt_ssq = tl.sqrt(ssq)
     fro = M * sqrt_ssq
-    valid = (~any_nf) & (M > 0.0) & (fro == fro) & (fro < 1e308) & (fro > fro_floor)
 
-    prescale64 = tl.full((), 0.0, dtype=tl.float64) + prescale
+    zero64 = tl.full((), 0.0, dtype=tl.float64)
+    prescale64 = zero64 + prescale
+    dtype_max64 = zero64 + dtype_max
     factor = tl.where(has_factors != 0, tl.load(factors_ptr + matrix).to(tl.float64), 1.0)
     eff_prescale = prescale64 / factor
+    valid = (
+        (~any_nf) & (M > 0.0) & (fro == fro) & (fro < 1e308) & (fro > fro_floor)
+        & (eff_prescale <= dtype_max64 * sqrt_ssq)
+    )
     unit_scale = tl.where(valid, eff_prescale / tl.where(sqrt_ssq > 0.0, sqrt_ssq, 1.0), 0.0).to(tl.float32)
     M_f32 = M_safe.to(tl.float32)
 
@@ -458,9 +474,12 @@ def _normalize_safe_kernel(
     tl.store(o_ptr + matrix * size + local, y.to(o_ptr.dtype.element_ty), mask=mask)
 
 
-@triton.autotune(configs=[triton.Config({"BLOCK": 4096}, num_warps=4)], key=[])
+@triton.autotune(configs=[triton.Config({"BLOCK": 4096, "REDUCE_BLOCKS": _REDUCE_BLOCKS}, num_warps=4)], key=[])
 @triton.jit
-def _dual_norm_part_kernel(r_ptr, s_ptr, part_r_ptr, part_s_ptr, nn, num_blocks, BLOCK: tl.constexpr):
+def _dual_norm_part_kernel(
+    r_ptr, s_ptr, part_r_ptr, part_s_ptr, nn, num_blocks,
+    BLOCK: tl.constexpr, REDUCE_BLOCKS: tl.constexpr,
+):
     """Single-pass partial Frobenius-squared reduction of symmetric R_h and S in FP64."""
     pid = tl.program_id(0)
     matrix = tl.program_id(1).to(tl.int64)
@@ -481,27 +500,27 @@ def _dual_norm_part_kernel(r_ptr, s_ptr, part_r_ptr, part_s_ptr, nn, num_blocks,
         acc_r += tl.sum(r * r, axis=0).to(tl.float64)
         acc_s += tl.sum(s * s, axis=0).to(tl.float64)
 
-    out_idx = matrix * 64 + pid.to(tl.int64)
+    out_idx = matrix * REDUCE_BLOCKS + pid.to(tl.int64)
     tl.store(part_r_ptr + out_idx, acc_r)
     tl.store(part_s_ptr + out_idx, acc_s)
 
 
-@triton.autotune(configs=[triton.Config({"BLOCK": 4096}, num_warps=4)], key=[])
+@triton.autotune(configs=[triton.Config({"BLOCK": 4096, "REDUCE_BLOCKS": _REDUCE_BLOCKS}, num_warps=4)], key=[])
 @triton.jit
 def _fold_and_row0_axpy_kernel(
     r_ptr, s_ptr, part_r_ptr, part_s_ptr, tbl_ptr, regs_ptr, out_coeffs_ptr,
     n, nn, batch, num_blocks, num_rows, use_frobenius, has_b0, has_c0,
     u, e, prescale, alpha, u_safe, slack, residual,
-    BLOCK: tl.constexpr,
+    BLOCK: tl.constexpr, REDUCE_BLOCKS: tl.constexpr,
 ):
     """Compute per-matrix Schatten-8 kappa, fold Segment-1 table, and fuse row-0 update into S."""
     pid = tl.program_id(0)
     matrix = tl.program_id(1).to(tl.int64)
-    idx = tl.arange(0, 64)
+    idx = tl.arange(0, REDUCE_BLOCKS)
     bmask = idx < num_blocks
 
-    sum_r = tl.sum(tl.load(part_r_ptr + matrix * 64 + idx, mask=bmask, other=0.0), axis=0)
-    sum_s = tl.sum(tl.load(part_s_ptr + matrix * 64 + idx, mask=bmask, other=0.0), axis=0)
+    sum_r = tl.sum(tl.load(part_r_ptr + matrix * REDUCE_BLOCKS + idx, mask=bmask, other=0.0), axis=0)
+    sum_s = tl.sum(tl.load(part_s_ptr + matrix * REDUCE_BLOCKS + idx, mask=bmask, other=0.0), axis=0)
     norm_r = tl.sqrt(sum_r)
     norm_s = tl.sqrt(sum_s)
     ok = (norm_r == norm_r) & (norm_r < 1e308) & (norm_s == norm_s) & (norm_s < 1e308)
@@ -622,9 +641,11 @@ def schatten_switch_blackwell(G: Tensor, variant=None, *, dtype: torch.dtype = t
     ``variant`` is a name in ``SCHATTEN_SWITCH_CIRCUITS`` or a ``SchattenSwitchCircuit``.
     ``scaling="frobenius"`` uses the Frobenius norm as the bound (for comparison only).
     ``sigma_hat`` is a test hook: an explicit scale in units of ``||G||_F`` per matrix, so that
-    ``x = sigma / (sigma_hat ||G||_F)``. It bypasses the bound and is unsafe if it is smaller
-    than ``sigma_max(G) / ||G||_F``.
-    The result has the dtype and shape of ``G``.
+    ``x = sigma / (sigma_hat ||G||_F)``. It bypasses the bound, runs host setup (not capturable),
+    and is unsafe if smaller than ``sigma_max(G) / ||G||_F``. CUDA-graph capture is supported after
+    one eager warm-up call per ``(variant, shape, dtype, device)``. ``float64`` inputs exceeding
+    the FP32 finite range map to non-finite and return zeros. The result has the dtype and shape
+    of ``G``.
     """
     circuit = _lookup(DEFAULT_VARIANT if variant is None else variant)
     if dtype not in _WORK_DTYPES:
@@ -644,6 +665,8 @@ def schatten_switch_blackwell(G: Tensor, variant=None, *, dtype: torch.dtype = t
     nn = n * n
     prescale, alpha = _prescale(n)
     u, e = _ROUNDING[dtype]
+    dtype_max = float(torch.finfo(dtype).max)
+    k_slack = 1.0 if k <= 65536 else 1.0 / max(1.0 - 1.2e-8 * k, 0.2)
 
     m_part = torch.empty((batch, _REDUCE_BLOCKS), dtype=torch.float64, device=device)
     s_part = torch.empty_like(m_part)
@@ -662,7 +685,7 @@ def schatten_switch_blackwell(G: Tensor, variant=None, *, dtype: torch.dtype = t
     X = torch.empty(X32.shape, dtype=dtype, device=device)
     _launch(_normalize_safe_kernel, lambda c: (triton.cdiv(size, c["BLOCK"]), batch, 1),
             X32, m_part, s_part, nf_part, factors, X,
-            size, size_blocks, has_factors, float(prescale), float(FRO_FLOOR))
+            size, size_blocks, has_factors, float(prescale), float(FRO_FLOOR), dtype_max)
 
     work = X.new_empty(circuit.buffers, batch, n, n)
     grid = _triangle_grid(n, batch)
@@ -687,10 +710,13 @@ def schatten_switch_blackwell(G: Tensor, variant=None, *, dtype: torch.dtype = t
             work[0], work[1], m_part, s_part, tbl_coeffs, tbl_regs, out_coeffs,
             n, nn, batch, nn_blocks, len(seg1_rows), use_frobenius, has_b0, has_c0,
             float(u), float(e), float(prescale), float(alpha),
-            float(circuit.u_safe), float(_SLACK), float(seg1_residual))
+            float(circuit.u_safe), float(_SLACK * k_slack), float(seg1_residual))
 
     for j, (dst, src, add, *_rest) in enumerate(seg1_rows[1:], 1):
         _launch(_symprod_ptr_kernel, grid, work[src], work[src], work[add], work[dst], out_coeffs[j], n)
+
+    if sigma_hat is not None:
+        X = torch.where((out_coeffs[0, :, 3] != 0.0)[:, None, None], X, 0.0)
 
     last = len(table) - 1
     seg1_out_dtype = out_dtype if last == 0 else dtype
@@ -700,6 +726,8 @@ def schatten_switch_blackwell(G: Tensor, variant=None, *, dtype: torch.dtype = t
         prod = _apply(work[dst], X, 0.0, torch.float32)
         res_scale = out_coeffs[0, :, 0].view(-1, 1, 1)
         X = (prod + res_scale * X.float()).to(seg1_out_dtype)
+    if sigma_hat is not None:
+        X = torch.where(torch.isfinite(X).all(dim=(-2, -1), keepdim=True), X, 0.0)
 
     for phase, (residual, iterations) in enumerate(table[1:], 1):
         view = X.mT if rows > columns else X
@@ -707,6 +735,8 @@ def schatten_switch_blackwell(G: Tensor, variant=None, *, dtype: torch.dtype = t
         for dst, src, add, a, b, c in iterations:
             _launch(_symprod_kernel, grid, work[src], work[src], work[add], work[dst], n, a, b, c)
         X = _apply(work[dst], X, residual, out_dtype if phase == last else dtype)
+        if sigma_hat is not None:
+            X = torch.where(torch.isfinite(X).all(dim=(-2, -1), keepdim=True), X, 0.0)
 
     return X.reshape(G.shape)
 

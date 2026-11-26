@@ -753,7 +753,8 @@ def harvest_nesterov(config: ModelConfig, data: ShardData, *, device: torch.devi
     losses = []
     for step in range(1, steps + 1):
         optimizer.capture = capture_into(step) if step in capture_steps else None
-        optimizer.set_lr_multiplier(lr_multiplier(step - 1, (step - 1) / steps, lr_warmup_steps, min_lr_ratio))
+        optimizer.set_lr_multiplier(lr_multiplier(step - 1, (step - 1) / steps, lr_warmup_steps, min_lr_ratio,
+                                                  total_steps=steps))
         losses.append(train_step(model, stream.next_batch(), optimizer).item())
         model.zero_grad(set_to_none=True)
     pairs = []
@@ -923,11 +924,10 @@ def main(argv: list[str] | None = None) -> None:
     if args.resume and log_path.exists():
         rows = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
         for r in rows:
-            exp_hash = budget_hashes.get(r.get("budget"))
-            if exp_hash is not None and r.get("run_config_hash") != exp_hash:
+            if r.get("budget") not in budget_hashes or r.get("run_config_hash") != budget_hashes[r["budget"]]:
                 raise ValueError(
-                    f"Cannot --resume from {log_path}: existing row config hash "
-                    f"{r.get('run_config_hash')!r} != current {exp_hash!r}"
+                    f"Cannot --resume from {log_path}: existing row ({r.get('budget')!r}, "
+                    f"{r.get('run_config_hash')!r}) != current {budget_hashes!r}"
                 )
     elif log_path.exists():
         log_path.unlink()
