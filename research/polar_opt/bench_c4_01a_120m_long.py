@@ -74,6 +74,13 @@ T975_DF2 = 0.95 / math.sqrt(2 * 0.975 * 0.025)  # df = 2 quantile: (2p - 1) / sq
 
 MUON = ("muon_pe_compiled", "muon_ps3_blackwell", "muon_ss3_54", "muon_ss3_53")
 SS3_FACTORIES = {"muon_ss3_54": "ss3_54_blackwell_fp16", "muon_ss3_53": "ss3_53_blackwell_fp16"}
+CUDA_ORTHOGONALIZERS = {
+    "adamw": "torch.optim.AdamW fused, betas (0.9, 0.95)",
+    "muon_pe_compiled": "torch.compile(baselines.polar_express), 5 steps",
+    "muon_ps3_blackwell": "tier2_candidates.ps3_blackwell_fp16 (Polar Switch PS3_55, FP16 Triton)",
+    "muon_ss3_54": "tier2_candidates.ss3_54_blackwell_fp16 (Schatten Switch SS3_54, FP16 Triton)",
+    "muon_ss3_53": "tier2_candidates.ss3_53_blackwell_fp16 (Schatten Switch SS3_53, FP16 Triton)",
+}
 # Predeclared contrasts: (reference, candidates, budgets). The candidate is the numerator.
 MUON_PLAN = (("muon_pe_compiled", ("muon_ss3_54", "muon_ss3_53", "muon_ps3_blackwell"), ("tokens", "wall")),
              ("muon_ps3_blackwell", ("muon_ss3_54", "muon_ss3_53"), ("tokens", "wall")))
@@ -206,11 +213,7 @@ def factories(device: torch.device) -> tuple[dict, dict]:
     for name, attribute in SS3_FACTORIES.items():
         found[name] = lambda attribute=attribute: getattr(candidates, attribute)
     found = {name: found[name] for name in ("adamw", *MUON)}
-    described = {"adamw": "torch.optim.AdamW fused, betas (0.9, 0.95)",
-                 "muon_pe_compiled": "torch.compile(baselines.polar_express), 5 steps",
-                 "muon_ps3_blackwell": "tier2_candidates.ps3_blackwell_fp16 (Polar Switch PS3_55, FP16 Triton)",
-                 "muon_ss3_54": "tier2_candidates.ss3_54_blackwell_fp16 (Schatten Switch SS3_54, FP16 Triton)",
-                 "muon_ss3_53": "tier2_candidates.ss3_53_blackwell_fp16 (Schatten Switch SS3_53, FP16 Triton)"}
+    described = dict(CUDA_ORTHOGONALIZERS)
     if device.type != "cuda":
         for name in MUON:
             found[name] = lambda: polar_express
@@ -280,24 +283,35 @@ def run_config_hash(args, config: h.ModelConfig, data: h.ShardData, protocol: di
 
 
 def load_rows(log: Path, cfg_hash: str, resume: bool) -> list[dict]:
-    """Rows of an interrupted run. A cut-off last line is dropped; any other mismatch raises."""
+    """Rows of an interrupted run. A cut-off tail is dropped and repaired; any other mismatch raises."""
     if not resume:
         log.unlink(missing_ok=True)
         return []
     if not log.exists():
         return []
-    lines = log.read_text().splitlines()
+    raw = log.read_text()
+    lines = raw.splitlines()
     rows = []
+    truncated = bool(raw) and not raw.endswith("\n")
     for i, line in enumerate(lines):
         try:
             rows.append(json.loads(line))
         except json.JSONDecodeError:
             if i == len(lines) - 1:
+                truncated = True
                 break  # interrupted mid-write
             raise
     for row in rows:
         if row.get("run_config_hash") != cfg_hash:
             raise ValueError(f"Cannot --resume from {log}: row hash {row.get('run_config_hash')!r} != {cfg_hash!r}")
+    if truncated:
+        tmp = log.with_name(log.name + ".tmp")
+        with tmp.open("w") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, allow_nan=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp.replace(log)
     return rows
 
 
@@ -623,10 +637,40 @@ def _validate_provenance(meta: dict, data: dict, canonical: bool, where: str) ->
                  f"{where}: shards must be verified against the pins")
 
 
+def _expected_run_config_hash(payload: dict) -> str:
+    """Recompute ``run_config_hash`` from the payload's own recorded configuration, code and env."""
+    protocol, meta = payload["protocol"], payload["meta"]
+    harness_payload = {
+        "config": payload["config"],
+        "data_sha256": {k: v["sha256"] for k, v in sorted(payload["data"]["splits"].items())},
+        "budget": payload["stage"],
+        "target_tokens": protocol["tokens"],
+        "target_seconds": protocol["seconds"],
+        "auxiliary_lr": protocol["muon_aux_lr"],
+        "weight_decay": protocol["weight_decay"],
+        "lr_warmup_steps": protocol["lr_warmup_steps"],
+        "wall_warmup_fraction": (protocol["wall_warmup_fraction"]
+                                 if protocol["wall_warmup_fraction"] is not None else 0.0),
+        "min_lr_ratio": protocol["min_lr_ratio"],
+        "compile_model": protocol["compile_model"],
+        "eval_tokens": protocol["eval_tokens"],
+    }
+    harness_hash = hashlib.sha256(json.dumps(harness_payload, sort_keys=True).encode()).hexdigest()[:16]
+    env = meta["environment"]
+    outer = {"schema": payload["schema_version"], "harness": harness_hash, "protocol": protocol,
+             "quick": payload["quick"], "code_sha256": meta["code_sha256"], "git_sha": meta["git_sha"],
+             "env": {k: env.get(k) for k in ("torch", "triton", "cuda", "device", "capability")}}
+    return hashlib.sha256(json.dumps(outer, sort_keys=True).encode()).hexdigest()[:16]
+
+
 def _validate_runs(payload: dict, canonical: bool) -> None:
     stage, protocol, meta, rows = payload["stage"], payload["protocol"], payload["meta"], payload["runs"]
     _require(stage in ("tokens", "wall"), f"unknown stage {stage!r}")
     _validate_provenance(meta, payload["data"], canonical, stage)
+    _require(_is_hex(meta.get("code_sha256"), 64), f"{stage}: code_sha256 must be 64-hex")
+    _require(_is_hex(payload.get("run_config_hash"), 16), f"{stage}: run_config_hash must be 16-hex")
+    _require(payload["run_config_hash"] == _expected_run_config_hash(payload),
+             f"{stage}: run_config_hash differs from the recomputed digest")
     config = h.ModelConfig(**payload["config"])
     _require(payload["config"] == asdict(h.PRESETS[payload["preset"]]), "config differs from the preset")
     _require(payload["step_tokens"] == config.step_tokens, "step_tokens differs from the config")
@@ -651,6 +695,8 @@ def _validate_runs(payload: dict, canonical: bool) -> None:
             _require(protocol[key] == locked[key], f"protocol {key} differs from the canonical {stage} protocol")
         if "adamw" in locked["optimizers"]:
             _require(protocol["adamw_lrs"] == locked["adamw_lrs"], "protocol adamw_lrs differs")
+        _require(protocol["orthogonalizers"] == {name: CUDA_ORTHOGONALIZERS[name] for name in protocol["optimizers"]},
+                 "protocol orthogonalizers differ from CUDA_ORTHOGONALIZERS")
     for split in ("val", "test"):
         _require(protocol["eval_tokens_used"][split] == eval_tokens_used(
             payload["data"]["splits"][split]["tokens"], config, protocol["eval_tokens"]), "eval_tokens_used differs")
@@ -666,10 +712,18 @@ def _validate_runs(payload: dict, canonical: bool) -> None:
     expected = sorted((n, lr, s) for n in protocol["optimizers"] for lr in lrs[n] for s in protocol["seeds"])
     _require(sorted((r["optimizer"], r["lr"], r["seed"]) for r in rows) == expected,
              "runs differ from the (optimizer, LR, seed) plan")
+    expected_order = {}
+    for seed in protocol["seeds"]:
+        plan = [(name, lr) for name in protocol["optimizers"] for lr in lrs[name]]
+        random.Random(f"{seed}-{stage}").shuffle(plan)
+        for order, (name, lr) in enumerate(plan):
+            expected_order[(name, lr, seed)] = order
     fingerprints: dict = {}
     for i, r in enumerate(rows):
         where = f"runs[{i}] {r['optimizer']} seed {r['seed']}"
         _require(r["run_config_hash"] == payload["run_config_hash"], f"{where}: run_config_hash differs")
+        _require(r["order_in_block"] == expected_order[(r["optimizer"], r["lr"], r["seed"])],
+                 f"{where}: order_in_block differs")
         _require(r["budget"] == stage, f"{where}: budget differs")
         _require(r["diverged"] is False, f"{where}: diverged (0 divergences required)")
         _require(r["update_dtype"] == (None if r["optimizer"] == "adamw" else protocol["update_dtype"]),
@@ -708,6 +762,7 @@ def _validate_runs(payload: dict, canonical: bool) -> None:
         key = r["seed"]
         fp = fingerprints.setdefault(key, (r["init_fingerprint"], r["stream_fingerprint"]))
         _require(fp == (r["init_fingerprint"], r["stream_fingerprint"]), f"{where}: runs of one seed are not paired")
+    _require(len({v[0] for v in fingerprints.values()}) == len(fingerprints), "seeds share an init fingerprint")
     _require(len({v[1] for v in fingerprints.values()}) == len(fingerprints), "seeds share a batch stream")
     _assert_close(payload["derived"], derive_runs(payload), "derived")
     if canonical:
@@ -731,7 +786,7 @@ def validate_results(payload: dict, *, canonical: bool | None = None, sources: d
     _require(payload.get("kind") == "summary", "unknown payload kind")
     if canonical:
         _require(payload["quick"] is False and payload["canonical"] is True, "a canonical summary cannot be --quick")
-        _require(payload["meta"]["git_dirty"] is False, "the canonical summary must come from a clean git tree")
+        _validate_provenance(payload["meta"], payload["data"], canonical, "summary")
     if sources is None and canonical:
         sources = {}
         for stage, src in payload["sources"].items():
@@ -744,14 +799,27 @@ def validate_results(payload: dict, *, canonical: bool | None = None, sources: d
         for stage, src in sources.items():
             validate_results(src, canonical=canonical)
             recorded = payload["sources"][stage]
+            _require(_is_hex(recorded.get("sha256"), 64), f"sources.{stage}.sha256 must be 64-hex")
+            if canonical:
+                path = Path(recorded["path"]) if Path(recorded["path"]).is_absolute() else ROOT / recorded["path"]
+                _require(path.exists(), f"canonical source {path} is missing")
+                _require(sha256_file(path) == recorded["sha256"], f"{path}: SHA-256 differs from the summary")
             for key in ("git_sha", "git_dirty", "code_sha256", "run_config_hash", "quick", "canonical", "protocol"):
                 _assert_close(recorded[key], {**src["meta"], **src}[key], f"sources.{stage}.{key}")
+            _require(recorded.get("device") == src["meta"]["environment"].get("device"),
+                     f"sources.{stage}.device differs")
+            _require(recorded.get("capability") == src["meta"]["environment"].get("capability"),
+                     f"sources.{stage}.capability differs")
         _assert_close(payload["per_seed"], {s: per_seed_table(sources[s]) for s in ("tokens", "wall")}, "per_seed")
         _assert_close(payload["checks"], {s: stage_checks(sources[s]) for s in ("tokens", "wall")}, "checks")
+        for key in ("preset", "config", "step_tokens", "parameters", "data"):
+            _assert_close(payload[key], sources["tokens"][key], key)
         if canonical:
             _require(sources["tokens"]["meta"]["git_sha"] == sources["wall"]["meta"]["git_sha"]
                      and sources["tokens"]["meta"]["code_sha256"] == sources["wall"]["meta"]["code_sha256"],
                      "canonical stages must come from one commit")
+            _require(payload["meta"]["git_sha"] == sources["tokens"]["meta"]["git_sha"],
+                     "canonical summary git_sha differs from its stage sources")
     for stage, src in payload["sources"].items():
         _validate_provenance(src, payload["data"], canonical, f"sources.{stage}")
     if canonical:

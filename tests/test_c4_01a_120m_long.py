@@ -289,6 +289,16 @@ def test_resume_reuses_finished_rows_and_removes_the_log(quick, tmp_path):
     assert payload["meta"]["resume"] == {"resume": True, "rows_loaded": 4, "rows_run": 11}
     assert not log.exists() and len(payload["runs"]) == 15
     c4.validate_results(payload)
+    # Double-interruption regression (M3): torn tail must be repaired on disk before any later append.
+    log.write_text("".join(json.dumps(r) + "\n" for r in rows[:2]) + '{"torn')
+    loaded = c4.load_rows(log, quick["tokens"]["run_config_hash"], resume=True)
+    assert len(loaded) == 2 and log.read_text().endswith("\n") and "torn" not in log.read_text()
+    with log.open("a") as handle:
+        handle.write(json.dumps(rows[2]) + "\n" + '{"torn2')
+    resumed_twice = c4.main(["--stage", "tokens", *quick["common"], "--resume", "--output", str(out)])
+    assert resumed_twice["meta"]["resume"] == {"resume": True, "rows_loaded": 3, "rows_run": 12}
+    assert not log.exists() and len(resumed_twice["runs"]) == 15
+    c4.validate_results(resumed_twice)
     log.write_text(json.dumps({**rows[0], "run_config_hash": "0" * 16}) + "\n")
     with pytest.raises(ValueError, match="resume"):
         c4.main(["--stage", "tokens", *quick["common"], "--resume", "--output", str(out)])
@@ -384,17 +394,42 @@ def test_committed_canonical_artifacts():
 
 def test_committed_canonical_artifacts_reject_tampering():
     found = _committed()
+    sources = {"tokens": found["tokens"], "wall": found["wall"]}
+
+    def _forged_hash_all_rows(p):
+        p["meta"]["code_sha256"] = "0" * 64
+        p["run_config_hash"] = "0" * 16
+        for row in p["runs"]:
+            row["run_config_hash"] = "0" * 16
+
     for stage, edit in (
         ("summary", _set(["analysis", "contrasts", 2, "p_holm_muon_joint"], delta=1e-9)),
         ("summary", _set(["sources", "wall", "sha256"], "0" * 64)),
         ("summary", _set(["meta", "git_dirty"], True)),
+        ("summary", _set(["meta", "git_sha"], "0" * 40)),
+        ("summary", _set(["config", "width"], 123)),
         ("summary", _set(["quick"], True)),
         ("tokens", _set(["meta", "git_dirty"], True)),
         ("tokens", _set(["meta", "environment", "capability"], [9, 0])),
         ("tokens", _set(["data", "splits", "test", "sha256"], "0" * 64)),
         ("tokens", _set(["protocol", "lr_warmup_steps"], 20)),
+        ("tokens", _set(["protocol", "orthogonalizers", "muon_ss3_54"],
+                         "CPU stand-in: baselines.polar_express eager (the real kernel needs CUDA)")),
+        ("tokens", _set(["runs", 0, "order_in_block"], 4)),
+        ("tokens", _forged_hash_all_rows),
         ("wall", _set(["protocol", "seconds"], 100.0)),
         ("wall", _set(["runs", 0, "test_loss"], delta=1e-9)),
+        ("wall", _set(["runs", 0, "order_in_block"], 3)),
+        ("wall", _forged_hash_all_rows),
     ):
         with pytest.raises(ValueError):
             c4.validate_results(_tampered(found[stage], edit), canonical=True)
+
+    # Also test explicit ``sources=...`` summary overload catches M1 tampering.
+    for edit in (
+        _set(["sources", "wall", "sha256"], "0" * 64),
+        _set(["config", "width"], 123),
+        _set(["meta", "git_sha"], "0" * 40),
+    ):
+        with pytest.raises(ValueError):
+            c4.validate_results(_tampered(found["summary"], edit), canonical=True, sources=sources)

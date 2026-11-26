@@ -4,7 +4,7 @@ An open, continuously operating autonomous AI research repository investigating 
 
 ---
 
-## Cycle 4 In Progress — `C4-02` & `C4-01b` Audited & Merged (1269 Passed, 6 Skipped on RTX 5080)
+## Cycle 4 In Progress — `C4-02`, `C4-01b` & `C4-01a` Audited & Merged (1288 Passed, 6 Skipped on RTX 5080)
 
 - **`C4-02` (End-to-End Blackwell NVFP4 W4A4 Inference — Online Triton Activation Quantizer, Block-16 Rotation & Real Hardware Perplexity):** Audited live on RTX 5080 (`sm_120`) by **GPT 6.2 Astra (`high`)** (`FAIL -> 7 findings remediated -> PASS — HOLD LIFTED`, [`AUDIT_cycle4_c4_02_gpt62_astra.md`](audits/AUDIT_cycle4_c4_02_gpt62_astra.md)); artifact [`results/cycle4_c4_02_nvfp4_e2e.json`](results/cycle4_c4_02_nvfp4_e2e.json) (`schema_version: cycle4_c4_02.v2`, `69,960` GPU events & `13,404` wall samples persisted, `0` D2H syncs, `216/216` quant parity, `60/60` int32 weight parity across all 5 methods):
   - **Single-Layer CUDA-Graph (`4×` L2 flush = `268 MB`, BF16 vs E2E NVFP4):**
@@ -17,7 +17,10 @@ An open, continuously operating autonomous AI research repository investigating 
 - **`C4-01b` (Seed-0-Calibrated Iso-Loss Muon-vs-AdamW PTQ & Hardware W4A4, Negative Sensitivity Finding — Promotion Held):** Audited live on RTX 5080 by **GPT 6.2 Astra (`high`)** (`PASS_WITH_CAVEATS`, [`AUDIT_cycle4_c4_01b_gpt62_astra.md`](audits/AUDIT_cycle4_c4_01b_gpt62_astra.md); post-merge M1/M2/M3 hardened); artifact [`results/cycle4_c4_01b_isoloss_ptq.json`](results/cycle4_c4_01b_isoloss_ptq.json) (`schema_version: cycle4_c4_01b.v1`):
   - **Stage A (`seed 0`, `val.bin` only):** Selected `(T_muon=320, T_adamw=544, adamw_lr=0.0015)` (`val NLL` `5.3393` vs `5.3255`, `0.0137` nats, `1.70×` AdamW tokens).
   - **Stage B (`seeds 1–3`, full `val`/`test`):** Under val-selected `adaptive_butterfly_b16_gptq`, `muon_ss3_54` incurs **`2.15–11.93×`** larger `test ΔNLL` than `adamw` across all `6` primary cells (`Holm p <= 0.0021`): NVFP4 W4A16 `+0.001972` vs `+0.000374`, W4A4 dyn `+0.011022` vs `+0.005060`, W4A4 static `+0.011018` vs `+0.005132`, MXFP4 `+0.003688` vs `+0.001070`, INT2 g16 `+0.033131` vs `+0.003272`, INT2 g32 `+0.053718` vs `+0.004504`; all `25` `(format, method, mode)` combos show larger `ΔNLL` (`Holm p <= 0.0124`). Absolute quantized `test NLL` is inconclusive (`Holm p = 1.0`). Verified `60` FP4 GEMMs/fwd, `480/480` int32 decode checks, and `<= 0.000144` nats hw-vs-FP32 parity; Astra's geometric replay confirmed higher Muon stable rank (`172.3` vs `23.3`) and lower signal-Hessian alignment (`1.15` vs `8.30`). *Caveats (promotion held):* only seed 2 met `<= 0.02` nats (`0.0905`/`0.1439` baseline gaps on seeds 1/3), Stage A `adamw` `lr=0.0015` had non-monotone trials, and live retrains are non-deterministic.
-- **Active / Queued Cycle 4:** `C4-01a` (`>= 20M`-token `120m` transfer, launching now), `C4-03` (wide training & `K=2^25`), and `C3-04` (M5 Max open-lid rerun when `Ryan's MacBook Pro` reconnects).
+- **`C4-01a` (Long-Budget `120m` FineWeb-Edu 3-Seed Transfer — `ps3_blackwell` Retained as Default):** Audited live on RTX 5080 by **GPT 6.2 Astra (`high`)** (`PASS_WITH_CAVEATS`, [`AUDIT_cycle4_c4_01a_gpt62_astra.md`](audits/AUDIT_cycle4_c4_01a_gpt62_astra.md); post-merge M1/M3 hardened); artifacts [`results/cycle4_c4_01a_120m_summary.json`](results/cycle4_c4_01a_120m_summary.json), [`results/cycle4_c4_01a_120m_tokens_21m.json`](results/cycle4_c4_01a_120m_tokens_21m.json), [`results/cycle4_c4_01a_120m_wall_300s.json`](results/cycle4_c4_01a_120m_wall_300s.json) (`27` runs, `0/27` divergences, `0.0s` accepted-compute overshoot):
+  - **Fixed-Token (`640` steps, `20,971,520` tokens, `0.8065` epoch):** `muon_ss3_53` (`86,172` tok/s, `4.64621` test), `muon_ss3_54` (`86,086`, `4.64464`), and `muon_ps3_blackwell` (`86,014`, `4.64693`) gain `+2.84–3.03%` tok/s over `muon_pe_compiled` (`83,640`, `4.64099`; all-Muon Holm `p <= 0.0068`) with test-loss parity (`p = 1.0`), and beat `adamw` (`88,666` tok/s, `5.11236`) by `-0.465` to `-0.471` nats (`p <= 0.0060`).
+  - **Fixed `300s` Accepted Compute (`<= 0.9942` epoch):** `muon_ps3_blackwell` (`787–788` steps, `86,066` tok/s, `4.48218`), `muon_ss3_54` (`788`, `86,137`, `4.48076`), and `muon_ss3_53` (`789`, `86,216`, `4.48381`) gain `22–24` steps (`+2.90–3.08%` tok/s, all-Muon Holm `p <= 0.0010`) over `muon_pe_compiled` (`765`, `83,640`, `4.50289`), lowering test loss `-0.0191` to `-0.0221` nats (`ps3_blackwell` family/ref Holm `p = 0.0138`/`0.0275`, all-Muon `0.0643`; `ss3_54` family `p = 0.0565`). `SS3_54`/`SS3_53` gain `+0.08–0.18%` tok/s over `ps3_blackwell` with no loss edge (`-0.0014`/`+0.0016` wall, `p = 1.0`). *Caveats:* fixed single LRs (`0.02`/`0.001`), 3 seeds, PE pos-1 in token blocks, no 300s AdamW arm, `100s` `SS3_54` signal did not replicate at `300s`.
+- **Active / Queued Cycle 4:** `C4-03` (wide-layer `w >= 1536` training crossover, 5-seed common-ckpt `SS3` vs `PS3` replication & `K=2^25` Gram drift, launching now) and `C3-04` (M5 Max open-lid rerun when `Ryan's MacBook Pro` reconnects).
 
 ---
 
@@ -80,6 +83,7 @@ Sources: [`results/m5_max_dense_cycle2.json`](results/m5_max_dense_cycle2.json),
 ## Independent Adversarial Audits (`audits/`)
 
 ### Cycle 4
+- **C4-01a (`GPT 6.2 Astra`, live RTX 5080, `high`):** [`AUDIT_cycle4_c4_01a_gpt62_astra.md`](audits/AUDIT_cycle4_c4_01a_gpt62_astra.md) — `PASS_WITH_CAVEATS` -> M1/M3 hardened (`ps3_blackwell` stays `120m` default; `42/42` paired contrasts & `27/27` rows recomputed, `48/48` tests, live `sm_120` dispatch, bitwise deadline rollback & `--resume` probes)
 - **C4-01b (`GPT 6.2 Astra`, live RTX 5080, `high`):** [`AUDIT_cycle4_c4_01b_gpt62_astra.md`](audits/AUDIT_cycle4_c4_01b_gpt62_astra.md) — `PASS_WITH_CAVEATS` -> M1/M2/M3 hardened (optimizer promotion & 3-seed iso-loss claim held; `253/253` tests, `60/60` FP4 GEMMs/fwd, `480/480` decode checks, `<= 0.000144` hw-vs-FP32 parity, geometric alignment replay)
 - **C4-02 (`GPT 6.2 Astra`, live RTX 5080 + re-check, `high`):** [`AUDIT_cycle4_c4_02_gpt62_astra.md`](audits/AUDIT_cycle4_c4_02_gpt62_astra.md) — `FAIL` -> 7 findings remediated -> **`PASS — HOLD LIFTED`** (reproduced `69,960` GPU events & `366` timing distributions `< 3.56e-15 ms`, `18/18` subnormal underflow probes finite, `0` diffs on strided butterfly tables & `12/12` invalid rejections, cross-checkout canonical output + `sm_120+` guard, `300/300` int32 weight checks, `val.bin` selection)
 
@@ -99,8 +103,13 @@ Sources: [`results/m5_max_dense_cycle2.json`](results/m5_max_dense_cycle2.json),
 ## Reproduction Commands
 
 ```bash
-# Run full verified suite (1269 passed, 6 skipped on Linux RTX 5080)
+# Run full verified suite (1288 passed, 6 skipped on Linux RTX 5080)
 PYTHONPATH=. .venv/bin/pytest -q
+
+# Cycle 4 C4-01a long-budget 120m FineWeb-Edu 3-seed transfer (tokens, 300s wall, summary)
+PYTHONPATH=. .venv/bin/python research/polar_opt/bench_c4_01a_120m_long.py --stage tokens --data-dir artifacts/real_text
+PYTHONPATH=. .venv/bin/python research/polar_opt/bench_c4_01a_120m_long.py --stage wall --data-dir artifacts/real_text
+PYTHONPATH=. .venv/bin/python research/polar_opt/bench_c4_01a_120m_long.py --stage summary
 
 # Cycle 4 C4-01b seed-0-calibrated Muon-vs-AdamW PTQ & hardware W4A4 benchmark
 PYTHONPATH=. .venv/bin/python research/quant_ptq/bench_isoloss_ptq.py --data-dir artifacts/real_text --output results/cycle4_c4_01b_isoloss_ptq.json
