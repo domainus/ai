@@ -1,0 +1,902 @@
+{
+  "meta": {
+    "git_sha": "9a23a6176726465cd65a0d55e959ef5b17462b62",
+    "git_dirty": false,
+    "command": [
+      "/var/home/ryan/Documents/projects/ai/.venv/bin/python",
+      "research/polar_opt/harness_tier2_real.py",
+      "--preset",
+      "50m",
+      "--optimizers",
+      "adamw",
+      "--adamw-lrs",
+      "3e-4",
+      "6e-4",
+      "1e-3",
+      "2e-3",
+      "3e-3",
+      "--seeds",
+      "0",
+      "--budget",
+      "tokens",
+      "--tokens",
+      "4194304",
+      "--lr-warmup-steps",
+      "16",
+      "--output",
+      "results/cycle2_tier2_pilot_adamw.json"
+    ],
+    "args": {
+      "preset": "50m",
+      "micro_batch": "None",
+      "grad_accum": "None",
+      "data_dir": "/var/home/ryan/Documents/projects/ai/artifacts/real_text",
+      "device": "cuda",
+      "optimizers": "['adamw']",
+      "extra_optimizer": "[]",
+      "adamw_lrs": "[0.0003, 0.0006, 0.001, 0.002, 0.003]",
+      "muon_lrs": "[0.005, 0.01, 0.02, 0.04]",
+      "muon_aux_lr": "0.002",
+      "weight_decay": "0.01",
+      "update_dtype": "fp32",
+      "seeds": "[0]",
+      "budget": "tokens",
+      "tokens": "4194304",
+      "seconds": "120.0",
+      "lr_warmup_steps": "16",
+      "wall_warmup_fraction": "0.0625",
+      "min_lr_ratio": "0.1",
+      "compile_warmup_steps": "3",
+      "eval_tokens": "1048576",
+      "compile_model": "False",
+      "reference": "muon_pe_eager",
+      "output": "results/cycle2_tier2_pilot_adamw.json",
+      "resume": "False",
+      "log_every": "10",
+      "telemetry_every": "100",
+      "harvest_nesterov": "False",
+      "harvest_optimizer": "muon_pe_eager",
+      "harvest_lr": "0.02",
+      "harvest_steps": "400",
+      "harvest_seed": "999",
+      "harvest_output": "/var/home/ryan/Documents/projects/ai/artifacts/harvested_nesterov_real.pt"
+    },
+    "preset": "50m",
+    "config": {
+      "vocab_size": 50304,
+      "width": 512,
+      "layers": 12,
+      "heads": 8,
+      "hidden": 1408,
+      "sequence_length": 512,
+      "micro_batch": 16,
+      "grad_accum": 4
+    },
+    "step_tokens": 32768,
+    "parameters": {
+      "total": 64303616,
+      "embedding": 25755648,
+      "non_embedding": 38547968,
+      "muon_matrices": 38535168
+    },
+    "data": {
+      "source": {
+        "dataset": "HuggingFaceFW/fineweb-edu",
+        "config": "sample-10BT",
+        "split": "train",
+        "streaming": true,
+        "name": "fineweb-edu",
+        "fallback_from": null
+      },
+      "encoding": "gpt2",
+      "splits": {
+        "train": {
+          "tokens": 26004518,
+          "sha256": "015ab83ceb742555c2398963a0bd1f3c5502dc52cf70a22bf173f1571326ca3a"
+        },
+        "val": {
+          "tokens": 2002330,
+          "sha256": "371b64a537f7b1e306ea174a868b05932a254a98b7fbdbf4146648d93180b0b1"
+        },
+        "test": {
+          "tokens": 2000081,
+          "sha256": "4eb46f1424856849d2973923dbf3c886d37eb743cf22053fc7e1eea1f41ab92a"
+        }
+      }
+    },
+    "device": "NVIDIA GeForce RTX 5080",
+    "torch": "2.14.1+cu130",
+    "cuda": "13.0",
+    "host_cpus": 16,
+    "timestamp": "2026-11-25T17:26:15-0700",
+    "loadavg_start": [
+      2.7978515625,
+      2.94921875,
+      2.99169921875
+    ],
+    "loadavg_end": [
+      2.4814453125,
+      2.78466796875,
+      2.9228515625
+    ]
+  },
+  "summary": {
+    "grid": [
+      {
+        "budget": "tokens",
+        "optimizer": "adamw",
+        "update_dtype": null,
+        "lr": 0.0003,
+        "runs": 1,
+        "diverged": 0,
+        "val_loss_mean": 6.837751217186451,
+        "test_loss_mean": 6.874224066734314,
+        "tokens_per_second_mean": 122496.32234942772
+      },
+      {
+        "budget": "tokens",
+        "optimizer": "adamw",
+        "update_dtype": null,
+        "lr": 0.0006,
+        "runs": 1,
+        "diverged": 0,
+        "val_loss_mean": 6.821642946451902,
+        "test_loss_mean": 6.855633299797773,
+        "tokens_per_second_mean": 122435.60769688721
+      },
+      {
+        "budget": "tokens",
+        "optimizer": "adamw",
+        "update_dtype": null,
+        "lr": 0.001,
+        "runs": 1,
+        "diverged": 0,
+        "val_loss_mean": 6.686016853898764,
+        "test_loss_mean": 6.720184773206711,
+        "tokens_per_second_mean": 122374.27981607369
+      },
+      {
+        "budget": "tokens",
+        "optimizer": "adamw",
+        "update_dtype": null,
+        "lr": 0.002,
+        "runs": 1,
+        "diverged": 0,
+        "val_loss_mean": 7.360055722296238,
+        "test_loss_mean": 7.3858447894454,
+        "tokens_per_second_mean": 122373.73167412468
+      },
+      {
+        "budget": "tokens",
+        "optimizer": "adamw",
+        "update_dtype": null,
+        "lr": 0.003,
+        "runs": 1,
+        "diverged": 0,
+        "val_loss_mean": 7.044229544699192,
+        "test_loss_mean": 7.081548482179642,
+        "tokens_per_second_mean": 122340.07663606903
+      }
+    ],
+    "best_lr": [
+      {
+        "budget": "tokens",
+        "optimizer": "adamw",
+        "update_dtype": null,
+        "lr": 0.001,
+        "runs": 1,
+        "diverged": 0,
+        "val_loss_mean": 6.686016853898764,
+        "test_loss_mean": 6.720184773206711,
+        "tokens_per_second_mean": 122374.27981607369,
+        "lr_grid": [
+          0.0003,
+          0.0006,
+          0.001,
+          0.002,
+          0.003
+        ],
+        "lr_at_grid_edge": false
+      }
+    ],
+    "paired_vs_reference": [],
+    "note": "Negative loss differences favour the optimizer. LR is chosen on validation loss only; test loss is reported for the chosen LR."
+  },
+  "runs": [
+    {
+      "optimizer": "adamw",
+      "lr": 0.0006,
+      "seed": 0,
+      "budget": "tokens",
+      "update_dtype": null,
+      "auxiliary_lr": null,
+      "init_fingerprint": "450226adb57b95ef",
+      "stream_fingerprint": "c799a807f454d68f",
+      "timestamp_start": "2026-11-25T17:26:19-0700",
+      "loadavg_start": [
+        2.7978515625,
+        2.94921875,
+        2.99169921875
+      ],
+      "gpu_start": {
+        "time": 1795652779.6140149,
+        "clocks.sm": 2850.0,
+        "clocks.mem": 14801.0,
+        "temperature.gpu": 45.0,
+        "power.draw": 170.71,
+        "utilization.gpu": 84.0,
+        "pstate": "P1",
+        "memory.used": 12307.0,
+        "clocks_event_reasons.active": "0x0000000000000400"
+      },
+      "gpu_end": {
+        "time": 1795652814.0191698,
+        "clocks.sm": 2835.0,
+        "clocks.mem": 14801.0,
+        "temperature.gpu": 65.0,
+        "power.draw": 284.82,
+        "utilization.gpu": 100.0,
+        "pstate": "P1",
+        "memory.used": 12308.0,
+        "clocks_event_reasons.active": "0x0000000000000400"
+      },
+      "loadavg_end": [
+        3.26611328125,
+        3.02392578125,
+        3.0146484375
+      ],
+      "steps": 128,
+      "tokens": 4194304,
+      "target_tokens": 4194304,
+      "target_seconds": null,
+      "train_seconds": 34.25722368597053,
+      "discarded_step_seconds": null,
+      "wall_budget_overshoot_seconds": null,
+      "tokens_per_second": 122435.60769688721,
+      "last_train_loss": 6.839270114898682,
+      "val_loss": 6.821642946451902,
+      "val_ppl": 917.4911613275885,
+      "test_loss": 6.855633299797773,
+      "test_ppl": 949.2130755442269,
+      "diverged": false,
+      "timing": {
+        "steps_timed": 127,
+        "fwd_bwd_ms": 265.0374755859375,
+        "polar_ortho_ms": null,
+        "layout_cast_ms": null,
+        "foreach_update_ms": null,
+        "momentum_ms": null,
+        "auxiliary_adamw_ms": null,
+        "adamw_fused_ms": 2.205280065536499,
+        "optimizer_step_ms": 2.205280065536499,
+        "step_wall_ms": 267.2930429689586
+      },
+      "train_curve": [
+        [
+          1,
+          10.91208
+        ],
+        [
+          10,
+          9.32246
+        ],
+        [
+          20,
+          7.78061
+        ],
+        [
+          30,
+          7.68912
+        ],
+        [
+          40,
+          7.4729
+        ],
+        [
+          50,
+          7.41345
+        ],
+        [
+          60,
+          7.19119
+        ],
+        [
+          70,
+          7.15589
+        ],
+        [
+          80,
+          7.06353
+        ],
+        [
+          90,
+          6.93388
+        ],
+        [
+          100,
+          6.90214
+        ],
+        [
+          110,
+          6.83421
+        ],
+        [
+          120,
+          6.89913
+        ]
+      ],
+      "gpu_samples": [
+        {
+          "time": 1795652806.478819,
+          "clocks.sm": 2835.0,
+          "clocks.mem": 14801.0,
+          "temperature.gpu": 63.0,
+          "power.draw": 285.57,
+          "utilization.gpu": 100.0,
+          "pstate": "P1",
+          "memory.used": 12308.0,
+          "clocks_event_reasons.active": "0x0000000000000400"
+        }
+      ],
+      "timestamp_end": "2026-11-25T17:26:59-0700",
+      "run_config_hash": "bdb2f6b3b68c5e82",
+      "order_in_block": 0
+    },
+    {
+      "optimizer": "adamw",
+      "lr": 0.001,
+      "seed": 0,
+      "budget": "tokens",
+      "update_dtype": null,
+      "auxiliary_lr": null,
+      "init_fingerprint": "450226adb57b95ef",
+      "stream_fingerprint": "c799a807f454d68f",
+      "timestamp_start": "2026-11-25T17:27:00-0700",
+      "loadavg_start": [
+        3.1513671875,
+        3.00634765625,
+        3.00830078125
+      ],
+      "gpu_start": {
+        "time": 1795652820.989168,
+        "clocks.sm": 2850.0,
+        "clocks.mem": 14801.0,
+        "temperature.gpu": 52.0,
+        "power.draw": 241.25,
+        "utilization.gpu": 100.0,
+        "pstate": "P1",
+        "memory.used": 12316.0,
+        "clocks_event_reasons.active": "0x0000000000000400"
+      },
+      "gpu_end": {
+        "time": 1795652855.4134567,
+        "clocks.sm": 2827.0,
+        "clocks.mem": 14801.0,
+        "temperature.gpu": 62.0,
+        "power.draw": 283.9,
+        "utilization.gpu": 99.0,
+        "pstate": "P1",
+        "memory.used": 12316.0,
+        "clocks_event_reasons.active": "0x0000000000000400"
+      },
+      "loadavg_end": [
+        2.88671875,
+        2.95703125,
+        2.99169921875
+      ],
+      "steps": 128,
+      "tokens": 4194304,
+      "target_tokens": 4194304,
+      "target_seconds": null,
+      "train_seconds": 34.27439169655554,
+      "discarded_step_seconds": null,
+      "wall_budget_overshoot_seconds": null,
+      "tokens_per_second": 122374.27981607369,
+      "last_train_loss": 6.6948137283325195,
+      "val_loss": 6.686016853898764,
+      "val_ppl": 801.1248911065893,
+      "test_loss": 6.720184773206711,
+      "test_ppl": 828.9706689001023,
+      "diverged": false,
+      "timing": {
+        "steps_timed": 127,
+        "fwd_bwd_ms": 265.5115966796875,
+        "polar_ortho_ms": null,
+        "layout_cast_ms": null,
+        "foreach_update_ms": null,
+        "momentum_ms": null,
+        "auxiliary_adamw_ms": null,
+        "adamw_fused_ms": 2.1991679668426514,
+        "optimizer_step_ms": 2.1991679668426514,
+        "step_wall_ms": 267.73484610021114
+      },
+      "train_curve": [
+        [
+          1,
+          10.91208
+        ],
+        [
+          10,
+          8.89979
+        ],
+        [
+          20,
+          7.69219
+        ],
+        [
+          30,
+          7.57523
+        ],
+        [
+          40,
+          7.37697
+        ],
+        [
+          50,
+          7.29581
+        ],
+        [
+          60,
+          7.04423
+        ],
+        [
+          70,
+          7.00737
+        ],
+        [
+          80,
+          6.90714
+        ],
+        [
+          90,
+          6.78894
+        ],
+        [
+          100,
+          6.7561
+        ],
+        [
+          110,
+          6.69736
+        ],
+        [
+          120,
+          6.76561
+        ]
+      ],
+      "gpu_samples": [
+        {
+          "time": 1795652847.8352342,
+          "clocks.sm": 2827.0,
+          "clocks.mem": 14801.0,
+          "temperature.gpu": 65.0,
+          "power.draw": 287.97,
+          "utilization.gpu": 100.0,
+          "pstate": "P1",
+          "memory.used": 12316.0,
+          "clocks_event_reasons.active": "0x0000000000000400"
+        }
+      ],
+      "timestamp_end": "2026-11-25T17:27:41-0700",
+      "run_config_hash": "bdb2f6b3b68c5e82",
+      "order_in_block": 1
+    },
+    {
+      "optimizer": "adamw",
+      "lr": 0.0003,
+      "seed": 0,
+      "budget": "tokens",
+      "update_dtype": null,
+      "auxiliary_lr": null,
+      "init_fingerprint": "450226adb57b95ef",
+      "stream_fingerprint": "c799a807f454d68f",
+      "timestamp_start": "2026-11-25T17:27:42-0700",
+      "loadavg_start": [
+        2.89599609375,
+        2.9580078125,
+        2.9921875
+      ],
+      "gpu_start": {
+        "time": 1795652862.3869193,
+        "clocks.sm": 2827.0,
+        "clocks.mem": 14801.0,
+        "temperature.gpu": 53.0,
+        "power.draw": 243.81,
+        "utilization.gpu": 100.0,
+        "pstate": "P1",
+        "memory.used": 12315.0,
+        "clocks_event_reasons.active": "0x0000000000000400"
+      },
+      "gpu_end": {
+        "time": 1795652896.7766364,
+        "clocks.sm": 2827.0,
+        "clocks.mem": 14801.0,
+        "temperature.gpu": 65.0,
+        "power.draw": 288.18,
+        "utilization.gpu": 99.0,
+        "pstate": "P1",
+        "memory.used": 12315.0,
+        "clocks_event_reasons.active": "0x0000000000000400"
+      },
+      "loadavg_end": [
+        2.798828125,
+        2.94140625,
+        2.9853515625
+      ],
+      "steps": 128,
+      "tokens": 4194304,
+      "target_tokens": 4194304,
+      "target_seconds": null,
+      "train_seconds": 34.24024427472614,
+      "discarded_step_seconds": null,
+      "wall_budget_overshoot_seconds": null,
+      "tokens_per_second": 122496.32234942772,
+      "last_train_loss": 6.8615899085998535,
+      "val_loss": 6.837751217186451,
+      "val_ppl": 932.3900327204442,
+      "test_loss": 6.874224066734314,
+      "test_ppl": 967.0247277449047,
+      "diverged": false,
+      "timing": {
+        "steps_timed": 127,
+        "fwd_bwd_ms": 265.4671936035156,
+        "polar_ortho_ms": null,
+        "layout_cast_ms": null,
+        "foreach_update_ms": null,
+        "momentum_ms": null,
+        "auxiliary_adamw_ms": null,
+        "adamw_fused_ms": 2.201184034347534,
+        "optimizer_step_ms": 2.201184034347534,
+        "step_wall_ms": 267.7078458946198
+      },
+      "train_curve": [
+        [
+          1,
+          10.91208
+        ],
+        [
+          10,
+          9.68939
+        ],
+        [
+          20,
+          8.53157
+        ],
+        [
+          30,
+          7.8445
+        ],
+        [
+          40,
+          7.50744
+        ],
+        [
+          50,
+          7.43495
+        ],
+        [
+          60,
+          7.2191
+        ],
+        [
+          70,
+          7.1613
+        ],
+        [
+          80,
+          7.08295
+        ],
+        [
+          90,
+          6.9441
+        ],
+        [
+          100,
+          6.91764
+        ],
+        [
+          110,
+          6.84296
+        ],
+        [
+          120,
+          6.91403
+        ]
+      ],
+      "gpu_samples": [
+        {
+          "time": 1795652889.2372088,
+          "clocks.sm": 2827.0,
+          "clocks.mem": 14801.0,
+          "temperature.gpu": 65.0,
+          "power.draw": 288.56,
+          "utilization.gpu": 99.0,
+          "pstate": "P1",
+          "memory.used": 12315.0,
+          "clocks_event_reasons.active": "0x0000000000000400"
+        }
+      ],
+      "timestamp_end": "2026-11-25T17:28:22-0700",
+      "run_config_hash": "bdb2f6b3b68c5e82",
+      "order_in_block": 2
+    },
+    {
+      "optimizer": "adamw",
+      "lr": 0.002,
+      "seed": 0,
+      "budget": "tokens",
+      "update_dtype": null,
+      "auxiliary_lr": null,
+      "init_fingerprint": "450226adb57b95ef",
+      "stream_fingerprint": "c799a807f454d68f",
+      "timestamp_start": "2026-11-25T17:28:23-0700",
+      "loadavg_start": [
+        2.734375,
+        2.92529296875,
+        2.97998046875
+      ],
+      "gpu_start": {
+        "time": 1795652903.7484703,
+        "clocks.sm": 2842.0,
+        "clocks.mem": 14801.0,
+        "temperature.gpu": 54.0,
+        "power.draw": 235.59,
+        "utilization.gpu": 100.0,
+        "pstate": "P1",
+        "memory.used": 12315.0,
+        "clocks_event_reasons.active": "0x0000000000000400"
+      },
+      "gpu_end": {
+        "time": 1795652938.172211,
+        "clocks.sm": 2827.0,
+        "clocks.mem": 14801.0,
+        "temperature.gpu": 65.0,
+        "power.draw": 289.12,
+        "utilization.gpu": 100.0,
+        "pstate": "P1",
+        "memory.used": 12316.0,
+        "clocks_event_reasons.active": "0x0000000000000400"
+      },
+      "loadavg_end": [
+        2.470703125,
+        2.83837890625,
+        2.9482421875
+      ],
+      "steps": 128,
+      "tokens": 4194304,
+      "target_tokens": 4194304,
+      "target_seconds": null,
+      "train_seconds": 34.27454521995969,
+      "discarded_step_seconds": null,
+      "wall_budget_overshoot_seconds": null,
+      "tokens_per_second": 122373.73167412468,
+      "last_train_loss": 7.384577751159668,
+      "val_loss": 7.360055722296238,
+      "val_ppl": 1571.9241517406197,
+      "test_loss": 7.3858447894454,
+      "test_ppl": 1612.9898563913637,
+      "diverged": false,
+      "timing": {
+        "steps_timed": 127,
+        "fwd_bwd_ms": 265.5133056640625,
+        "polar_ortho_ms": null,
+        "layout_cast_ms": null,
+        "foreach_update_ms": null,
+        "momentum_ms": null,
+        "auxiliary_adamw_ms": null,
+        "adamw_fused_ms": 2.2010879516601562,
+        "optimizer_step_ms": 2.2010879516601562,
+        "step_wall_ms": 267.7563359029591
+      },
+      "train_curve": [
+        [
+          1,
+          10.91208
+        ],
+        [
+          10,
+          8.16338
+        ],
+        [
+          20,
+          7.7644
+        ],
+        [
+          30,
+          7.83201
+        ],
+        [
+          40,
+          7.75697
+        ],
+        [
+          50,
+          7.77368
+        ],
+        [
+          60,
+          7.65541
+        ],
+        [
+          70,
+          7.65978
+        ],
+        [
+          80,
+          7.63966
+        ],
+        [
+          90,
+          7.5104
+        ],
+        [
+          100,
+          7.45569
+        ],
+        [
+          110,
+          7.39131
+        ],
+        [
+          120,
+          7.4312
+        ]
+      ],
+      "gpu_samples": [
+        {
+          "time": 1795652930.634197,
+          "clocks.sm": 2827.0,
+          "clocks.mem": 14801.0,
+          "temperature.gpu": 66.0,
+          "power.draw": 289.16,
+          "utilization.gpu": 100.0,
+          "pstate": "P1",
+          "memory.used": 12316.0,
+          "clocks_event_reasons.active": "0x0000000000000400"
+        }
+      ],
+      "timestamp_end": "2026-11-25T17:29:04-0700",
+      "run_config_hash": "bdb2f6b3b68c5e82",
+      "order_in_block": 3
+    },
+    {
+      "optimizer": "adamw",
+      "lr": 0.003,
+      "seed": 0,
+      "budget": "tokens",
+      "update_dtype": null,
+      "auxiliary_lr": null,
+      "init_fingerprint": "450226adb57b95ef",
+      "stream_fingerprint": "c799a807f454d68f",
+      "timestamp_start": "2026-11-25T17:29:05-0700",
+      "loadavg_start": [
+        2.478515625,
+        2.8271484375,
+        2.943359375
+      ],
+      "gpu_start": {
+        "time": 1795652945.1560817,
+        "clocks.sm": 2857.0,
+        "clocks.mem": 14801.0,
+        "temperature.gpu": 54.0,
+        "power.draw": 235.27,
+        "utilization.gpu": 21.0,
+        "pstate": "P1",
+        "memory.used": 12316.0,
+        "clocks_event_reasons.active": "0x0000000000000400"
+      },
+      "gpu_end": {
+        "time": 1795652979.593063,
+        "clocks.sm": 2827.0,
+        "clocks.mem": 14801.0,
+        "temperature.gpu": 66.0,
+        "power.draw": 289.58,
+        "utilization.gpu": 100.0,
+        "pstate": "P1",
+        "memory.used": 12315.0,
+        "clocks_event_reasons.active": "0x0000000000000400"
+      },
+      "loadavg_end": [
+        2.39453125,
+        2.77783203125,
+        2.92236328125
+      ],
+      "steps": 128,
+      "tokens": 4194304,
+      "target_tokens": 4194304,
+      "target_seconds": null,
+      "train_seconds": 34.283973946468905,
+      "discarded_step_seconds": null,
+      "wall_budget_overshoot_seconds": null,
+      "tokens_per_second": 122340.07663606903,
+      "last_train_loss": 7.07261848449707,
+      "val_loss": 7.044229544699192,
+      "val_ppl": 1146.2253801079678,
+      "test_loss": 7.081548482179642,
+      "test_ppl": 1189.8094915791194,
+      "diverged": false,
+      "timing": {
+        "steps_timed": 127,
+        "fwd_bwd_ms": 265.55194091796875,
+        "polar_ortho_ms": null,
+        "layout_cast_ms": null,
+        "foreach_update_ms": null,
+        "momentum_ms": null,
+        "auxiliary_adamw_ms": null,
+        "adamw_fused_ms": 2.201184034347534,
+        "optimizer_step_ms": 2.201184034347534,
+        "step_wall_ms": 267.80930696986616
+      },
+      "train_curve": [
+        [
+          1,
+          10.91208
+        ],
+        [
+          10,
+          7.86946
+        ],
+        [
+          20,
+          7.90598
+        ],
+        [
+          30,
+          7.87109
+        ],
+        [
+          40,
+          7.73511
+        ],
+        [
+          50,
+          7.66413
+        ],
+        [
+          60,
+          7.46715
+        ],
+        [
+          70,
+          7.44484
+        ],
+        [
+          80,
+          7.38728
+        ],
+        [
+          90,
+          7.22362
+        ],
+        [
+          100,
+          7.16745
+        ],
+        [
+          110,
+          7.07119
+        ],
+        [
+          120,
+          7.12805
+        ]
+      ],
+      "gpu_samples": [
+        {
+          "time": 1795652972.027815,
+          "clocks.sm": 2827.0,
+          "clocks.mem": 14801.0,
+          "temperature.gpu": 66.0,
+          "power.draw": 286.92,
+          "utilization.gpu": 94.0,
+          "pstate": "P1",
+          "memory.used": 12322.0,
+          "clocks_event_reasons.active": "0x0000000000000400"
+        }
+      ],
+      "timestamp_end": "2026-11-25T17:29:45-0700",
+      "run_config_hash": "bdb2f6b3b68c5e82",
+      "order_in_block": 4
+    }
+  ]
+}
