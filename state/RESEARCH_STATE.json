@@ -2,8 +2,8 @@
   "program": "Autonomous Verifiable AI Research",
   "repo": "https://github.com/domainus/ai",
   "cycle": 4,
-  "phase": "cycle4_in_progress",
-  "last_updated": "2026-11-26T13:09:12-07:00",
+  "phase": "cycle4_bazzite_complete",
+  "last_updated": "2026-11-26T16:34:40-07:00",
   "fleet": {
     "bazzite": {
       "environment_id": "6fb39dcd-f3b7-4929-a1d5-637d67eb79bb",
@@ -25,34 +25,38 @@
     }
   },
   "kpis": {
-    "experiments_run": 25,
-    "verified_wins": 11,
+    "experiments_run": 26,
+    "verified_wins": 12,
     "best_speedup_vs_pe": 2.7,
     "best_speedup_vs_ps": 2.58,
-    "tests_passing": 1288,
-    "audits_completed": 17
+    "tests_passing": 1319,
+    "audits_completed": 18
   },
   "completed": [
-    "C4-01a 120M LONG TRANSFER (0/27 div, 0.0s overshoot, M1/M3 hardened): 20.97M-tok (+2.84-3.03% tok/s vs PE, p<=0.0068; loss p=1; -0.465..-0.471 vs AdamW) & 300s wall (ps3 -0.0207 vs PE, fam p=0.014); ss3 +0.08-0.18% vs ps3, loss p=1 (ps3 stays default)",
-    "C4-01b ISO-LOSS PTQ (M1/M2/M3 hardened; hold): Seed-0 match (320 vs 544 @ LR 0.0015, 0.0137 nats); Muon loses 2.15-11.93x dNLL across 6 cells (Holm p<=0.0021; abs NLL p=1.0); 60/60 FP4 GEMMs, 480/480 decode; rank 172.3 vs 23.3",
-    "C4-02 BLACKWELL NVFP4 W4A4 E2E (0 D2H, 216/216 quant, 60x5 parity): had_b16 3.823x/384 TF @ 1024x4096 & 5.277x/612 TF @ 2048x8192 (4.134x/5.667x static_gs); full fwd: 1.008x (50m), 1.209x (120m), 1.972x (w2048); 50m bfly_b16_gptq +1.127% PPL",
-    "C3-03 & C3-01: SS3_53 wins all 5 shapes (1.034-1.132x vs PS3, 2.700x vs PE) & w512..w2048 (1.019-1.067x); SS3_54 wins n>=1024 (1.017-1.062x) & w1024->w2048 (1.020x); 120m 3-seed +2.90-3.00% tok/s vs PE",
-    "C3-02, T4-01 & T5-01: Hybrid ->SS3_34 falsified; CPU muP passes (0.078-0.116 vs SP 1.55-2.60); NVFP4 GEMM 5.07-6.54x (512-758 TF); GPTQ cuts dNLL 3-5x vs RTN",
-    "CYCLE 2: M5 Max 64x64 Metal SYRK <=2048^2 (2.58x FP16 / 2.57x BF16 vs PS3) & 50m 5-seed (+3.10-3.18% tok/s vs PE eager, -0.026..-0.033 75s loss, p<0.05)"
+    "C4-03 WIDE/CKPT/DRIFT (H1/M1/H2): w1536/w2048 SS3 +12-15.5% vs PE; SS3_53 beats PS3 (+0.68/+0.82%, p<=0.025); 5-seed ckpt loss p=1; MMA accum causes 15.6% long-K bias (ChunkedGram 0.002%, 29-85x)",
+    "C4-01a 120M TRANSFER (0/27 div, 0s overshoot, H1/M1/M3): 20.97M-tok (+2.84-3.03% vs PE, p<=0.0068; loss p=1; -0.47 vs AdamW) & 300s wall (ps3 -0.021 vs PE); ss3 +0.08-0.18% vs ps3, loss p=1",
+    "C4-01b PTQ (M1/M2/M3; hold): Seed-0 match (320 vs 544 @ 0.0015, 0.0137 nats); Muon loses 2.15-11.93x dNLL across 6 cells (p<=0.0021; abs p=1); 60/60 FP4, 480/480 decode; rank 172 vs 23",
+    "C4-02 NVFP4 W4A4 (0 D2H, 216/216 quant, 60x5 parity): had_b16 3.82x/384TF @ 1024x4096 & 5.28x/612TF @ 2048x8192; full fwd: 1.008x (50m), 1.209x (120m), 1.972x (w2048); bfly_b16_gptq +1.127% PPL",
+    "CYCLE 3 (C3-01..03, T4-01, T5-01): SS3_53 wins 5 shapes (1.03-1.13x vs PS3, 2.70x vs PE); CPU muP passes (0.078-0.116); NVFP4 GEMM 5.07-6.54x (512-758 TF); GPTQ cuts dNLL 3-5x vs RTN",
+    "CYCLE 2: M5 Max 64x64 Metal SYRK <=2048^2 (2.58x FP16/2.57x BF16 vs PS3) & 50m 5-seed (+3.10-3.18% vs PE, -0.026..-0.033 75s loss, p<0.05)"
   ],
   "wip": [
-    "C4-03 (launching): Wide-layer (w>=1536) training crossover, 5-seed common-ckpt SS3 vs PS3 replication & K=2^25 Gram drift",
     "C3-04: M5 Max open-lid 4096^2 rerun + live pytest tests/test_mlx.py (waiting for MacBook Pro)"
   ],
   "blockers": [
-    "C4-01b promotion/3-seed iso-loss held: only 1/3 Stage B seeds met <=0.02-nat target (0.0905/0.1439 gaps on seeds 1/3; non-monotone AdamW LR 0.0015; non-deterministic retrain)",
-    "C4-02 dynamic had_b16 is 0.860x vs BF16 @ (1024,512,1408); Part C single-seed 320-step 50m & BF16-calibrated static scales; had_b16_gptq (+1.232%) trails gptq (+1.188%)",
-    "SS3_54 trails PS3_55_bw in graph @ (512,2048) (0.987x) & Tier-1 med (0.991x); w512 host-load tails",
-    "C4-01a 120m used fixed LRs (0.02/0.001), 3 seeds, PE pos-1 in token blocks, no 300s AdamW; SS3 vs PS3 +0.08-0.18% tok/s with no loss edge (ps3_blackwell stays 120m default)",
-    "C3-02 hybrid ->SS3_34 falsified; T5-01 1.86x PPL confound investigated in C4-01b (seed-0 match only)",
+    "C4-03: MMA bit-exactness withheld (4-term FP16 1-ULP witness); ChunkedGram experimental (<=5.9% patch @ 512x2048); SS3_54 w1536 joint p=0.130",
+    "C4-01b promotion/3-seed iso-loss held (only seed 2 <=0.02 nats); C4-01a fixed LRs / no 300s AdamW (ps3 stays 120m default)",
+    "C4-02 dyn had_b16 0.860x vs BF16 @ (1024,512,1408); Part C 1-seed & BF16 static scales; SS3_54 @ (512,2048) 0.987x vs PS3",
     "MacBook Pro unreachable (C3-04 deferred); 3 Metal-only + 3 large-size tests skipped on Linux"
   ],
   "audits": [
+    {
+      "auditor": "GPT 6.2 Astra (C4-03 live GPU, high)",
+      "verdict": "PASS_WITH_CAVEATS -> H1/M1/H2 HARDENED",
+      "status": "DONE",
+      "report": "audits/AUDIT_cycle4_c4_03_gpt62_astra.md",
+      "target": "Wide-model transfer (w1536/w2048), 5-seed common-ckpt replication & K=2^25 MMA Gram drift + 4-term 1-ULP counterexample"
+    },
     {
       "auditor": "GPT 6.2 Astra (C4-01a live GPU, high)",
       "verdict": "PASS_WITH_CAVEATS -> M1/M3 HARDENED",
@@ -169,7 +173,9 @@
     }
   ],
   "next_queue": [
-    "C4-03 (launching): Wide-layer (w>=1536) training crossover, 5-seed common-ckpt SS3 vs PS3 replication & K=2^25 Gram drift",
-    "C3-04: M5 Max open-lid 4096^2 rerun + live pytest tests/test_mlx.py once MacBook Pro reconnects"
+    "C3-04 (MacBook Pro): Open-lid caffeinate 4096^2 Metal SYRK + live pytest tests/test_mlx.py + F5 profile",
+    "C5-01: Zero-regression native K>65536 chunked SYRK + MMA 1-ULP characterization",
+    "C5-02: Per-seed iso-loss Muon-vs-AdamW PTQ + quantization sensitivity mitigations",
+    "C5-03: Real 120m hardware NVFP4 W4A4 perplexity + small-shape quantizer fusion"
   ]
 }

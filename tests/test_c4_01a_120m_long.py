@@ -425,7 +425,7 @@ def test_committed_canonical_artifacts_reject_tampering():
         with pytest.raises(ValueError):
             c4.validate_results(_tampered(found[stage], edit), canonical=True)
 
-    # Also test explicit ``sources=...`` summary overload catches M1 tampering.
+    # Also test explicit ``sources=...`` summary overload catches M1 tampering and H1 binding.
     for edit in (
         _set(["sources", "wall", "sha256"], "0" * 64),
         _set(["config", "width"], 123),
@@ -433,3 +433,13 @@ def test_committed_canonical_artifacts_reject_tampering():
     ):
         with pytest.raises(ValueError):
             c4.validate_results(_tampered(found["summary"], edit), canonical=True, sources=sources)
+    tampered_wall = copy.deepcopy(found["wall"])
+    tampered_wall["runs"][0]["test_loss"] -= 0.01
+    tampered_wall["runs"][0]["test_ppl"] = math.exp(tampered_wall["runs"][0]["test_loss"])
+    tampered_wall["derived"] = c4.derive_runs(tampered_wall)
+    forged_summary = copy.deepcopy(found["summary"])
+    forged_summary["per_seed"]["wall"] = c4.per_seed_table(tampered_wall)
+    forged_summary["checks"]["wall"] = c4.stage_checks(tampered_wall)
+    forged_summary["analysis"] = c4.analyze(forged_summary["per_seed"])
+    with pytest.raises(ValueError, match="canonical file"):
+        c4.validate_results(forged_summary, canonical=True, sources={"tokens": found["tokens"], "wall": tampered_wall})

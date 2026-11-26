@@ -645,17 +645,21 @@ def _truncate(value: int, shift: int) -> int:
 
 
 def mma_accumulate(a: list[float], b: list[float], acc: float = 0.0, *, group: int = 16, guard: int = 2) -> float:
-    """Exact integer model of ``acc + sum(a_k * b_k)`` as the sm_120 Tensor-Core MMA computes it.
+    """Binade-aligned integer model of ``acc + sum(a_k * b_k)`` for sm_120 Tensor-Core MMA.
 
     One MMA instruction takes ``group`` = 16 products and the FP32 accumulator:
 
     1. Every product ``a_k * b_k`` of two FP16/BF16 values is exact.
-    2. All 17 addends are aligned to the largest exponent ``E`` among them and truncated toward
-       zero below ``2^(E - 23 - guard)``: 24 significand bits plus ``guard`` = 2 guard bits.
+    2. All 17 addends are aligned to the largest binary exponent ``E`` among them and truncated
+       toward zero below ``2^(E - 23 - guard)``: 24 significand bits plus ``guard`` = 2 guard bits.
     3. Their sum is exact and is truncated toward zero to 24 significant bits.
 
-    Step 2 is the bias: once the accumulator is ``2^25`` times a product, the product is dropped.
-    The model reproduces ``_syrk_kernel`` bit for bit (``drift`` stage, unit ``mma_model``).
+    Step 2 explains the measured long-K diagonal bias: once the accumulator enters a binade
+    where a product falls below the aligned truncation quantum ``2^(E - 25)``, the product is
+    dropped (reproducing ``_syrk_kernel`` on 160/160 probe cases and 260/260 sweep diagonals).
+    This is NOT a universal bit-exact specification of all Blackwell MMA arithmetic: live
+    RTX 5080 probes show 1-ULP disagreements on a 4-term normal FP16 diagonal, signed
+    off-diagonals, and FP32 exponent-limit cases.
     """
     value = _scaled(acc)
     for start in range(0, len(a), group):
@@ -1508,6 +1512,14 @@ def _validate_drift(payload: dict, canonical: bool) -> None:
         _require(list(r["kernels"]) == names, f"{r['id']}: kernels differ from the protocol")
         _require(("gram" in r) == (r["seed"] in protocol["gram_seeds"]), f"{r['id']}: Gram decomposition")
         for name, cell in r["kernels"].items():
+            for mode in ("production", "mitigated"):
+                entry = cell[mode]
+                _require(entry["finite"] is True, f"{r['id']} {name}.{mode}: non-finite")
+                _require(entry["sigma_min"] >= 0.0 and entry["sigma_max"] >= entry["sigma_min"]
+                         and entry["sigma_max"] > 0.0,
+                         f"{r['id']} {name}.{mode}: invalid singular value bounds")
+                _require(entry["rel_fro_err"] >= 0.0 and entry["ms"] > 0.0,
+                         f"{r['id']} {name}.{mode}: invalid error or latency")
             _require(cell["mitigated"]["chunked"] == (r["k"] > protocol["gate_k"]),
                      f"{r['id']} {name}: the mitigation gate differs from K > gate_k")
     _assert_close(payload["derived"], derive_drift(payload), "derived")
@@ -1555,7 +1567,11 @@ def validate_results(payload: dict, *, canonical: bool | None = None, sources: d
             if canonical:
                 path = _source_path(recorded)
                 _require(path.exists(), f"canonical source {path} is missing")
-                _require(sha256_file(path) == recorded["sha256"], f"{path}: SHA-256 differs from the summary")
+                raw = path.read_bytes()
+                _require(hashlib.sha256(raw).hexdigest() == recorded["sha256"],
+                         f"{path}: SHA-256 differs from the summary")
+                _require(src == json.loads(raw),
+                         f"sources.{stage} differs from the canonical file {path}")
             for key in ("git_sha", "git_dirty", "code_sha256", "run_config_hash", "quick", "canonical", "protocol"):
                 _assert_close(recorded[key], {**src["meta"], **src}[key], f"sources.{stage}.{key}")
             for key in ("device", "capability"):

@@ -803,7 +803,11 @@ def validate_results(payload: dict, *, canonical: bool | None = None, sources: d
             if canonical:
                 path = Path(recorded["path"]) if Path(recorded["path"]).is_absolute() else ROOT / recorded["path"]
                 _require(path.exists(), f"canonical source {path} is missing")
-                _require(sha256_file(path) == recorded["sha256"], f"{path}: SHA-256 differs from the summary")
+                raw = path.read_bytes()
+                _require(hashlib.sha256(raw).hexdigest() == recorded["sha256"],
+                         f"{path}: SHA-256 differs from the summary")
+                _require(src == json.loads(raw),
+                         f"sources.{stage} differs from the canonical file {path}")
             for key in ("git_sha", "git_dirty", "code_sha256", "run_config_hash", "quick", "canonical", "protocol"):
                 _assert_close(recorded[key], {**src["meta"], **src}[key], f"sources.{stage}.{key}")
             _require(recorded.get("device") == src["meta"]["environment"].get("device"),

@@ -770,6 +770,9 @@ def test_committed_canonical_artifacts_reject_tampering():
         ("ckpt", forged_hash),
         ("drift", _set(["protocol", "chunk_k"], 8192)),
         ("drift", _set(["rows", 10, "kernels", "ss3_54_fp16", "production", "sigma_max"], delta=1e-6)),
+        ("drift", _set(["rows", 10, "kernels", "ss3_54_fp16", "production", "sigma_min"], -0.1)),
+        ("drift", _set(["rows", 10, "kernels", "ss3_54_fp16", "production", "sigma_min"],
+                       found["drift"]["rows"][10]["kernels"]["ss3_54_fp16"]["production"]["sigma_max"] + 0.5)),
         ("drift", forged_hash),
     ):
         with pytest.raises(ValueError):
@@ -778,3 +781,14 @@ def test_committed_canonical_artifacts_reject_tampering():
                  _set(["sources", "ckpt", "git_sha"], "0" * 40)):
         with pytest.raises(ValueError):
             c3.validate_results(_tampered(found["summary"], edit), canonical=True, sources=sources)
+    # H1 explicit-source attack: consistent altered ckpt object with original file sha256 must fail.
+    tampered_ckpt = copy.deepcopy(found["ckpt"])
+    tampered_ckpt["runs"][0]["checkpoints"][1]["test_loss"] -= 0.01
+    tampered_ckpt["runs"][0]["checkpoints"][1]["test_ppl"] = math.exp(
+        tampered_ckpt["runs"][0]["checkpoints"][1]["test_loss"]
+    )
+    tampered_ckpt["derived"] = c3.derive_train(tampered_ckpt)
+    forged_summary = copy.deepcopy(found["summary"])
+    forged_summary["ckpt"] = c3._train_section("ckpt", tampered_ckpt)
+    with pytest.raises(ValueError, match="canonical file"):
+        c3.validate_results(forged_summary, canonical=True, sources={**sources, "ckpt": tampered_ckpt})
