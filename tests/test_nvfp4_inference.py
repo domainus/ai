@@ -138,6 +138,65 @@ def test_huge_and_tiny_magnitudes(magnitude):
         assert torch.isfinite(a.global_scale)
 
 
+@needs_fp4
+@pytest.mark.parametrize("rotation", ROTS)
+@pytest.mark.parametrize("tiny", (2**-149, 2**-145, 2**-140, 2**-138, 2**-137, 2**-126))
+def test_subnormal_fp32_activations_produce_finite_gemm_outputs(tiny, rotation):
+    x = torch.full((17, 96), tiny, device="cuda", dtype=torch.float32)
+    x[0, :16] = 0.0
+    angles, tables = _args(rotation, 96, seed=7)
+    ref = nb.quantize_activation_ref(x, rotation, angles)
+    got = nb.quantize_activation(x, rotation, tables)
+    _assert_same(got, ref)
+    assert torch.isfinite(got.global_scale) and got.global_scale.item() > 0.0
+    assert not (got.scale.view(torch.uint8) == 0x7F).any()
+    assert torch.isfinite(nb.dequantize(got, 17, 96)).all()
+    layer = nb.NVFP4Linear.from_weight(torch.ones(48, 96, device="cuda"), rotation, angles)
+    out = layer(x)
+    assert torch.isfinite(out).all() and not out.isnan().any()
+
+
+@needs_cuda
+def test_strided_and_invalid_butterfly_tables():
+    torch.manual_seed(42)
+    x = torch.randn(17, 96, device="cuda")
+    angles = torch.randn(6, 4, 8, device="cuda")
+    tables = nb.butterfly_tables(angles)
+    strided = tuple(torch.stack((t, torch.zeros_like(t)), -1)[..., 0] for t in tables)
+    assert all(not t.is_contiguous() and torch.equal(a, b) for t, a, b in zip(strided, tables, strided))
+    _assert_same(nb.quantize_activation(x, "adaptive_butterfly_b16", strided),
+                 nb.quantize_activation(x, "adaptive_butterfly_b16", tables))
+
+    pr, pc = nb.scale_layout(17, 96)
+    ws_a = torch.empty(nb.MAX_PARTIALS, device="cuda")
+    ws_b = torch.empty(nb.MAX_PARTIALS, device="cuda")
+    n_a = nb.launch_amax(x, ws_a, "adaptive_butterfly_b16", tables)
+    n_b = nb.launch_amax(x, ws_b, "adaptive_butterfly_b16", strided)
+    assert n_a == n_b and torch.equal(ws_a[:n_a], ws_b[:n_b])
+    p_a = torch.empty((17, 48), dtype=torch.uint8, device="cuda")
+    s_a = torch.empty(pr * pc, dtype=torch.float8_e4m3fn, device="cuda")
+    gs_a = torch.empty((), device="cuda")
+    p_b = torch.empty_like(p_a)
+    s_b = torch.empty_like(s_a)
+    gs_b = torch.empty_like(gs_a)
+    nb.launch_quant(x, p_a, s_a, gs_a, rotation="adaptive_butterfly_b16", tables=tables, workspace=ws_a, n_part=n_a)
+    nb.launch_quant(x, p_b, s_b, gs_b, rotation="adaptive_butterfly_b16", tables=strided, workspace=ws_b, n_part=n_b)
+    assert torch.equal(p_a, p_b) and torch.equal(s_a.view(torch.uint8), s_b.view(torch.uint8))
+    assert torch.equal(gs_a.view(torch.int32), gs_b.view(torch.int32))
+
+    cos, sin = tables
+    for bad in (
+        (cos,),
+        (cos, sin[:, :2, :]),
+        (cos.bfloat16(), sin.bfloat16()),
+        (cos, sin.half()),
+        (cos.cpu(), sin.cpu()),
+        (cos, sin.cpu()),
+    ):
+        with pytest.raises(ValueError):
+            nb.quantize_activation(x, "adaptive_butterfly_b16", bad)
+
+
 @needs_cuda
 def test_static_scale_saturates_and_tiny_static_scale():
     x = torch.randn(64, 256, device="cuda") * 4
@@ -370,14 +429,74 @@ def test_cli_output_guard_protects_canonical_artifact(tmp_path, monkeypatch):
     assert bench.parse_args(["--quick"]).output == bench.QUICK_OUTPUT
     custom = tmp_path / "sub.json"
     assert bench.parse_args(["--steps", "10", "--output", str(custom)]).output == custom
+    other_checkout_canonical = tmp_path / "other_checkout" / "results" / bench.CANONICAL_OUTPUT.name
+    alias = tmp_path / "alias.json"
+    alias.symlink_to(other_checkout_canonical)
     for argv in (
         ["--quick", "--output", str(bench.CANONICAL_OUTPUT)],
         ["--steps", "10"],
         ["--parts", "A"],
-        ["--rounds", "2", "--output", str(bench.CANONICAL_OUTPUT)],
+        ["--parts", "A", "--output", str(other_checkout_canonical)],
+        ["--parts", "A", "--output", str(alias)],
+        ["--squares", "1", "--output", str(bench.CANONICAL_OUTPUT)],
+        ["--device", "cpu", "--output", str(bench.CANONICAL_OUTPUT)],
         ["--no-verify", "--output", str(bench.CANONICAL_OUTPUT)],
         ["--max-eval-windows", "8"],
     ):
         with pytest.raises(SystemExit) as exc:
             bench.main(argv)
         assert exc.value.code == 2
+
+
+@needs_fp4
+def test_quick_benchmark_persists_recomputable_raw_samples_and_val_selection(tmp_path):
+    import json
+    import numpy as np
+
+    out_path = tmp_path / "q.json"
+    payload = bench.run_experiment(bench.parse_args(["--quick", "--parts", "AB", "--silent", "--output", str(out_path)]))
+    bench.validate_results(payload, parts="AB")
+
+    for row in payload["part_a"]["shapes"]:
+        assert row["eager_williams_orders"] and row["cuda_graph_williams_orders"]
+        for mode in ("eager", "cuda_graph"):
+            for dist_pair in row[mode].values():
+                for kind, dist in (("gpu", dist_pair["gpu"]), ("wall", dist_pair["wall"])):
+                    samples = dist["samples_ms"]
+                    assert len(samples) == dist["rounds"]
+                    q1, mid, q3 = np.quantile(samples, [0.25, 0.5, 0.75])
+                    assert abs(dist["median_ms"] - float(mid)) < 1e-12
+                    assert abs(dist["iqr_ms"] - float(q3 - q1)) < 1e-12
+                    assert abs(dist["min_ms"] - float(min(samples))) < 1e-12
+                    assert abs(dist["max_ms"] - float(max(samples))) < 1e-12
+                    assert abs(dist["mean_ms"] - float(np.mean(samples))) < 1e-12
+                    if kind == "gpu":
+                        for ev, mean_ms in zip(dist["event_samples_ms"], samples):
+                            assert abs(sum(ev) / len(ev) - mean_ms) < 1e-12
+
+    for model_row in payload["part_b"]["models"].values():
+        assert model_row["williams_orders"]
+        for dist_pair in model_row["timing"].values():
+            for ev, mean_ms in zip(dist_pair["gpu"]["event_samples_ms"], dist_pair["gpu"]["samples_ms"]):
+                assert abs(sum(ev) / len(ev) - mean_ms) < 1e-12
+
+    encoded = bench._dumps_json(payload)
+    assert json.loads(encoded) == payload
+
+    # Selection must use val.bin, while test.bin remains reported separately.
+    fake_c = {
+        "baseline_val": {"nll": 5.0, "ppl": math.exp(5.0), "tokens": 1024},
+        "baseline_test": {"nll": 5.0, "ppl": math.exp(5.0), "tokens": 1024},
+        "grid": [
+            {"method": "rtn", "mode": "w4a4_hw_dynamic", "val_nll": 5.05, "val_ppl": math.exp(5.05),
+             "val_delta_nll": 0.05, "val_relative_delta_ppl_pct": 5.1, "test_nll": 5.20, "test_ppl": math.exp(5.20),
+             "delta_nll": 0.20, "relative_delta_ppl_pct": 22.1},
+            {"method": "gptq", "mode": "w4a4_hw_dynamic", "val_nll": 5.15, "val_ppl": math.exp(5.15),
+             "val_delta_nll": 0.15, "val_relative_delta_ppl_pct": 16.2, "test_nll": 5.02, "test_ppl": math.exp(5.02),
+             "delta_nll": 0.02, "relative_delta_ppl_pct": 2.0},
+        ],
+    }
+    part_c_summary = bench.summarize({"part_c": fake_c})["part_c"]
+    assert part_c_summary["best_w4a4_hw_dynamic_by_val"] == "rtn"
+    assert part_c_summary["best_w4a4_hw_dynamic_by_test"] == "gptq"
+    assert part_c_summary["best_w4a4_hw_dynamic"] == "rtn"

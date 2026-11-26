@@ -188,10 +188,15 @@ def unpack_e2m1(packed: Tensor) -> Tensor:
 # Group quantizers
 # ======================================================================================
 def nvfp4_global_scale(W: Tensor) -> Tensor:
-    """FP32 per-tensor scale amax / (6 * 448) over the last two dimensions, shape (..., 1, 1)."""
+    """FP32 per-tensor scale amax / (6 * 448) over the last two dimensions, shape (..., 1, 1).
+
+    Zero, NaN, and extreme subnormal tensors whose amax / (6 * 448) underflows to 0.0 fall back
+    to 1.0, preventing 0 / 0 -> NaN E4M3 block scales on zero groups.
+    """
     amax = W.detach().abs().amax(dim=(-2, -1), keepdim=True).float()
     # Tensor divisor: CUDA divides by a Python scalar via its reciprocal, which is not exact IEEE division.
-    return torch.where(amax > 0, amax / torch.full_like(amax, E2M1_MAX * E4M3_MAX), torch.ones_like(amax))
+    raw = amax / torch.full_like(amax, E2M1_MAX * E4M3_MAX)
+    return torch.where(raw > 0, raw, torch.ones_like(amax))
 
 
 def mxfp4_exponent(amax: Tensor) -> Tensor:

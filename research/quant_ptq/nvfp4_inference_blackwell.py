@@ -152,7 +152,8 @@ def _quant_kernel(x_ptr, q_ptr, s_ptr, gs_ptr, part_ptr, cos_ptr, sin_ptr, M, K,
     if DYNAMIC:
         p = tl.arange(0, PBLOCK)
         amax = tl.reduce(tl.load(part_ptr + p, mask=p < n_part, other=0.0), None, _nanmax)
-        gs = tl.where(amax > 0, tl.div_rn(amax, 2688.0), 1.0)  # amax / (6 * 448); NaN or 0 -> 1
+        raw_gs = tl.div_rn(amax, 2688.0)  # amax / (6 * 448)
+        gs = tl.where(raw_gs > 0, raw_gs, 1.0)  # 0, underflowing subnormal, or NaN -> 1
         if (pid_m == 0) & (pid_g == 0):
             tl.store(gs_ptr, gs)
     else:
@@ -243,7 +244,7 @@ def butterfly_tables(angles: Tensor) -> tuple[Tensor, Tensor]:
     return angles.cos(), angles.sin()
 
 
-def _check(x: Tensor, rotation: str, tables) -> tuple[int, int]:
+def _check(x: Tensor, rotation: str, tables) -> tuple[int, int, tuple[Tensor, Tensor] | None]:
     if x.ndim != 2 or not x.is_cuda or x.dtype not in (torch.float32, torch.bfloat16, torch.float16):
         raise ValueError("Expected a CUDA (M, K) float32, bfloat16 or float16 tensor")
     M, K = x.shape
@@ -252,9 +253,17 @@ def _check(x: Tensor, rotation: str, tables) -> tuple[int, int]:
     if rotation not in ROTATIONS:
         raise ValueError(f"Unknown rotation {rotation!r}; expected one of {tuple(ROTATIONS)}")
     if rotation == "adaptive_butterfly_b16":
-        if tables is None or tables[0].shape != (K // 16, 4, 8):
-            raise ValueError("adaptive_butterfly_b16 needs (cos, sin) tables of shape (K // 16, 4, 8)")
-    return M, K
+        if not isinstance(tables, (tuple, list)) or len(tables) != 2:
+            raise ValueError("adaptive_butterfly_b16 needs a (cos, sin) pair of CUDA float32 tables")
+        cos, sin = tables
+        expected = (K // 16, 4, 8)
+        for name, tbl in (("cos", cos), ("sin", sin)):
+            if not isinstance(tbl, Tensor) or tbl.shape != expected:
+                raise ValueError(f"adaptive_butterfly_b16 {name} table must have shape {expected}")
+            if tbl.dtype != torch.float32 or tbl.device != x.device:
+                raise ValueError(f"adaptive_butterfly_b16 {name} table must be float32 on {x.device}")
+        return M, K, (cos.contiguous(), sin.contiguous())
+    return M, K, None
 
 
 def _amax(x, M, K, workspace, rot, tables) -> int:
@@ -282,7 +291,7 @@ def _quant(x, M, K, packed_u8, scale, gs, workspace, n_part, rot, tables) -> Non
 
 def launch_amax(x: Tensor, workspace: Tensor, rotation: str = "none", tables=None) -> int:
     """Pass 1 into ``workspace`` (>= MAX_PARTIALS + 1 float32). Returns the number of partials."""
-    M, K = _check(x, rotation, tables)
+    M, K, tables = _check(x, rotation, tables)
     return _amax(x, M, K, workspace, rotation, tables)
 
 
@@ -293,7 +302,7 @@ def launch_quant(x: Tensor, packed: Tensor, scale: Tensor, global_scale: Tensor,
     With ``workspace`` (dynamic) the kernel reduces its first ``n_part`` partials and writes the
     tensor scale to ``global_scale``; without it, ``global_scale`` is read (static).
     """
-    M, K = _check(x, rotation, tables)
+    M, K, tables = _check(x, rotation, tables)
     _quant(x, M, K, packed.view(torch.uint8), scale.view(torch.float8_e4m3fn), global_scale, workspace, n_part,
            rotation, tables)
 
@@ -317,7 +326,7 @@ def _quantize(x: Tensor, M: int, K: int, rotation: str, tables, global_scale: Te
 def quantize_activation(x: Tensor, rotation: str = "none", tables=None,
                         global_scale: Tensor | None = None) -> NVFP4Activation:
     """``F.scaled_mm``-ready NVFP4 operands of ``x`` (M, K). Static mode when ``global_scale`` is given."""
-    M, K = _check(x, rotation, tables)
+    M, K, tables = _check(x, rotation, tables)
     if global_scale is not None:
         global_scale = global_scale.reshape(())
         if global_scale.dtype != torch.float32 or global_scale.device != x.device:

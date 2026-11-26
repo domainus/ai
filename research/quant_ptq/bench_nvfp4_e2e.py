@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import math
 import os
@@ -43,7 +44,7 @@ from research.quant_ptq import micro_rotated_ptq as q
 from research.quant_ptq import nvfp4_inference_blackwell as nb
 
 ROOT = Path(__file__).resolve().parents[2]
-SCHEMA_VERSION = "cycle4_c4_02.v1"
+SCHEMA_VERSION = "cycle4_c4_02.v2"
 CANONICAL_OUTPUT = ROOT / "results" / "cycle4_c4_02_nvfp4_e2e.json"
 QUICK_OUTPUT = ROOT / "results" / "cycle4_c4_02_nvfp4_e2e_quick.json"
 FMT = q.FORMATS["nvfp4_g16"]
@@ -86,22 +87,26 @@ def williams_square(n: int) -> list[list[int]]:
 def _stats(values: list[float]) -> dict:
     q1, mid, q3 = np.quantile(values, [0.25, 0.5, 0.75])
     return {"median_ms": float(mid), "iqr_ms": float(q3 - q1), "min_ms": float(min(values)),
-            "max_ms": float(max(values)), "mean_ms": float(np.mean(values)), "rounds": len(values)}
+            "max_ms": float(max(values)), "mean_ms": float(np.mean(values)), "rounds": len(values),
+            "samples_ms": [float(v) for v in values]}
 
 
 def williams_timing(functions: dict, *, squares: int, iters: int, flush: Tensor, warmup: int = 3,
-                    wall_iters: int = 2) -> dict:
+                    wall_iters: int = 2) -> tuple[dict, list[list[str]]]:
     """Per method: CUDA-event ms (mean of ``iters`` flushed samples per round) and host wall ms."""
     names = list(functions)
     square = williams_square(len(names))
-    gpu, wall = {n: [] for n in names}, {n: [] for n in names}
+    gpu, gpu_events, wall = {n: [] for n in names}, {n: [] for n in names}, {n: [] for n in names}
+    orders = []
     for fn in functions.values():
         for _ in range(warmup):
             fn()
     torch.cuda.synchronize()
     for r in range(squares * len(square)):
-        for index in square[r % len(square)]:
-            name, fn = names[index], functions[names[index]]
+        row_order = [names[i] for i in square[r % len(square)]]
+        orders.append(row_order)
+        for name in row_order:
+            fn = functions[name]
             fn()
             pairs = []
             for _ in range(iters):
@@ -112,7 +117,9 @@ def williams_timing(functions: dict, *, squares: int, iters: int, flush: Tensor,
                 end.record()
                 pairs.append((start, end))
             torch.cuda.synchronize()
-            gpu[name].append(sum(s.elapsed_time(e) for s, e in pairs) / iters)
+            ev = [float(s.elapsed_time(e)) for s, e in pairs]
+            gpu_events[name].append(ev)
+            gpu[name].append(sum(ev) / iters)
             for _ in range(wall_iters):
                 flush.zero_()
                 torch.cuda.synchronize()
@@ -120,7 +127,8 @@ def williams_timing(functions: dict, *, squares: int, iters: int, flush: Tensor,
                 fn()
                 torch.cuda.synchronize()
                 wall[name].append((time.perf_counter() - began) * 1e3)
-    return {n: {"gpu": _stats(gpu[n]), "wall": _stats(wall[n])} for n in names}
+    return ({n: {"gpu": {**_stats(gpu[n]), "event_samples_ms": gpu_events[n]}, "wall": _stats(wall[n])}
+             for n in names}, orders)
 
 
 def capture(fn):
@@ -173,19 +181,20 @@ def part_a_shape(device: torch.device, M: int, N: int, K: int, *, squares: int, 
         "nvfp4_e2e_triton_bfly_b16": lambda: layers["bfly_b16"](x),
         "nvfp4_e2e_triton_had_b16_static_gs": lambda: layers["had_b16_static_gs"](x),
     }
-    # Stage kernels on preallocated buffers (the module allocates one buffer per call).
+    # Stage kernels on preallocated per-rotation workspaces (the module allocates one buffer per call).
     pr, pc = nb.scale_layout(M, K)
     packed = torch.empty(M, K // 2, dtype=torch.uint8, device=device)
     scale = torch.empty(pr * pc, dtype=torch.float8_e4m3fn, device=device)
-    partials = torch.empty(nb.MAX_PARTIALS, device=device)
+    amax_ws = {key: torch.empty(nb.MAX_PARTIALS, device=device) for key in rot_name}
+    quant_ws = {key: torch.empty(nb.MAX_PARTIALS, device=device) for key in rot_name}
     gs = torch.empty((), device=device)
     stages = {}
     for key, rot in rot_name.items():
         tables = layers[key].tables()
-        n_part = nb.launch_amax(x, partials, rot, tables)
-        stages[f"stage_amax_{key}"] = lambda rot=rot, tables=tables: nb.launch_amax(x, partials, rot, tables)
-        stages[f"stage_quant_{key}"] = lambda rot=rot, tables=tables, n=n_part: nb.launch_quant(
-            x, packed, scale, gs, rotation=rot, tables=tables, workspace=partials, n_part=n)
+        n_part = nb.launch_amax(x, quant_ws[key], rot, tables)
+        stages[f"stage_amax_{key}"] = lambda rot=rot, tables=tables, ws=amax_ws[key]: nb.launch_amax(x, ws, rot, tables)
+        stages[f"stage_quant_{key}"] = lambda rot=rot, tables=tables, ws=quant_ws[key], n=n_part: nb.launch_quant(
+            x, packed, scale, gs, rotation=rot, tables=tables, workspace=ws, n_part=n)
     stages["stage_quant_had_b16_static_gs"] = lambda: nb.launch_quant(x, packed, scale, static_gs,
                                                                       rotation="hadamard_b16")
     functions = {**methods, **stages}
@@ -202,7 +211,7 @@ def part_a_shape(device: torch.device, M: int, N: int, K: int, *, squares: int, 
         checks[f"{key}_rel_err_vs_bf16_exact"] = _rel(y, exact)
     del exact
 
-    eager = williams_timing(functions, squares=squares, iters=iters, flush=flush)
+    eager, eager_orders = williams_timing(functions, squares=squares, iters=iters, flush=flush)
     graphs, graph_errors = {}, {}
     for name, fn in functions.items():
         try:
@@ -210,10 +219,11 @@ def part_a_shape(device: torch.device, M: int, N: int, K: int, *, squares: int, 
         except Exception as error:  # noqa: BLE001 - record why a method cannot be captured
             graph_errors[name] = f"{type(error).__name__}: {str(error).splitlines()[0][:200]}"
             torch.cuda.synchronize()
-    graphed = williams_timing(graphs, squares=squares, iters=iters, flush=flush)
+    graphed, graph_orders = williams_timing(graphs, squares=squares, iters=iters, flush=flush)
     flops = 2.0 * M * N * K
     row = {"m": M, "n": N, "k": K, "label": PART_A_LABELS.get((M, N, K), ""), "checks": checks,
-           "graph_capture_errors": graph_errors, "eager": eager, "cuda_graph": graphed}
+           "graph_capture_errors": graph_errors, "eager_williams_orders": eager_orders,
+           "cuda_graph_williams_orders": graph_orders, "eager": eager, "cuda_graph": graphed}
     summary = {}
     for mode, timing in (("eager", eager), ("cuda_graph", graphed)):
         if "bf16_cublas" not in timing:
@@ -303,7 +313,7 @@ def part_b(device: torch.device, models: dict, *, squares: int, iters: int, flus
         del reference
         for key in ("bf16_eager", "nvfp4_triton_none", "nvfp4_triton_had_b16"):
             functions[key + "_graph"] = capture(functions[key])
-        timing = williams_timing(functions, squares=squares, iters=iters, flush=flush, wall_iters=1)
+        timing, orders = williams_timing(functions, squares=squares, iters=iters, flush=flush, wall_iters=1)
         tokens_per_call = batch * config.sequence_length
         table = {}
         base_eager = timing["bf16_eager"]["gpu"]["median_ms"]
@@ -318,7 +328,8 @@ def part_b(device: torch.device, models: dict, *, squares: int, iters: int, flus
         rows[name] = {"config": asdict(config), "batch": batch, "tokens_per_call": tokens_per_call,
                       "linear_parameters": linear_params,
                       "total_parameters": sum(p.numel() for p in model.parameters()),
-                      "compile_seconds": compile_seconds, "checks": checks, "timing": timing, "summary": table}
+                      "compile_seconds": compile_seconds, "checks": checks, "williams_orders": orders,
+                      "timing": timing, "summary": table}
         log(f"  B {name}: " + "  ".join(f"{k} {v['ms']:.3f}" for k, v in table.items()))
         del model, compiled, variants, functions
         torch._dynamo.reset()
@@ -390,6 +401,17 @@ class EmulatedW4A4Linear(nn.Module):
             return (values @ self.weight_values.T).to(torch.bfloat16).reshape(*lead, -1)
 
 
+def _checkpoint_sha256(model: nn.Module) -> str:
+    digest = hashlib.sha256()
+    for name, tensor in sorted(model.state_dict().items()):
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        arr = tensor.detach().float().contiguous().cpu().numpy()
+        digest.update(str(arr.shape).encode("utf-8"))
+        digest.update(arr.tobytes())
+    return digest.hexdigest()
+
+
 def part_c(args, device: torch.device, log) -> dict:
     t0 = time.perf_counter()
     data = q.load_data(args.data_dir, verify=not args.no_verify, expected=None if args.no_verify else q.EXPECTED_SHA256)
@@ -397,16 +419,20 @@ def part_c(args, device: torch.device, log) -> dict:
     log(f"  C training {args.preset} muon_ss3_54 for {args.steps} steps (seed {args.seed})")
     model, training = q.train_model("muon_ss3_54", config, data, device, steps=args.steps, seed=args.seed,
                                     warmup_steps=args.warmup_steps, eval_tokens=args.harness_eval_tokens)
+    checkpoint_sha256 = _checkpoint_sha256(model)
     log(f"  C trained in {time.perf_counter() - t0:.0f}s, last loss {training['last_train_loss']:.4f}")
+    val = data.splits["val"]
     test = data.splits["test"]
     seq, batch = config.sequence_length, config.micro_batch
     calibration = q.calibration_windows(data, args.calibration_sequences, seq, args.calibration_seed)
 
-    def evaluate():
-        return q.evaluate_split(model, test, seq, batch, device, args.max_eval_windows)
+    def evaluate_both():
+        return (q.evaluate_split(model, val, seq, batch, device, args.max_eval_windows),
+                q.evaluate_split(model, test, seq, batch, device, args.max_eval_windows))
 
-    baseline = evaluate()
-    log(f"  C BF16 test NLL {baseline['nll']:.4f} PPL {baseline['ppl']:.3f} on {baseline['tokens']:,} tokens")
+    baseline_val, baseline_test = evaluate_both()
+    log(f"  C BF16 val NLL {baseline_val['nll']:.4f} PPL {baseline_val['ppl']:.3f} ({baseline_val['tokens']:,} tok) | "
+        f"test NLL {baseline_test['nll']:.4f} PPL {baseline_test['ppl']:.3f} ({baseline_test['tokens']:,} tok)")
     H = q.collect_hessians(model, calibration["array"], batch, device)
     linears = q.quantized_linears(model)
     kinds = {k: [f"blocks.{i}.{k}" for i in range(config.layers)] for k in q.LINEAR_KINDS}
@@ -420,13 +446,19 @@ def part_c(args, device: torch.device, log) -> dict:
         rotations[(kind, "adaptive_butterfly_b16")], butterfly_fits[kind] = q.make_rotation(
             "adaptive_butterfly_b16", W[kind], FMT, butterfly_steps=args.butterfly_steps)
 
-    def row(mode: str, method: str, result: dict, seconds: float, **extra) -> dict:
-        if result["tokens"] != baseline["tokens"]:
+    def row(mode: str, method: str, evals: tuple[dict, dict], seconds: float, **extra) -> dict:
+        val_res, test_res = evals
+        if val_res["tokens"] != baseline_val["tokens"] or test_res["tokens"] != baseline_test["tokens"]:
             raise RuntimeError("Evaluation token count changed between runs")
-        return {"method": method, "mode": mode, "test_nll": result["nll"], "test_ppl": result["ppl"],
-                "test_tokens": result["tokens"], "delta_nll": result["nll"] - baseline["nll"],
-                "delta_ppl": result["ppl"] - baseline["ppl"],
-                "relative_delta_ppl_pct": 100.0 * (result["ppl"] / baseline["ppl"] - 1.0), "seconds": seconds, **extra}
+        return {"method": method, "mode": mode,
+                "val_nll": val_res["nll"], "val_ppl": val_res["ppl"], "val_tokens": val_res["tokens"],
+                "val_delta_nll": val_res["nll"] - baseline_val["nll"],
+                "val_relative_delta_ppl_pct": 100.0 * (val_res["ppl"] / baseline_val["ppl"] - 1.0),
+                "test_nll": test_res["nll"], "test_ppl": test_res["ppl"], "test_tokens": test_res["tokens"],
+                "delta_nll": test_res["nll"] - baseline_test["nll"],
+                "delta_ppl": test_res["ppl"] - baseline_test["ppl"],
+                "relative_delta_ppl_pct": 100.0 * (test_res["ppl"] / baseline_test["ppl"] - 1.0),
+                "seconds": seconds, **extra}
 
     grid = []
     for method in PART_C_METHODS:
@@ -455,9 +487,15 @@ def part_c(args, device: torch.device, log) -> dict:
                 hardware[name] = nb.NVFP4Linear.from_encoding(codes[i], blocks[i], scales[i], rotation=rotation,
                                                               angles=angles)
         quant_seconds = time.perf_counter() - t1
-        # The hardware weights decode exactly to the fake-quant weights in rotated coordinates.
-        weights_exact = all(torch.equal(nb.dequantized_weight(hardware[names[0]]), rotated[kind][0])
-                            for kind, names in kinds.items())
+        # Every hardware weight matrix decodes bit-exact to fake-quant weights in rotated coordinates.
+        checked = 0
+        weights_exact = True
+        for kind, names in kinds.items():
+            for i, name in enumerate(names):
+                checked += 1
+                if not torch.equal(nb.dequantized_weight(hardware[name]).view(torch.int32),
+                                   rotated[kind][i].contiguous().view(torch.int32)):
+                    weights_exact = False
 
         # W4A16 fake quant (dequantized weights, BF16 autocast activations), as in Cycle 3 T5-01.
         t1 = time.perf_counter()
@@ -465,21 +503,22 @@ def part_c(args, device: torch.device, log) -> dict:
             for kind, names in kinds.items():
                 for i, name in enumerate(names):
                     linears[name].weight.copy_(effective[kind][i])
-        result = evaluate()
+        evals = evaluate_both()
         with torch.no_grad():
             for kind, names in kinds.items():
                 for i, name in enumerate(names):
                     linears[name].weight.copy_(W[kind][i])
-        grid.append(row("w4a16_fakequant", method, result, time.perf_counter() - t1,
+        grid.append(row("w4a16_fakequant", method, evals, time.perf_counter() - t1,
                         quantize_seconds=quant_seconds, gptq_damping_max=max(damping) if damping else None,
-                        hw_weights_decode_to_fakequant_weights=weights_exact))
+                        hw_weights_decode_to_fakequant_weights=weights_exact,
+                        hw_weights_checked_matrices=checked))
 
         # Hardware W4A4, dynamic per-tensor activation scale.
         t1 = time.perf_counter()
         previous = _swap(model, hardware)
-        result = evaluate()
+        evals = evaluate_both()
         _swap(model, previous)
-        grid.append(row("w4a4_hw_dynamic", method, result, time.perf_counter() - t1))
+        grid.append(row("w4a4_hw_dynamic", method, evals, time.perf_counter() - t1))
 
         # Hardware W4A4, static activation scales calibrated on the train.bin calibration windows.
         t1 = time.perf_counter()
@@ -489,9 +528,9 @@ def part_c(args, device: torch.device, log) -> dict:
         for name, layer in hardware.items():
             layer.act_global_scale = static[name]
         previous = _swap(model, hardware)
-        result = evaluate()
+        evals = evaluate_both()
         _swap(model, previous)
-        grid.append(row("w4a4_hw_static", method, result, time.perf_counter() - t1,
+        grid.append(row("w4a4_hw_static", method, evals, time.perf_counter() - t1,
                         static_scale_calibration="train.bin calibration windows, BF16 model, max |x R^T| / 2688",
                         static_global_scale_range=[min(v.item() for v in static.values()),
                                                    max(v.item() for v in static.values())]))
@@ -501,20 +540,21 @@ def part_c(args, device: torch.device, log) -> dict:
                 layer.act_global_scale = None
             t1 = time.perf_counter()
             previous = _swap(model, {n: EmulatedW4A4Linear(m) for n, m in hardware.items()})
-            result = evaluate()
+            evals = evaluate_both()
             _swap(model, previous)
-            grid.append(row("w4a4_emulated_fp32_dynamic", method, result, time.perf_counter() - t1))
+            grid.append(row("w4a4_emulated_fp32_dynamic", method, evals, time.perf_counter() - t1))
         for r in grid:
             if r["method"] == method:
-                log(f"  C {method:<28} {r['mode']:<26} PPL {r['test_ppl']:9.3f} dNLL {r['delta_nll']:+.4f} "
-                    f"({r['relative_delta_ppl_pct']:+.2f}%)")
+                log(f"  C {method:<28} {r['mode']:<26} val_dNLL {r['val_delta_nll']:+.4f} "
+                    f"test_PPL {r['test_ppl']:9.3f} test_dNLL {r['delta_nll']:+.4f} ({r['relative_delta_ppl_pct']:+.2f}%)")
         del hardware, effective, rotated
         torch.cuda.empty_cache()
-    return {"preset": args.preset, "config": asdict(config), "training": training, "baseline_test": baseline,
+    return {"preset": args.preset, "config": asdict(config), "training": training,
+            "checkpoint_sha256": checkpoint_sha256, "baseline_val": baseline_val, "baseline_test": baseline_test,
             "calibration": {k: v for k, v in calibration.items() if k != "array"},
             "butterfly_fits": butterfly_fits, "grid": grid, "seconds": time.perf_counter() - t0,
             "data": {**data.summary(), "directory": str(args.data_dir), "sha256_verified": not args.no_verify,
-                     "evaluation_split": "test", "calibration_split": "train",
+                     "selection_split": "val", "evaluation_split": "test", "calibration_split": "train",
                      "static_scale_split": "train", "test_used_for": "evaluation only"}}
 
 
@@ -551,6 +591,9 @@ def kernel_parity(device: torch.device, quick: bool) -> dict:
 # ======================================================================================
 def run_experiment(args) -> dict:
     device = torch.device(args.device)
+    if getattr(args, "output", None) is not None and _targets_canonical_filename(args.output) and (
+            not torch.cuda.is_available() or device.type != "cuda" or torch.cuda.get_device_capability(device) < (12, 0)):
+        raise RuntimeError("Canonical NVFP4 artifact requires a Blackwell (sm_120+) CUDA device")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
@@ -612,13 +655,21 @@ def summarize(payload: dict) -> dict:
                                 for k, v in m["summary"].items()} for name, m in payload["part_b"]["models"].items()}
     if "part_c" in payload:
         c = payload["part_c"]
-        out["part_c"] = {"baseline_test_nll": c["baseline_test"]["nll"], "baseline_test_ppl": c["baseline_test"]["ppl"],
-                         "test_tokens": c["baseline_test"]["tokens"],
-                         "table": {f"{r['method']}/{r['mode']}": {k: r[k] for k in ("test_nll", "test_ppl", "delta_nll",
-                                                                                      "relative_delta_ppl_pct")}
-                                   for r in c["grid"]}}
+        out["part_c"] = {
+            "baseline_val_nll": c["baseline_val"]["nll"], "baseline_val_ppl": c["baseline_val"]["ppl"],
+            "val_tokens": c["baseline_val"]["tokens"],
+            "baseline_test_nll": c["baseline_test"]["nll"], "baseline_test_ppl": c["baseline_test"]["ppl"],
+            "test_tokens": c["baseline_test"]["tokens"],
+            "table": {f"{r['method']}/{r['mode']}": {k: r[k] for k in (
+                "val_nll", "val_ppl", "val_delta_nll", "val_relative_delta_ppl_pct",
+                "test_nll", "test_ppl", "delta_nll", "relative_delta_ppl_pct")} for r in c["grid"]},
+        }
         hw = [r for r in c["grid"] if r["mode"] == "w4a4_hw_dynamic"]
-        out["part_c"]["best_w4a4_hw_dynamic"] = min(hw, key=lambda r: r["test_nll"])["method"]
+        best_by_val = min(hw, key=lambda r: r["val_nll"])["method"]
+        best_by_test = min(hw, key=lambda r: r["test_nll"])["method"]
+        out["part_c"]["best_w4a4_hw_dynamic_by_val"] = best_by_val
+        out["part_c"]["best_w4a4_hw_dynamic_by_test"] = best_by_test
+        out["part_c"]["best_w4a4_hw_dynamic"] = best_by_val
     return out
 
 
@@ -634,6 +685,8 @@ def caveats(payload: dict) -> list[str]:
         "bf16_compiled is torch.compile(default); NVFP4 models run eager or as CUDA graphs, not compiled.",
         "CUDA-event resolution on this GPU is about 2 us, so single-call sub-10-us numbers are averages of "
         "quantized samples (mean over iters per round, median over rounds).",
+        "Isolated Part A stage kernels run cold on preallocated buffers, so the sum of stage medians is a "
+        "micro-benchmark breakdown rather than an additive model of end-to-end call time.",
     ]
     rows = payload.get("part_a", {}).get("shapes", [])
     slower = [f"({r['m']},{r['n']},{r['k']})" for r in rows
@@ -642,6 +695,26 @@ def caveats(payload: dict) -> list[str]:
         notes.append("NVFP4 e2e (had_b16, CUDA graph) is slower than BF16 cuBLAS at " + ", ".join(slower)
                      + ": activation quantization and the FP4 GEMM do not amortize at these sizes.")
     return notes
+
+
+def _validate_dist(dist: dict, *, gpu: bool) -> int:
+    samples = dist.get("samples_ms")
+    if not isinstance(samples, list) or not samples or len(samples) != dist["rounds"]:
+        raise ValueError("Missing or mismatched raw timing samples_ms")
+    if gpu:
+        ev_rounds = dist.get("event_samples_ms")
+        if not isinstance(ev_rounds, list) or len(ev_rounds) != dist["rounds"]:
+            raise ValueError("Missing or mismatched event_samples_ms")
+        for ev, mean_ms in zip(ev_rounds, samples):
+            if not ev or abs(sum(ev) / len(ev) - mean_ms) > 1e-12:
+                raise ValueError("GPU round mean does not match event_samples_ms")
+    q1, mid, q3 = np.quantile(samples, [0.25, 0.5, 0.75])
+    expected = {"median_ms": float(mid), "iqr_ms": float(q3 - q1), "min_ms": float(min(samples)),
+                "max_ms": float(max(samples)), "mean_ms": float(np.mean(samples))}
+    for key, want in expected.items():
+        if abs(dist[key] - want) > 1e-12:
+            raise ValueError(f"Timing summary {key} differs from raw samples_ms ({dist[key]} vs {want})")
+    return dist["rounds"]
 
 
 def validate_results(payload: dict, parts: str = "ABC") -> None:
@@ -653,12 +726,37 @@ def validate_results(payload: dict, parts: str = "ABC") -> None:
             raise ValueError(f"Missing meta key {key!r}")
     if not payload["kernel_parity"]["passed"]:
         raise ValueError(f"Kernel parity failed: {payload['kernel_parity']['bitwise_failures'][:5]}")
+    if "A" in parts:
+        for row in payload["part_a"]["shapes"]:
+            for mode, order_key in (("eager", "eager_williams_orders"), ("cuda_graph", "cuda_graph_williams_orders")):
+                orders = row.get(order_key, [])
+                rounds = {m: (_validate_dist(t["gpu"], gpu=True), _validate_dist(t["wall"], gpu=False))
+                          for m, t in row[mode].items()}
+                if not orders or any(r != len(orders) or w != 2 * len(orders) for r, w in rounds.values()):
+                    raise ValueError(f"Part A {mode} rounds do not match {order_key}")
+    if "B" in parts:
+        for m in payload["part_b"]["models"].values():
+            orders = m.get("williams_orders", [])
+            rounds = {k: (_validate_dist(t["gpu"], gpu=True), _validate_dist(t["wall"], gpu=False))
+                      for k, t in m["timing"].items()}
+            if not orders or any(r != len(orders) or w != len(orders) for r, w in rounds.values()):
+                raise ValueError("Part B rounds do not match williams_orders")
     if "C" in parts:
         c = payload["part_c"]
-        if c["calibration"]["split"] != "train" or c["data"]["evaluation_split"] != "test":
-            raise ValueError("Calibration must use train.bin and evaluation test.bin")
-        if any(r["test_tokens"] != c["baseline_test"]["tokens"] for r in c["grid"]):
-            raise ValueError("Every Part C row must use the baseline test tokens")
+        if (c["calibration"]["split"] != "train" or c["data"]["selection_split"] != "val"
+                or c["data"]["evaluation_split"] != "test"):
+            raise ValueError("Calibration must use train.bin, selection val.bin, and evaluation test.bin")
+        if not c.get("checkpoint_sha256"):
+            raise ValueError("Missing Part C checkpoint_sha256")
+        if any(r["val_tokens"] != c["baseline_val"]["tokens"] or r["test_tokens"] != c["baseline_test"]["tokens"]
+               for r in c["grid"]):
+            raise ValueError("Every Part C row must use the baseline val and test tokens")
+        expected_matrices = c["config"]["layers"] * len(q.LINEAR_KINDS)
+        for r in c["grid"]:
+            if r["mode"] == "w4a16_fakequant" and (
+                    not r.get("hw_weights_decode_to_fakequant_weights")
+                    or r.get("hw_weights_checked_matrices") != expected_matrices):
+                raise ValueError("Part C hardware weights must match fake-quant across all matrices")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -685,13 +783,18 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-_CANONICAL = {"parts": "ABC", "squares": 2, "iters": 10, "preset": "50m", "steps": 320, "warmup_steps": 32,
-              "seed": 1, "calibration_sequences": 128, "calibration_seed": 20261126, "max_eval_windows": None,
-              "harness_eval_tokens": 1 << 20, "butterfly_steps": 150, "no_verify": False, "quick": False}
+_CANONICAL = {"device": "cuda", "parts": "ABC", "squares": 2, "iters": 10, "preset": "50m", "steps": 320,
+              "warmup_steps": 32, "seed": 1, "calibration_sequences": 128, "calibration_seed": 20261126,
+              "max_eval_windows": None, "harness_eval_tokens": 1 << 20, "butterfly_steps": 150,
+              "no_verify": False, "quick": False}
 
 
 def _is_canonical_args(args: argparse.Namespace) -> bool:
     return all(getattr(args, k) == v for k, v in _CANONICAL.items())
+
+
+def _targets_canonical_filename(path: Path) -> bool:
+    return path.name == CANONICAL_OUTPUT.name or path.resolve().name == CANONICAL_OUTPUT.name
 
 
 def _resolve_output(args: argparse.Namespace) -> Path:
@@ -703,10 +806,27 @@ def _resolve_output(args: argparse.Namespace) -> Path:
             return CANONICAL_OUTPUT
         raise ValueError(f"Non-canonical run requires an explicit --output path to avoid overwriting "
                          f"{CANONICAL_OUTPUT.name}")
-    if args.output.resolve() == CANONICAL_OUTPUT.resolve() and not canonical:
+    if _targets_canonical_filename(args.output) and not canonical:
         raise ValueError(f"Refusing to overwrite canonical {CANONICAL_OUTPUT.name} from a --quick or "
                          "non-canonical run; choose a different --output path")
     return args.output
+
+
+def _dumps_json(obj, indent: int = 0) -> str:
+    """2-space JSON with leaf primitive lists on one line (strict allow_nan=False)."""
+    if isinstance(obj, dict):
+        if not obj:
+            return "{}"
+        pad = " " * (indent + 2)
+        items = [f"{pad}{json.dumps(k)}: {_dumps_json(v, indent + 2)}" for k, v in obj.items()]
+        return "{\n" + ",\n".join(items) + "\n" + (" " * indent) + "}"
+    if isinstance(obj, list):
+        if not obj or all(not isinstance(x, (dict, list)) for x in obj):
+            return json.dumps(obj, allow_nan=False)
+        pad = " " * (indent + 2)
+        items = [f"{pad}{_dumps_json(v, indent + 2)}" for v in obj]
+        return "[\n" + ",\n".join(items) + "\n" + (" " * indent) + "]"
+    return json.dumps(obj, allow_nan=False)
 
 
 def parse_args(argv: list[str] | None = None):
@@ -739,7 +859,7 @@ def main(argv: list[str] | None = None) -> dict:
     payload = run_experiment(args)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     tmp = args.output.with_suffix(args.output.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, allow_nan=False) + "\n")
+    tmp.write_text(_dumps_json(payload) + "\n")
     tmp.replace(args.output)
     if not args.silent:
         print(f"Wrote {args.output}")
