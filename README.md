@@ -4,6 +4,20 @@ An open, continuously operating autonomous AI research repository investigating 
 
 ---
 
+## Cycle 4 In Progress — `C4-02` Verified & Merged (1238 Passed, 6 Skipped on RTX 5080)
+
+- **`C4-02` (End-to-End Blackwell NVFP4 W4A4 Inference — Online Triton Activation Quantizer, Block-16 Rotation & Real Hardware Perplexity):** Audited live on RTX 5080 (`sm_120`) by **GPT 6.2 Astra (`high`)** (`FAIL -> 7 findings remediated -> PASS — HOLD LIFTED`, [`AUDIT_cycle4_c4_02_gpt62_astra.md`](audits/AUDIT_cycle4_c4_02_gpt62_astra.md)); artifact [`results/cycle4_c4_02_nvfp4_e2e.json`](results/cycle4_c4_02_nvfp4_e2e.json) (`schema_version: cycle4_c4_02.v2`, `69,960` GPU events & `13,404` wall samples persisted, `0` D2H syncs, `216/216` quant parity, `60/60` int32 weight parity across all 5 methods):
+  - **Single-Layer CUDA-Graph (`4×` L2 flush = `268 MB`, BF16 vs E2E NVFP4):**
+    - `(16, 4096, 4096)` (small-batch decode): BF16 `0.0459 ms` (`11.7 TFLOPS`) -> GEMM-only `0.0248 ms` (`21.7 TFLOPS`, `1.853×`) | Triton `none` `0.0287 ms` (`1.602×`, `86.4%` ceiling) | `had_b16` `0.0289 ms` (`1.590×`, `85.8%`) | `bfly_b16` `0.0311 ms` (`1.475×`, `79.6%`) | `had_b16_static_gs` `0.0268 ms` (`1.712×`, `92.4%`).
+    - `(1024, 4096, 4096)`: BF16 `0.3417 ms` (`100.6 TFLOPS`) -> GEMM-only `0.0664 ms` (`517.5 TFLOPS`, `5.146×`) | `none` `0.0859 ms` (`400.0 TFLOPS`, `3.978×`) | `had_b16` `0.0894 ms` (`384.4 TFLOPS`, `3.823×`, `74.3%`) | `bfly_b16` `0.0964 ms` (`356.6 TFLOPS`, `3.546×`) | `had_b16_static_gs` `0.0826 ms` (`415.7 TFLOPS`, `4.134×`, `80.3%`).
+    - `(2048, 8192, 8192)`: BF16 `2.3710 ms` (`115.9 TFLOPS`) -> GEMM-only `0.3661 ms` (`750.9 TFLOPS`, `6.477×`) | `none` `0.4369 ms` (`629.1 TFLOPS`, `5.426×`) | `had_b16` `0.4493 ms` (`611.7 TFLOPS`, `5.277×`, `81.5%`) | `bfly_b16` `0.4724 ms` (`581.9 TFLOPS`, `5.019×`) | `had_b16_static_gs` `0.4184 ms` (`657.0 TFLOPS`, `5.667×`, `87.5%`).
+    - `(1024, 512, 1408)` (*50m MLP down — honest negative caveat*): BF16 `0.0229 ms` beats dynamic `none` (`0.0250 ms`, `0.916×`), `had_b16` (`0.0266 ms`, `0.860×`), and `bfly_b16` (`0.0289 ms`, `0.793×`); `had_b16_static_gs` reaches `0.0225 ms` (`1.016×`).
+  - **Full Transformer Forward (`Part B`, CUDA graph vs `bf16_compiled` / `bf16_eager`):** `50m` `1.060×` (`none`, `11.090 ms`) / `1.008×` (`had_b16`, `11.657 ms` vs `11.752 ms`, `1.260×` vs eager); `120m` `1.265×` (`none`, `8.557 ms`) / `1.209×` (`had_b16`, `8.950 ms` vs `10.824 ms`, `1.451×` vs eager); `w2048_6l` `2.038×` (`none`, `8.226 ms`) / `1.972×` (`had_b16`, `8.500 ms` vs `16.765 ms`, `2.087×` vs eager).
+  - **Real Hardware W4A4 Perplexity (`Part C`, `50m` `muon_ss3_54` 320-step seed-1 checkpoint `bbf39121...`, val selection -> full `test.bin` `1,999,872` tok):** Baseline `val 5.36134` (`PPL 213.010`), `test 5.39647` (`PPL 220.625`). Val-selected **`adaptive_butterfly_b16_gptq`** achieves `test ΔNLL +0.01121` (`+1.127%` PPL, `5.40767` / `223.111`; static `+1.145%`), ahead of unrotated `gptq` (`+1.188%`), `hadamard_b16_gptq` (`+1.232%`, matching FP32 emulation `+1.228%` within `0.00004` NLL), `rtn` (`+1.946%`), and `hadamard_b16_rtn` (`+1.958%`). *Caveats:* single-seed 320-step `50m` model, BF16-calibrated static scales, dynamic W4A4 slower than BF16 at `(1024,512,1408)`.
+- **Active / Queued Cycle 4:** `C4-01b` (iso-loss 3-seed Muon-vs-AdamW PTQ, launching now), `C4-01a` (`>= 20M`-token `120m` transfer), `C4-03` (wide training & `K=2^25`), and `C3-04` (M5 Max open-lid rerun when `Ryan's MacBook Pro` reconnects).
+
+---
+
 ## Cycle 3 Executive Summary (Audited, Remediated & Merged — 1054 Passed, 6 Skipped on RTX 5080)
 
 Cycle 3 merged and adversarially audited five tracks on `bazzite` (`C3-04` on `Ryan's MacBook Pro` remains queued while the laptop is unreachable):
@@ -62,6 +76,9 @@ Sources: [`results/m5_max_dense_cycle2.json`](results/m5_max_dense_cycle2.json),
 
 ## Independent Adversarial Audits (`audits/`)
 
+### Cycle 4
+- **C4-02 (`GPT 6.2 Astra`, live RTX 5080 + re-check, `high`):** [`AUDIT_cycle4_c4_02_gpt62_astra.md`](audits/AUDIT_cycle4_c4_02_gpt62_astra.md) — `FAIL` -> 7 findings remediated -> **`PASS — HOLD LIFTED`** (reproduced `69,960` GPU events & `366` timing distributions `< 3.56e-15 ms`, `18/18` subnormal underflow probes finite, `0` diffs on strided butterfly tables & `12/12` invalid rejections, cross-checkout canonical output + `sm_120+` guard, `300/300` int32 weight checks, `val.bin` selection)
+
 ### Cycle 3
 - **C3-03 (`Claude Opus 5.5`, live RTX 5080, `high`):** [`AUDIT_cycle3_c3_03_claude_opus.md`](audits/AUDIT_cycle3_c3_03_claude_opus.md) — `PASS_WITH_CAVEATS` -> L1/L3/L4 remediated (Triton 3.8 C launcher, tile-norm fusion, `0` D2H syncs, 180/180 bitwise graph overwrites, `SS3_54` `(512,2048)` `0.987×` caveat)
 - **C3-01 (`GPT 6.2 Astra`, CPU, `high`):** [`AUDIT_cycle3_c3_01_gpt62_astra.md`](audits/AUDIT_cycle3_c3_01_gpt62_astra.md) — `PASS_WITH_CAVEATS` -> remediated (`crossover()` exact-tie & canonical output guard; short-budget caveat)
@@ -78,10 +95,13 @@ Sources: [`results/m5_max_dense_cycle2.json`](results/m5_max_dense_cycle2.json),
 ## Reproduction Commands
 
 ```bash
-# Run full verified suite (1054 passed, 6 skipped on Linux RTX 5080)
+# Run full verified suite (1238 passed, 6 skipped on Linux RTX 5080)
 PYTHONPATH=. .venv/bin/pytest -q
 
-# Regenerate daily Cycle 3 HTML infographic
+# Cycle 4 C4-02 end-to-end Blackwell NVFP4 W4A4 inference benchmark
+PYTHONPATH=. .venv/bin/python research/quant_ptq/bench_nvfp4_e2e.py --data-dir artifacts/real_text --output results/cycle4_c4_02_nvfp4_e2e.json
+
+# Regenerate daily Cycle 4 HTML infographic
 PYTHONPATH=. .venv/bin/python reports/generate_infographic.py --date 2026-11-26
 
 # Cycle 3 C3-03 3-clock CUDA-graph & 117-case Tier-1 refresh
