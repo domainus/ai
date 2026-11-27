@@ -259,3 +259,30 @@ Two statements still exceed the evidence. The genuine synthetic quick result sai
 |---|---|
 | `tests/test_nvfp4_inference.py tests/test_c5_03_nvfp4_120m_fusion.py` | 276 passed, 10 warnings, 334.37 s |
 | `tests/test_c5_02_isoloss_ptq_mitigation.py -k test_committed_canonical_artifact` | 3 passed, 97 deselected, 23.72 s |
+
+## Post-Remediation Re-Check (v4)
+
+**PASS — HOLD LIFTED**
+
+All three v3 findings are closed on the NVIDIA GeForce RTX 5080 (sm_120, driver 615.78.08). The committed v2 result at `d5fe951adf1f9a2d8f32937ce6db12edb192643e` passed full offline canonical validation. All live Part C runs used synthetic shards. This review performed no canonical training and did not score the published test shard.
+
+**Scope and provenance.** Relative to v3 audit commit `b48528790ba2817e5654a5414a19ecee2a399187`, remediation commit `a7a5d57380de144ca7220ee749be70839c1eb1ca` changed only the C5-03 benchmark driver and its test file. The next commit changed only the canonical JSON. The four C5-02 summary modules matched the v3 bytes. The whole Blackwell module matched `0df8a0e`. Source slices for `_amax_kernel`, `_quant_kernel`, `_launch`, `_pass1`, `_pass2`, `quantizer_plan` and `NVFP4Linear`, including decorators, also matched `798488e` byte for byte.
+
+| SHA-256 check | Verified value |
+|---|---|
+| Canonical v2 JSON, working file and Git blob at `d5fe951` | `e0e435ef2ea8598df22bace95ab76fd10c43b2ff394bf635ab8d1548d8bcad82` |
+| Source v1 JSON at `726b20c9590aba911361e300e7d2079c7bb55cfa`, measured by `38cef483071d649fc74161b5d00359c7c5ad0927` | `9ed6c9fd3879566f78e943f5aa54657b1f0e1c27e543e3e93f11103413da14ce` |
+| Recorded `source_raw_measurements_sha256`, recomputed v2 `raw_measurements_sha256`, independent v1 and v2 serializations | `bacb1484441a8413315daecb19187528f3bf6900c736813073ad810f0482f5f3` |
+
+The independent check selected the ten raw fields from each result, removed derived Part C analysis, and serialized with sorted keys and compact separators. The serialized bytes were identical.
+
+1. **Canonical output path.** I created links to both `results` and the checkout root, once inside the worktree and once outside it. All four paths identified the real canonical file. Both the canonical measuring parser and the pinned postprocess parser rejected every alias with exit code 2 (8 of 8). Appending only `--output <alias>` to the recorded postprocess command caused full canonical validation to reject each copy (4 of 4). As positive controls, both parsers accepted the direct path and the validator certified the command with that path appended. On a disposable directory layout, the writer rejected all four aliases in both canonical and reserved-name modes (8 of 8), preserving the target bytes each time. The CLI and validator use `_verify_canonical_output_path`. The writer calls the same underlying path and directory-descriptor checks directly.
+2. **Caveats.** A separate `--quick --parts C --seeds 1 2 3 4 5 6 --max-eval-windows 1` run trained six tiny models on synthetic shards. The resulting JSON passed full noncanonical validation with 174 grid rows. The recorded test SHA-256 matched the shard bytes, `4b4c7490e3e3a53f0f236ce93a05b515a0ab20f0d793fa872b07dbdd14d18165`. The canonical test SHA-256 is `4eb46f1424856849d2973923dbf3c886d37eb743cf22053fc7e1eea1f41ab92a`. The quick report explicitly excluded earlier FineWeb-Edu scoring and omitted the “same test.bin” claim. It reported `part_c.analysis is None` and made no sign-flip significance claim. The certified canonical report retained its earlier-scoring disclosure.
+3. **Writer durability.** I selected the failing `fsync` by descriptor type with `fstat`. A regular-file sync error propagated before rename and preserved the old bytes and inode. A directory sync error propagated after the staged file had synced and the rename had completed. The new JSON was readable at the destination with a new inode. Only the destination remained in the directory after each failure. These observations match the docstring. Crash durability after the directory sync error remains uncertain.
+
+**Test runs.** Both suites used `PYTHONPATH=.` and `/home/ryan/Documents/projects/ai/.venv/bin/python`. A temporary pytest hook supplied the synthetic directory and `--no-verify` only to the C5-03 quick fixture. The repository's synthetic generator writes placeholder manifest digests. For the separate six-seed probe, I replaced each placeholder with the independently computed shard hash before launching the driver and checked all three recorded digests afterward. Both runs used 65,536 training tokens and 16,384 tokens in each evaluation split.
+
+| Pytest selection | Result |
+|---|---|
+| `tests/test_nvfp4_inference.py tests/test_c5_03_nvfp4_120m_fusion.py` | 276 passed, 10 warnings, 408.69 s |
+| `tests/test_c5_02_isoloss_ptq_mitigation.py -k test_committed_canonical_artifact` | 3 passed, 97 deselected, 23.10 s |
