@@ -699,6 +699,37 @@ def _hyp_overcount(payload):
     payload["mma"]["hypotheses"][0]["bit_matches"] = payload["mma"]["hypotheses"][0]["cases"] + 1
 
 
+def _refresh_run_config_hash(payload):
+    m = payload["meta"]
+    payload["run_config_hash"] = c5.run_config_hash(
+        payload["quick"], payload["protocol"], m["code_sha256"], m["git_sha"], m["environment"]
+    )
+
+
+def _opus_femtosecond(payload):
+    row = payload["long_k"]["opus_l6"][0]
+    for s in row["samples"]:
+        s["native"]["wall_ms"] = 1e-12
+    row["speedup"] = c5.speedup(row["samples"])
+    row["speedup_paired"] = c5.paired_speedup(row["samples"])
+
+
+def _timing_femtosecond(payload):
+    cell = payload["timing"]["cells"][0]
+    cell["rounds"][0]["native"].update(gpu_ms=1e-12, wall_ms=1e-12)
+    cell["summary"] = c5.timing_summary(cell["rounds"])
+
+
+def _tree_git_sha(payload):
+    payload["meta"]["git_sha"] = "7d960703b674a14d6c173855a76d3e5f9b0ca64a"
+    _refresh_run_config_hash(payload)
+
+
+def _hidden_cuda_env(payload):
+    payload["meta"]["environment"]["env"]["CUDA_VISIBLE_DEVICES"] = ""
+    _refresh_run_config_hash(payload)
+
+
 def _structural_probes(canonical):
     """Astra's validator bypasses (C5-01 audit + re-audit v2, v3, v4): each must be rejected."""
     probes = [
@@ -795,6 +826,12 @@ def _structural_probes(canonical):
         ), "exceeds meta.section_seconds.timing"),
         (lambda p: next(r for r in p["long_k"]["inputs"] if "normal_quality" in r)["normal_quality"].update(
             sigma_min=0.25, sigma_max=1.0, rel_fro_err=1.85), "violates singular-value bounds"),
+        (_set(["long_k", "syrk", 0, "diag_bias_max"], 1e20), "diag_bias_max mathematical bound"),
+        (_opus_femtosecond, "wall-clock floor"),
+        (_timing_femtosecond, "sub-microsecond sample"),
+        (lambda p: p["timing"].update(l2_cache_bytes=1, flush_bytes=4), "plausible CUDA GPU L2 range"),
+        (_hidden_cuda_env, "CUDA_VISIBLE_DEVICES cannot hide GPUs"),
+        (_set(["meta", "numerics", "autocast"], "bogus"), "full-precision numerics are required"),
     ]
     if canonical:
         probes += [
@@ -822,6 +859,11 @@ def _structural_probes(canonical):
             (_set(["long_k", "opus_l6", 0, "native", "sigma_max"], 0.93), "vs grid"),
             (lambda p: p["long_k"]["opus_l6"][6]["control"].update(
                 sigma_min=0.25, sigma_max=2.0, rel_fro_err=2.35), "violates singular-value bounds"),
+            (_set(["long_k", "syrk", 2, "diag_bias_max"], 0.05), "diag_bias_max exceeds promotion ceiling"),
+            (lambda p: p["timing"].update(l2_cache_bytes=16 << 20, flush_bytes=64 << 20), "RTX 5080 64 MiB L2"),
+            (_tree_git_sha, "not a commit object"),
+            (lambda p: p["zero_regression"]["launches"][3].update(native=99, legacy=99), "launch counts differ"),
+            (_set(["long_k", "launches_at_graph_shape", "native", "ps3_55"], 1), "must exceed unchunked launch count"),
         ]
     return probes
 

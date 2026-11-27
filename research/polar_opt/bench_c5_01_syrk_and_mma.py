@@ -924,8 +924,15 @@ def _validate_polar_quality(q: dict, where: str, *, rank: int, extra_keys: set[s
                  f"{where}: non-finite quality metrics must be None")
 
 
+def _require_git_commit(sha: str, label: str) -> None:
+    kind = subprocess.run(["git", "-C", str(ROOT), "cat-file", "-t", sha], capture_output=True, text=True)
+    if kind.returncode != 0 or kind.stdout.strip() != "commit":
+        raise ValueError(f"{label} {sha} is not a commit object")
+
+
 @functools.cache
 def _expected_legacy_blobs(base: str) -> dict[str, str]:
+    _require_git_commit(base, "legacy_base")
     blobs = {}
     for name in LEGACY_MODULES:
         proc = subprocess.run(["git", "-C", str(ROOT), "rev-parse", f"{base}:research/polar_opt/{name}.py"],
@@ -938,6 +945,7 @@ def _expected_legacy_blobs(base: str) -> dict[str, str]:
 
 @functools.cache
 def _expected_code_sha256_at_commit(git_sha: str, modules: tuple[str, ...]) -> str:
+    _require_git_commit(git_sha, "git_sha")
     digest = hashlib.sha256()
     for mod in modules:
         rel = "/".join(mod.split(".")) + ".py"
@@ -978,6 +986,7 @@ def _validate_meta(meta: dict, *, canonical: bool) -> None:
     _require(isinstance(meta["command"], list) and len(meta["command"]) >= 2
              and all(isinstance(x, str) and x for x in meta["command"]),
              "meta.command invalid")
+    _require("python" in Path(meta["command"][0]).name.lower(), "meta.command[0] must be a Python executable")
     if canonical:
         _require(meta["command"][1].endswith("bench_c5_01_syrk_and_mma.py") and "--quick" not in meta["command"],
                  "meta.command invalid for canonical run")
@@ -996,15 +1005,21 @@ def _validate_meta(meta: dict, *, canonical: bool) -> None:
     _require(set(env.keys()) == expected_env_keys, "meta.environment keys differ from schema")
     for k in ("python", "platform", "torch", "cuda", "numpy", "triton", "device", "driver"):
         _require(isinstance(env[k], str) and bool(env[k]), f"meta.environment.{k} must be non-empty str")
-    _require(_is_int(env["host_cpus"]) and env["host_cpus"] > 0, "meta.environment.host_cpus invalid")
-    _require(env["cudnn"] is None or (_is_int(env["cudnn"]) and env["cudnn"] > 0), "meta.environment.cudnn invalid")
+    _require(_is_int(env["host_cpus"]) and 1 <= env["host_cpus"] <= 4096, "meta.environment.host_cpus invalid")
+    _require(env["cudnn"] is None or (_is_int(env["cudnn"]) and 0 < env["cudnn"] <= 10_000_000),
+             "meta.environment.cudnn invalid")
     _require(isinstance(env["env"], dict)
              and set(env["env"].keys()) == {"CUDA_VISIBLE_DEVICES", "PYTHONPATH", "OMP_NUM_THREADS"}
              and all(v is None or isinstance(v, str) for v in env["env"].values()),
              "meta.environment.env invalid")
+    cvd = env["env"]["CUDA_VISIBLE_DEVICES"]
+    _require(cvd is None or (cvd.strip() != "" and cvd.strip() not in {"-1", "NoDevFiles"}),
+             "CUDA_VISIBLE_DEVICES cannot hide GPUs for a CUDA run")
+    omp = env["env"]["OMP_NUM_THREADS"]
+    _require(omp is None or (omp.isdigit() and int(omp) > 0), "OMP_NUM_THREADS invalid")
     cap = env["capability"]
     _require(isinstance(cap, list) and len(cap) == 2 and all(_is_int(x) for x in cap)
-             and cap[0] >= 0 and 0 <= cap[1] < 10,
+             and 0 <= cap[0] <= 99 and 0 <= cap[1] < 10,
              "meta.environment.capability invalid")
 
     numerics = meta["numerics"]
@@ -1016,7 +1031,7 @@ def _validate_meta(meta: dict, *, canonical: bool) -> None:
              and numerics["float32_matmul_precision"] == "highest"
              and numerics["allow_fp16_reduced_precision_reduction"] is False
              and numerics["allow_bf16_reduced_precision_reduction"] is False
-             and isinstance(numerics["autocast"], str) and bool(numerics["autocast"]),
+             and numerics["autocast"] == "bfloat16 forward on CUDA (harness_tier2_real._loss)",
              "full-precision numerics are required")
 
     modules = meta["code_modules"]
@@ -1036,12 +1051,13 @@ def _validate_meta(meta: dict, *, canonical: bool) -> None:
 
     ss = meta["section_seconds"]
     _require(isinstance(ss, dict) and set(ss.keys()) == {"zero_regression", "timing", "long_k", "mma"}
-             and all(_is_number(v) and v > 0 for v in ss.values()),
-             "meta.section_seconds must contain positive timings for all four sections")
+             and all(_is_number(v) and v >= 1e-6 for v in ss.values()),
+             "meta.section_seconds must contain timings >= 1 us for all four sections")
     _require(_is_number(meta["total_seconds"]) and 0.0 <= meta["total_seconds"] - sum(ss.values()) <= 5.0,
              "meta.total_seconds inconsistent with sum(meta.section_seconds)")
     t_start = _parse_iso_timestamp(meta["timestamp_start"], "timestamp_start")
     t_end = _parse_iso_timestamp(meta["timestamp_end"], "timestamp_end")
+    _require(t_start.timestamp() >= 1_700_000_000, "meta.timestamp_start before 2023 is implausible")
     elapsed = (t_end - t_start).total_seconds()
     _require(t_end >= t_start and abs(elapsed - meta["total_seconds"]) <= 5.0,
              "meta.timestamp_start/end inconsistent with meta.total_seconds")
@@ -1087,9 +1103,11 @@ def _validate_meta(meta: dict, *, canonical: bool) -> None:
         _require(_is_number(ts0) and ts0 > 0 and _is_number(ts1) and ts1 >= ts0
                  and abs((ts1 - ts0) - meta["total_seconds"]) <= 5.0,
                  "meta.gpu_telemetry timestamps inconsistent with meta.total_seconds")
+    if canonical:
+        _require(gt["end"]["memory.used"] > 0, "meta.gpu_telemetry.end.memory.used must be positive for canonical run")
 
 
-def _validate_timing(payload: dict) -> None:
+def _validate_timing(payload: dict, *, canonical: bool = False) -> None:
     spec = payload["protocol"]["timing"]
     tm = payload["timing"]
     _require(isinstance(tm, dict) and set(tm.keys()) == {"flush_bytes", "l2_cache_bytes", "cells"},
@@ -1098,9 +1116,16 @@ def _validate_timing(payload: dict) -> None:
     expected = [(s, k, m) for s in spec["shapes"] for k in spec["kernels"] for m in spec["modes"]]
     _require(_exact_equal([(c["shape"], c["kernel"], c["mode"]) for c in cells], expected),
              "timing cells differ from the protocol")
-    _require(_is_int(tm["l2_cache_bytes"]) and tm["l2_cache_bytes"] > 0
-             and _is_int(tm["flush_bytes"])
-             and tm["flush_bytes"] == spec["flush_l2_multiple"] * tm["l2_cache_bytes"],
+    l2 = tm["l2_cache_bytes"]
+    _require(_is_int(l2) and 131_072 <= l2 <= (1 << 30) and l2 % 4096 == 0,
+             "timing.l2_cache_bytes outside plausible CUDA GPU L2 range")
+    if canonical or payload["meta"]["environment"]["capability"] >= [12, 0]:
+        _require(l2 >= (16 << 20) and l2 % (1 << 20) == 0,
+                 "timing.l2_cache_bytes below sm_120 L2 minimum")
+        if payload["meta"]["environment"]["device"] == "NVIDIA GeForce RTX 5080":
+            _require(l2 == 67_108_864, "timing.l2_cache_bytes differs from RTX 5080 64 MiB L2")
+    _require(_is_int(tm["flush_bytes"])
+             and tm["flush_bytes"] == spec["flush_l2_multiple"] * l2,
              "the L2 flush must be flush_l2_multiple x L2")
     cell_keys = {"shape", "kernel", "dtype", "mode", "outputs_bitwise_equal", "rounds", "summary"}
     round_keys = {"round", "order", "native", "control"}
@@ -1118,9 +1143,9 @@ def _validate_timing(payload: dict) -> None:
             for v in VARIANTS:
                 _require(isinstance(r[v], dict) and set(r[v].keys()) == sample_keys,
                          f"{where}: round {i} {v} unexpected keys")
-                _require(_is_number(r[v]["gpu_ms"]) and r[v]["gpu_ms"] > 0
-                         and _is_number(r[v]["wall_ms"]) and r[v]["wall_ms"] > 0,
-                         f"{where}: non-positive sample")
+                _require(_is_number(r[v]["gpu_ms"]) and r[v]["gpu_ms"] >= 5e-4
+                         and _is_number(r[v]["wall_ms"]) and r[v]["wall_ms"] >= 1e-3,
+                         f"{where}: non-positive or sub-microsecond sample")
                 _require(r[v]["gpu_ms"] <= r[v]["wall_ms"] + 0.005, f"{where}: gpu_ms exceeds wall_ms")
         _assert_close_strict(c["summary"], timing_summary(c["rounds"]), f"{where}.summary", 1e-9)
     timing_wall_s = sum(r[v]["wall_ms"] for c in cells for r in c["rounds"] for v in VARIANTS) / 1e3
@@ -1128,7 +1153,7 @@ def _validate_timing(payload: dict) -> None:
              "timing sample wall_ms sum exceeds meta.section_seconds.timing")
 
 
-def _validate_long_k(payload: dict) -> None:
+def _validate_long_k(payload: dict, *, canonical: bool = False) -> None:
     lk, protocol = payload["long_k"], payload["protocol"]
     _require(isinstance(lk, dict)
              and set(lk.keys()) == {"launches_at_graph_shape", "syrk", "boundaries", "inputs",
@@ -1165,17 +1190,24 @@ def _validate_long_k(payload: dict) -> None:
         _require(_exact_equal(recorded, expected), f"long_k {name} rows differ from the protocol")
     syrk_keys = {"shape", "dtype", "out_dtype", "view_strides", "k", "symmetric",
                  "api_equals_helper", "sync_free", "diag_bias_max"}
+    in_min_subnormal = {"fp16": 2.0 ** -24, "bf16": 2.0 ** -133}
+    out_max = {
+        "float16": 65504.0,
+        "bfloat16": float(torch.finfo(torch.bfloat16).max),
+        "float32": float(torch.finfo(torch.float32).max),
+    }
     for r in lk["syrk"]:
         mx = torch.empty(r["shape"], device="meta")
         mv = (mx.mT if mx.ndim == 3 else mx.mT[None]) if mx.shape[-2] > mx.shape[-1] else (
             mx if mx.ndim == 3 else mx[None])
         _require(set(r.keys()) == syrk_keys, f"long_k syrk {r['shape']} {r['dtype']}: unexpected keys")
+        max_possible = 1.0 + out_max[r["out_dtype"]] / (in_min_subnormal[r["dtype"]] ** 2)
         _require(_is_int(r["k"]) and r["k"] == max(r["shape"][-2:])
                  and _exact_equal(r["view_strides"], list(mv.stride()))
                  and isinstance(r["symmetric"], bool) and isinstance(r["api_equals_helper"], bool)
                  and isinstance(r["sync_free"], bool)
-                 and _is_number(r["diag_bias_max"]) and r["diag_bias_max"] >= 0,
-                 f"long_k syrk {r['shape']} {r['dtype']}: invalid view_strides or fields")
+                 and _is_number(r["diag_bias_max"]) and 0.0 <= r["diag_bias_max"] <= max_possible,
+                 f"long_k syrk {r['shape']} {r['dtype']}: invalid view_strides, fields, or diag_bias_max mathematical bound")
     boundary_keys = {"k", "shape", "kernel", "dtype", "chunked", "reference",
                      "bitwise_equal_reference", "bitwise_equal_control", "sigma_max"}
     for r in lk["boundaries"]:
@@ -1233,13 +1265,14 @@ def _validate_long_k(payload: dict) -> None:
         _validate_polar_quality(r["control"], f"{where}.control", rank=rank)
         _require(isinstance(r["bitwise_equal_c4_03"], bool), f"{where}: bitwise_equal_c4_03 must be bool")
         _require(len(r["samples"]) == spec["opus_reps"], f"{where}: sample count differs")
+        min_opus_wall_ms = 0.1 if canonical else 1e-3
         for i, s in enumerate(r["samples"]):
             _require(set(s.keys()) == {"round", "order", "native", "control"}, f"{where}: sample unexpected keys")
             _require(_exact_equal(s["round"], i) and _exact_equal(s["order"], williams_order(i)),
                      f"{where}: sample order differs")
             _require(all(isinstance(s[v], dict) and set(s[v].keys()) == {"wall_ms"}
-                         and _is_number(s[v]["wall_ms"]) and s[v]["wall_ms"] > 0 for v in VARIANTS),
-                     f"{where}: non-positive sample")
+                         and _is_number(s[v]["wall_ms"]) and s[v]["wall_ms"] >= min_opus_wall_ms for v in VARIANTS),
+                     f"{where}: sample wall_ms below wall-clock floor")
         _assert_close_strict(r["speedup"], speedup(r["samples"]), f"{where}.speedup", 1e-9)
         _assert_close_strict(r["speedup_paired"], paired_speedup(r["samples"]), f"{where}.speedup_paired", 1e-9)
         _assert_close_strict(r["design_ceiling"], design[r["kernel"]], f"{where}.design_ceiling", 1e-12)
@@ -1666,8 +1699,8 @@ def validate_results(payload: dict, *, canonical: bool | None = None) -> None:
                  and isinstance(r["native_sync_free"], bool) and isinstance(r["legacy_sync_free"], bool)
                  for r in zr["launches"]),
              "zero_regression launches invalid fields")
-    _validate_timing(payload)
-    _validate_long_k(payload)
+    _validate_timing(payload, canonical=bool(canonical))
+    _validate_long_k(payload, canonical=bool(canonical))
     _validate_mma(payload)
     _assert_close_strict(payload["derived"], json.loads(json.dumps(derive(payload), allow_nan=False)), "derived", 1e-12)
     if canonical:
@@ -1677,17 +1710,30 @@ def validate_results(payload: dict, *, canonical: bool | None = None) -> None:
         _require(all(r["finite"] for r in zr["rows"]), "a K <= gate cell is non-finite")
         _require(d["zero_regression"]["launches_equal"] == d["zero_regression"]["launch_cells"]
                  and _exact_equal(d["zero_regression"]["launches_at_512x2048"], spec["launch_expected"])
+                 and all(r["native"] == r["legacy"] == spec["launch_expected"][r["kernel"]] for r in zr["launches"])
                  and d["zero_regression"]["sync_free"] == d["zero_regression"]["launch_cells"]
                  and all(r["legacy_sync_free"] for r in zr["launches"]),
                  "launch counts differ")
         _require(d["timing"]["outputs_bitwise_equal"] == d["timing"]["cells"], "a timing cell's outputs differ")
+        _require(all(0.90 <= c["summary"][clock]["median_ratio"] <= 1.05
+                     for c in payload["timing"]["cells"] for clock in ("gpu", "wall")),
+                 "promotion: timing median_ratio outside zero-regression bounds")
         _require(d["long_k"]["opus_l6_native_above_design"] == 0, "an Opus L6 cell exceeds its own design ceiling")
         _require(d["long_k"]["grid_above_design_ceiling"] == 0, "a chunked cell exceeds its own design ceiling")
         _require(d["long_k"]["grid_bitwise_c4_03"] == d["long_k"]["grid_cells"], "grid C4-03 mismatch")
         _require(all(payload["long_k"]["launches_at_graph_shape"]["sync_free"].values()),
                  "launches_at_graph_shape sync_free failed")
+        _require(all(payload["long_k"]["launches_at_graph_shape"]["native"][k] > LAUNCHES[k]
+                     for k in protocol["kernels"]),
+                 "promotion: long_k launches_at_graph_shape must exceed unchunked launch count")
         _require(all(r["api_equals_helper"] for r in payload["long_k"]["syrk"]),
                  "promotion: long_k syrk api_equals_helper")
+        diag_bias_ceiling = {"float32": 1e-3, "float16": 2e-3, "bfloat16": 1e-2}
+        _require(all(r["diag_bias_max"] <= diag_bias_ceiling[r["out_dtype"]] for r in payload["long_k"]["syrk"]),
+                 "promotion: long_k syrk diag_bias_max exceeds promotion ceiling")
+        _require(all(r["speedup"] > 1.0 and r["speedup_paired"]["geomean_ratio"] > 1.0
+                     for r in payload["long_k"]["opus_l6"]),
+                 "promotion: long_k opus_l6 must demonstrate positive speedup")
         _require(d["long_k"]["boundaries_unchunked_equal_control"][0]
                  == d["long_k"]["boundaries_unchunked_equal_control"][1],
                  "promotion: long_k boundaries_unchunked_equal_control")
