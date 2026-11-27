@@ -744,6 +744,19 @@ def _structural_probes(canonical):
         (_syrk_group_fake_sha, "hardware_sha256 differs"),
         (_set(["mma", "audit_seeds", 0, "hardware_sha256"], "0" * 64), "hardware_sha256 differs"),
         (_set(["mma", "stress", 0, "hardware_sha256"], "0" * 64), "hardware_sha256 differs"),
+        (_set(["long_k", "graphs", 0, "max_abs_diff"], 1.0), "zero max_abs_diff"),
+        (_set(["long_k", "inputs", 0, "finite_per_matrix"], []), "finite_per_matrix|invalid fields"),
+        (_set(["long_k", "inputs", 0, "sync_free"], None), "sync_free|invalid fields"),
+        (_set(["long_k", "opus_l6", 0, "native", "sigma_min"], 2.0), "singular values|sigma_min"),
+        (lambda p: _set(["timing", "cells", 0, "summary", "gpu", "paired", "n"],
+                        p["protocol"]["timing"]["rounds"] + 1e-8)(p), "summary"),
+        (lambda p: _set(["long_k", "opus_l6", 0, "speedup_paired", "n"],
+                        p["protocol"]["long_k"]["opus_reps"] + 1e-8)(p), "speedup_paired"),
+        (_set(["zero_regression", "legacy_blobs", "kernels_blackwell"], "0" * 40), "legacy_blobs"),
+        (_set(["meta", "total_seconds"], -1.0), "total_seconds"),
+        (lambda p: p["meta"]["section_seconds"].pop("mma"), "section_seconds"),
+        (_set(["long_k", "syrk", 0, "view_strides"], [1, 1, 1]), "view_strides|invalid fields"),
+        (_set(["long_k", "boundaries", 0, "sigma_max"], -1.0), "sigma_max|invalid fields"),
     ]
     if canonical:
         probes += [

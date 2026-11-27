@@ -55,6 +55,7 @@ import sys
 import tempfile
 import time
 from contextlib import contextmanager, nullcontext
+from datetime import datetime
 from pathlib import Path
 from statistics import median
 
@@ -878,9 +879,170 @@ def _exact_equal(a, b) -> bool:
     return a == b
 
 
+def _assert_close_strict(found, expected, path: str, tol: float) -> None:
+    """Deep equality requiring exact ``int``/``bool``/``str`` types and close finite ``float`` values."""
+    if isinstance(expected, dict):
+        if not isinstance(found, dict) or list(found) != list(expected):
+            raise ValueError(f"{path}: keys differ from the recomputed value")
+        for key, value in expected.items():
+            _assert_close_strict(found[key], value, f"{path}.{key}", tol)
+    elif isinstance(expected, (list, tuple)):
+        if type(found) is not type(expected) or len(found) != len(expected):
+            raise ValueError(f"{path}: length or type differs from the recomputed value")
+        for i, value in enumerate(expected):
+            _assert_close_strict(found[i], value, f"{path}[{i}]", tol)
+    elif type(expected) is int:
+        if type(found) is not int or found != expected:
+            raise ValueError(f"{path}: {found!r} differs from expected int {expected!r}")
+    elif isinstance(expected, bool) or expected is None or isinstance(expected, str):
+        if type(found) is not type(expected) or found != expected:
+            raise ValueError(f"{path}: {found!r} differs from the recomputed {expected!r}")
+    else:
+        if not _is_number(found) or not abs(found - expected) <= tol * max(1.0, abs(expected)):
+            raise ValueError(f"{path}: {found!r} differs from the recomputed {expected!r}")
+
+
+def _validate_polar_quality(q: dict, where: str, extra_keys: set[str] | None = None) -> None:
+    expected_keys = {"finite", "sigma_min", "sigma_max", "rel_fro_err"} | (extra_keys or set())
+    _require(isinstance(q, dict) and set(q.keys()) == expected_keys, f"{where}: unexpected keys")
+    _require(isinstance(q["finite"], bool), f"{where}: finite must be bool")
+    if q["finite"]:
+        _require(_is_number(q["sigma_min"]) and _is_number(q["sigma_max"]) and _is_number(q["rel_fro_err"])
+                 and 0 <= q["sigma_min"] <= q["sigma_max"] and q["rel_fro_err"] >= 0,
+                 f"{where}: singular values out of order")
+    else:
+        _require(q["sigma_min"] is None and q["sigma_max"] is None and q["rel_fro_err"] is None,
+                 f"{where}: non-finite quality metrics must be None")
+
+
+@functools.cache
+def _expected_legacy_blobs(base: str) -> dict[str, str]:
+    blobs = {}
+    for name in LEGACY_MODULES:
+        proc = subprocess.run(["git", "-C", str(ROOT), "rev-parse", f"{base}:research/polar_opt/{name}.py"],
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise ValueError(f"cannot resolve legacy blob {name} at {base}")
+        blobs[name] = proc.stdout.strip()
+    return blobs
+
+
+@functools.cache
+def _expected_code_sha256_at_commit(git_sha: str, modules: tuple[str, ...]) -> str:
+    digest = hashlib.sha256()
+    for mod in modules:
+        rel = "/".join(mod.split(".")) + ".py"
+        proc = subprocess.run(["git", "-C", str(ROOT), "show", f"{git_sha}:{rel}"], capture_output=True)
+        if proc.returncode != 0:
+            raise ValueError(f"cannot read {mod} at git_sha {git_sha}")
+        digest.update(mod.encode() + b"\0" + proc.stdout)
+    return digest.hexdigest()
+
+
+def _parse_iso_timestamp(text: str, field: str) -> datetime:
+    if not isinstance(text, str):
+        raise ValueError(f"meta.{field}: expected ISO timestamp string")
+    try:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%S%z")
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"meta.{field}: invalid ISO timestamp {text!r}") from exc
+
+
+def _validate_meta(meta: dict, *, canonical: bool) -> None:
+    expected_keys = {"git_sha", "git_dirty", "command", "environment", "numerics", "code_sha256", "code_modules",
+                     "timestamp_start", "loadavg_start", "gpu_telemetry", "section_seconds", "timestamp_end",
+                     "loadavg_end", "total_seconds"}
+    _require(isinstance(meta, dict) and set(meta.keys()) == expected_keys, "meta keys differ from schema")
+    _require(meta["git_sha"] is None or _is_hex(meta["git_sha"], 40), "meta.git_sha must be 40-hex or None")
+    _require(isinstance(meta["git_dirty"], bool), "git_dirty must be recorded")
+    _require(isinstance(meta["command"], list) and len(meta["command"]) >= 2
+             and all(isinstance(x, str) and x for x in meta["command"]),
+             "meta.command invalid")
+    env = meta["environment"]
+    expected_env_keys = {"python", "platform", "torch", "cuda", "cudnn", "host_cpus", "numpy", "env",
+                         "triton", "device", "capability", "driver"}
+    _require(isinstance(env, dict) and all(env.get(k) is not None for k in ENV_KEYS),
+             f"environment needs {ENV_KEYS}")
+    _require(set(env.keys()) == expected_env_keys, "meta.environment keys differ from schema")
+    for k in ("python", "platform", "torch", "cuda", "numpy", "triton", "device", "driver"):
+        _require(isinstance(env[k], str) and bool(env[k]), f"meta.environment.{k} must be non-empty str")
+    _require(_is_int(env["host_cpus"]) and env["host_cpus"] > 0, "meta.environment.host_cpus invalid")
+    _require(env["cudnn"] is None or (_is_int(env["cudnn"]) and env["cudnn"] > 0), "meta.environment.cudnn invalid")
+    _require(isinstance(env["env"], dict)
+             and all(isinstance(k, str) and (v is None or isinstance(v, str)) for k, v in env["env"].items()),
+             "meta.environment.env invalid")
+    cap = env["capability"]
+    _require(isinstance(cap, list) and len(cap) == 2 and all(_is_int(x) for x in cap),
+             "meta.environment.capability invalid")
+
+    numerics = meta["numerics"]
+    expected_num_keys = {"allow_tf32", "cudnn_allow_tf32", "float32_matmul_precision",
+                         "allow_fp16_reduced_precision_reduction", "allow_bf16_reduced_precision_reduction",
+                         "autocast"}
+    _require(isinstance(numerics, dict) and set(numerics.keys()) == expected_num_keys, "meta.numerics keys differ")
+    _require(numerics["allow_tf32"] is False and numerics["cudnn_allow_tf32"] is False
+             and numerics["float32_matmul_precision"] == "highest"
+             and numerics["allow_fp16_reduced_precision_reduction"] is False
+             and numerics["allow_bf16_reduced_precision_reduction"] is False
+             and isinstance(numerics["autocast"], str) and bool(numerics["autocast"]),
+             "full-precision numerics are required")
+
+    modules = meta["code_modules"]
+    _require(isinstance(modules, list) and all(isinstance(m, str) for m in modules)
+             and all(any(m.endswith("." + needed) for m in modules) for needed in REQUIRED_CODE),
+             "code_modules does not cover the driver, the model and the kernels")
+    _require(_is_hex(meta["code_sha256"], 64), "code_sha256 must be 64-hex")
+    if canonical:
+        _require(_is_hex(meta["git_sha"], 40) and meta["git_dirty"] is False,
+                 "canonical results need a 40-hex git_sha and a clean tree")
+        _require(cap >= [12, 0], "a canonical result needs an sm_120+ CUDA device")
+        _require(len(set(modules)) == len(modules) and all(m.startswith("research.") for m in modules)
+                 and _exact_equal(modules, list(code_modules())),
+                 "code_modules differ from the static import closure")
+        _require(meta["code_sha256"] == _expected_code_sha256_at_commit(meta["git_sha"], tuple(modules)),
+                 "meta.code_sha256 differs from committed git blobs")
+
+    ss = meta["section_seconds"]
+    _require(isinstance(ss, dict) and set(ss.keys()) == {"zero_regression", "timing", "long_k", "mma"}
+             and all(_is_number(v) and v > 0 for v in ss.values()),
+             "meta.section_seconds must contain positive timings for all four sections")
+    _require(_is_number(meta["total_seconds"]) and meta["total_seconds"] >= sum(ss.values()),
+             "meta.total_seconds must be >= sum(meta.section_seconds)")
+    t_start = _parse_iso_timestamp(meta["timestamp_start"], "timestamp_start")
+    t_end = _parse_iso_timestamp(meta["timestamp_end"], "timestamp_end")
+    elapsed = (t_end - t_start).total_seconds()
+    _require(t_end >= t_start and abs(elapsed - meta["total_seconds"]) <= 5.0,
+             "meta.timestamp_start/end inconsistent with meta.total_seconds")
+    for field in ("loadavg_start", "loadavg_end"):
+        la = meta[field]
+        _require(isinstance(la, list) and len(la) == 3 and all(_is_number(x) and x >= 0 for x in la),
+                 f"meta.{field} invalid")
+    gt = meta["gpu_telemetry"]
+    _require(isinstance(gt, dict) and set(gt.keys()) == {"start", "end"}, "meta.gpu_telemetry keys differ")
+    numeric_gt = ("clocks.sm", "clocks.mem", "temperature.gpu", "power.draw", "utilization.gpu", "memory.used")
+    str_gt = ("pstate", "clocks_event_reasons.active")
+    for side in ("start", "end"):
+        sample = gt[side]
+        _require(isinstance(sample, dict) and len(sample) > 0, f"meta.gpu_telemetry.{side} invalid")
+        for key in numeric_gt:
+            if key in sample:
+                _require(_is_number(sample[key]) and sample[key] >= 0, f"meta.gpu_telemetry.{side}.{key} invalid")
+        for key in str_gt:
+            if key in sample:
+                _require(isinstance(sample[key], str) and bool(sample[key]),
+                         f"meta.gpu_telemetry.{side}.{key} invalid")
+    if "time" in gt["start"] and "time" in gt["end"]:
+        ts0, ts1 = gt["start"]["time"], gt["end"]["time"]
+        _require(_is_number(ts0) and ts0 > 0 and _is_number(ts1) and ts1 >= ts0
+                 and abs((ts1 - ts0) - meta["total_seconds"]) <= 5.0,
+                 "meta.gpu_telemetry timestamps inconsistent with meta.total_seconds")
+
+
 def _validate_timing(payload: dict) -> None:
     spec = payload["protocol"]["timing"]
     tm = payload["timing"]
+    _require(isinstance(tm, dict) and set(tm.keys()) == {"flush_bytes", "l2_cache_bytes", "cells"},
+             "timing keys differ from schema")
     cells = tm["cells"]
     expected = [(s, k, m) for s in spec["shapes"] for k in spec["kernels"] for m in spec["modes"]]
     _require(_exact_equal([(c["shape"], c["kernel"], c["mode"]) for c in cells], expected),
@@ -889,29 +1051,41 @@ def _validate_timing(payload: dict) -> None:
              and _is_int(tm["flush_bytes"])
              and tm["flush_bytes"] == spec["flush_l2_multiple"] * tm["l2_cache_bytes"],
              "the L2 flush must be flush_l2_multiple x L2")
+    cell_keys = {"shape", "kernel", "dtype", "mode", "outputs_bitwise_equal", "rounds", "summary"}
+    round_keys = {"round", "order", "native", "control"}
+    sample_keys = {"gpu_ms", "wall_ms"}
     for c in cells:
         where = f"timing {c['mode']} {c['kernel']} {c['shape']}"
+        _require(set(c.keys()) == cell_keys, f"{where}: unexpected keys")
         _require(_exact_equal(c["dtype"], spec["dtype"]), f"{where}: dtype differs from the protocol")
         _require(isinstance(c["outputs_bitwise_equal"], bool), f"{where}: outputs_bitwise_equal must be a bool")
         _require(len(c["rounds"]) == spec["rounds"], f"{where}: round count differs")
         for i, r in enumerate(c["rounds"]):
+            _require(set(r.keys()) == round_keys, f"{where}: round {i} unexpected keys")
             _require(_exact_equal(r["round"], i) and _exact_equal(r["order"], williams_order(i)),
                      f"{where}: round {i} order differs")
             for v in VARIANTS:
+                _require(isinstance(r[v], dict) and set(r[v].keys()) == sample_keys,
+                         f"{where}: round {i} {v} unexpected keys")
                 _require(_is_number(r[v]["gpu_ms"]) and r[v]["gpu_ms"] > 0
                          and _is_number(r[v]["wall_ms"]) and r[v]["wall_ms"] > 0,
                          f"{where}: non-positive sample")
-        _assert_close(c["summary"], timing_summary(c["rounds"]), f"{where}.summary", 1e-9)
+        _assert_close_strict(c["summary"], timing_summary(c["rounds"]), f"{where}.summary", 1e-9)
 
 
 def _validate_long_k(payload: dict) -> None:
     lk, protocol = payload["long_k"], payload["protocol"]
+    _require(isinstance(lk, dict)
+             and set(lk.keys()) == {"launches_at_graph_shape", "syrk", "boundaries", "inputs",
+                                    "graphs", "opus_l6", "grid"},
+             "long_k keys differ from schema")
     spec = protocol["long_k"]
     design = c3.design_ceilings(list(protocol["kernels"]))
     kernels, dtypes = protocol["kernels"], protocol["dtypes"]
     out_dtypes = {d: str(mm.DTYPES[d]).replace("torch.", "") for d in dtypes}
     lgs = lk["launches_at_graph_shape"]
-    _require(_exact_equal(lgs["shape"], spec["graph_shapes"][0])
+    _require(isinstance(lgs, dict) and set(lgs.keys()) == {"shape", "native", "sync_free"}
+             and _exact_equal(lgs["shape"], spec["graph_shapes"][0])
              and set(lgs["native"]) == set(kernels)
              and all(_is_int(v) and v > 0 for v in lgs["native"].values())
              and set(lgs["sync_free"]) == set(kernels)
@@ -934,58 +1108,100 @@ def _validate_long_k(payload: dict) -> None:
     }
     for name, (recorded, expected) in identities.items():
         _require(_exact_equal(recorded, expected), f"long_k {name} rows differ from the protocol")
+    syrk_keys = {"shape", "dtype", "out_dtype", "view_strides", "k", "symmetric",
+                 "api_equals_helper", "sync_free", "diag_bias_max"}
     for r in lk["syrk"]:
+        mx = torch.empty(r["shape"], device="meta")
+        mv = (mx.mT if mx.ndim == 3 else mx.mT[None]) if mx.shape[-2] > mx.shape[-1] else (
+            mx if mx.ndim == 3 else mx[None])
+        _require(set(r.keys()) == syrk_keys, f"long_k syrk {r['shape']} {r['dtype']}: unexpected keys")
         _require(_is_int(r["k"]) and r["k"] == max(r["shape"][-2:])
+                 and _exact_equal(r["view_strides"], list(mv.stride()))
                  and isinstance(r["symmetric"], bool) and isinstance(r["api_equals_helper"], bool)
                  and isinstance(r["sync_free"], bool)
                  and _is_number(r["diag_bias_max"]) and r["diag_bias_max"] >= 0,
-                 f"long_k syrk {r['shape']} {r['dtype']}: invalid fields")
+                 f"long_k syrk {r['shape']} {r['dtype']}: invalid view_strides or fields")
+    boundary_keys = {"k", "shape", "kernel", "dtype", "chunked", "reference",
+                     "bitwise_equal_reference", "bitwise_equal_control", "sigma_max"}
     for r in lk["boundaries"]:
-        _require(isinstance(r["bitwise_equal_reference"], bool) and isinstance(r["bitwise_equal_control"], bool),
-                 f"long_k boundaries k={r['k']}: flags must be bool")
+        _require(set(r.keys()) == boundary_keys, f"long_k boundaries k={r['k']}: unexpected keys")
+        _require(isinstance(r["bitwise_equal_reference"], bool) and isinstance(r["bitwise_equal_control"], bool)
+                 and _is_number(r["sigma_max"]) and r["sigma_max"] > 0,
+                 f"long_k boundaries k={r['k']}: invalid fields or sigma_max")
+    input_base_keys = {"case", "shape", "kernel", "dtype", "bitwise_equal_c4_03", "finite_per_matrix", "sync_free"}
     for r in lk["inputs"]:
+        n_mat = math.prod(r["shape"][:-2]) if len(r["shape"]) > 2 else 1
         _require(isinstance(r["bitwise_equal_c4_03"], bool)
-                 and (r["sync_free"] is None or isinstance(r["sync_free"], bool))
                  and isinstance(r["finite_per_matrix"], list)
+                 and len(r["finite_per_matrix"]) == n_mat
                  and all(isinstance(x, bool) for x in r["finite_per_matrix"]),
-                 f"long_k inputs {r['case']}: invalid fields")
+                 f"long_k inputs {r['case']}: invalid finite_per_matrix or flags")
+        if r["case"] == "sigma_hat":
+            _require(r["sync_free"] is None, f"long_k inputs {r['case']}: sigma_hat sync_free must be None")
+        else:
+            _require(isinstance(r["sync_free"], bool), f"long_k inputs {r['case']}: sync_free must be bool")
+        if r["case"].startswith("mixed"):
+            _require(set(r.keys()) == (input_base_keys | {"degenerate_zero", "normal_quality"}),
+                     f"long_k inputs {r['case']}: unexpected keys")
+            _validate_polar_quality(r["normal_quality"], f"long_k inputs {r['case']} {r['kernel']} {r['dtype']}")
+            _require(r["normal_quality"]["finite"] is r["finite_per_matrix"][0],
+                     f"long_k inputs {r['case']}: normal_quality.finite differs from finite_per_matrix[0]")
+            if r["kernel"] == "ps3_55":
+                _require(r["degenerate_zero"] is None,
+                         f"long_k inputs {r['case']}: ps3_55 degenerate_zero must be None")
+            else:
+                _require(isinstance(r["degenerate_zero"], list) and len(r["degenerate_zero"]) == 4
+                         and all(isinstance(x, bool) for x in r["degenerate_zero"]),
+                         f"long_k inputs {r['case']}: degenerate_zero must have 4 bool entries")
+        else:
+            _require(set(r.keys()) == input_base_keys, f"long_k inputs {r['case']}: unexpected keys")
+    graph_keys = {"shape", "kernel", "dtype", "bitwise_equal", "max_abs_diff", "finite"}
     for r in lk["graphs"]:
+        _require(set(r.keys()) == graph_keys, f"long_k graphs {r['shape']} {r['kernel']}: unexpected keys")
         _require(isinstance(r["bitwise_equal"], bool) and isinstance(r["finite"], bool)
                  and _is_number(r["max_abs_diff"]) and r["max_abs_diff"] >= 0,
                  f"long_k graphs {r['shape']} {r['kernel']}: invalid fields")
+        if r["bitwise_equal"] and r["finite"]:
+            _require(r["max_abs_diff"] == 0.0,
+                     f"long_k graphs {r['shape']} {r['kernel']}: bitwise_equal finite outputs must have zero max_abs_diff")
+    opus_keys = {"shape", "kernel", "dtype", "design_ceiling", "native", "control",
+                 "samples", "bitwise_equal_c4_03", "speedup", "speedup_paired"}
     for r in lk["opus_l6"]:
         where = f"opus_l6 {r['shape']} {r['kernel']} {r['dtype']}"
+        _require(set(r.keys()) == opus_keys, f"{where}: unexpected keys")
+        _validate_polar_quality(r["native"], f"{where}.native")
+        _validate_polar_quality(r["control"], f"{where}.control")
         _require(isinstance(r["bitwise_equal_c4_03"], bool), f"{where}: bitwise_equal_c4_03 must be bool")
         _require(len(r["samples"]) == spec["opus_reps"], f"{where}: sample count differs")
         for i, s in enumerate(r["samples"]):
+            _require(set(s.keys()) == {"round", "order", "native", "control"}, f"{where}: sample unexpected keys")
             _require(_exact_equal(s["round"], i) and _exact_equal(s["order"], williams_order(i)),
                      f"{where}: sample order differs")
-            _require(all(_is_number(s[v]["wall_ms"]) and s[v]["wall_ms"] > 0 for v in VARIANTS),
+            _require(all(isinstance(s[v], dict) and set(s[v].keys()) == {"wall_ms"}
+                         and _is_number(s[v]["wall_ms"]) and s[v]["wall_ms"] > 0 for v in VARIANTS),
                      f"{where}: non-positive sample")
-        _assert_close(r["speedup"], speedup(r["samples"]), f"{where}.speedup", 1e-9)
-        _assert_close(r["speedup_paired"], paired_speedup(r["samples"]), f"{where}.speedup_paired", 1e-9)
-        _assert_close(r["design_ceiling"], design[r["kernel"]], f"{where}.design_ceiling", 1e-12)
+        _assert_close_strict(r["speedup"], speedup(r["samples"]), f"{where}.speedup", 1e-9)
+        _assert_close_strict(r["speedup_paired"], paired_speedup(r["samples"]), f"{where}.speedup_paired", 1e-9)
+        _assert_close_strict(r["design_ceiling"], design[r["kernel"]], f"{where}.design_ceiling", 1e-12)
     expected = [(f, e, s) for f, fam in spec["grid_families"].items() for e in fam["k_exponents"] for s in fam["seeds"]]
     _require(_exact_equal([(r["family"], r["k_exponent"], r["seed"]) for r in lk["grid"]], expected),
              "grid rows differ from the protocol families")
     names = {f"{k}_{d}" for k in protocol["kernels"] for d in protocol["dtypes"]}
+    grid_keys = {"family", "n", "k", "k_exponent", "seed", "shape", "chunked", "cells"}
     for r in lk["grid"]:
         fam = spec["grid_families"][r["family"]]
         shape = [fam["n"], r["k"]] if fam["orientation"] == "wide" else [r["k"], fam["n"]]
+        _require(set(r.keys()) == grid_keys, f"grid {r['family']} 2^{r['k_exponent']}: unexpected keys")
         _require(_exact_equal(r["n"], fam["n"]) and _exact_equal(r["shape"], shape),
                  f"grid {r['family']} 2^{r['k_exponent']}: shape differs")
         _require(set(r["cells"]) == names, f"grid {r['family']} 2^{r['k_exponent']}: kernel cells differ")
         _require(_exact_equal(r["chunked"], r["k"] > protocol["gate"])
                  and _exact_equal(r["k"], 1 << r["k_exponent"]), "grid chunk flag")
         for name, c in r["cells"].items():
-            _require(isinstance(c["finite"], bool) and isinstance(c["bitwise_equal_c4_03"], bool),
-                     f"grid {name}: flags must be bool")
-            _assert_close(c["design_ceiling"], design[name.rsplit("_", 1)[0]], f"grid {name}.design_ceiling", 1e-12)
-            if c["finite"]:
-                _require(_is_number(c["sigma_min"]) and _is_number(c["sigma_max"])
-                         and _is_number(c["rel_fro_err"])
-                         and 0 <= c["sigma_min"] <= c["sigma_max"] and c["rel_fro_err"] >= 0,
-                         f"grid {name}: singular values out of order")
+            _validate_polar_quality(c, f"grid {name}", extra_keys={"design_ceiling", "bitwise_equal_c4_03"})
+            _require(isinstance(c["bitwise_equal_c4_03"], bool), f"grid {name}: flags must be bool")
+            _assert_close_strict(c["design_ceiling"], design[name.rsplit("_", 1)[0]],
+                                 f"grid {name}.design_ceiling", 1e-12)
 
 
 def _digest_words(x: Tensor) -> str:
@@ -1331,74 +1547,66 @@ def _validate_mma(payload: dict) -> None:
 
 def validate_results(payload: dict, *, canonical: bool | None = None) -> None:
     """Raise ValueError unless ``payload`` is a complete, internally consistent C5-01 result."""
+    expected_top_keys = {"schema_version", "task", "quick", "canonical", "meta", "protocol",
+                         "run_config_hash", "zero_regression", "timing", "long_k", "mma", "derived"}
+    _require(isinstance(payload, dict) and set(payload.keys()) == expected_top_keys, "top-level keys differ from schema")
     canonical = payload.get("canonical") if canonical is None else canonical
     _require(payload.get("schema_version") == SCHEMA_VERSION, "schema_version differs")
     _require(payload.get("task") == TASK, "task differs")
     _require(isinstance(payload.get("quick"), bool) and isinstance(payload.get("canonical"), bool),
              "quick/canonical flags must be bool")
+    if canonical:
+        _require(payload["canonical"] is True and payload["quick"] is False, "a canonical result cannot be --quick")
     meta, protocol = payload["meta"], payload["protocol"]
-    _require(isinstance(meta.get("git_dirty"), bool), "git_dirty must be recorded")
-    _require(_is_hex(meta.get("code_sha256"), 64), "code_sha256 must be 64-hex")
-    _require(all(any(m.endswith("." + needed) for m in meta["code_modules"]) for needed in REQUIRED_CODE),
-             "code_modules does not cover the driver, the model and the kernels")
-    env = meta["environment"]
-    _require(all(env.get(k) is not None for k in ENV_KEYS), f"environment needs {ENV_KEYS}")
+    _validate_meta(meta, canonical=bool(canonical))
     _require(_is_hex(payload.get("run_config_hash"), 16)
              and payload["run_config_hash"] == run_config_hash(payload["quick"], protocol, meta["code_sha256"],
-                                                               meta["git_sha"], env),
+                                                               meta["git_sha"], meta["environment"]),
              "run_config_hash differs from the recomputed digest")
-    numerics = meta["numerics"]
-    _require(numerics["allow_tf32"] is False and numerics["cudnn_allow_tf32"] is False
-             and numerics["float32_matmul_precision"] == "highest"
-             and numerics["allow_fp16_reduced_precision_reduction"] is False
-             and numerics["allow_bf16_reduced_precision_reduction"] is False, "full-precision numerics are required")
     _require(_exact_equal(protocol["gate"], kbw.SYRK_CHUNK_GATE)
              and _exact_equal(protocol["chunk"], kbw.SYRK_CHUNK_SIZE)
              and _exact_equal(protocol["max_bytes"], kbw.SYRK_CHUNK_MAX_BYTES),
              "gate constants differ from kernels_blackwell")
     _require(protocol["legacy_base"] == LEGACY_BASE == payload["zero_regression"]["legacy_base"], "legacy base differs")
     if canonical:
-        _require(payload["canonical"] is True and payload["quick"] is False, "a canonical result cannot be --quick")
-        _require(_is_hex(meta.get("git_sha"), 40) and meta["git_dirty"] is False,
-                 "canonical results need a 40-hex git_sha and a clean tree")
-        cap = env["capability"]
-        _require(isinstance(cap, list) and len(cap) == 2 and all(_is_int(x) for x in cap) and cap >= [12, 0],
-                 "a canonical result needs an sm_120+ CUDA device")
         _require(_exact_equal(protocol, CANONICAL), "protocol differs from the canonical protocol")
-        modules = meta["code_modules"]
-        _require(len(set(modules)) == len(modules) and all(m.startswith("research.") for m in modules)
-                 and _exact_equal(modules, list(code_modules())), "code_modules differ from the static import closure")
     zr = payload["zero_regression"]
     spec = protocol["zero_regression"]
-    _require(isinstance(zr["legacy_blobs"], dict) and set(zr["legacy_blobs"]) == set(LEGACY_MODULES)
-             and all(_is_hex(v, 40) for v in zr["legacy_blobs"].values()),
+    _require(isinstance(zr, dict) and set(zr.keys()) == {"legacy_base", "legacy_blobs", "rows", "launches"},
+             "zero_regression keys differ from schema")
+    _require(_exact_equal(zr["legacy_blobs"], _expected_legacy_blobs(zr["legacy_base"])),
              "zero_regression legacy_blobs differ")
     expected = [(s, seed, k, d) for s in spec["shapes"] for seed in spec["seeds"]
                 for k in (*protocol["kernels"], "gram_ns", "triton_syrk") for d in protocol["dtypes"]]
     _require(_exact_equal([(r["shape"], r["seed"], r["kernel"], r["dtype"]) for r in zr["rows"]], expected),
              "zero_regression rows differ from the protocol")
-    _require(all(_is_int(r["k"]) and r["k"] == max(r["shape"][-2:]) and r["k"] <= protocol["gate"]
-                 and isinstance(r["bitwise_equal"], bool) and isinstance(r["finite"], bool)
-                 for r in zr["rows"]),
+    zr_row_keys = {"shape", "seed", "kernel", "dtype", "k", "bitwise_equal", "finite"}
+    _require(all(set(r.keys()) == zr_row_keys and _is_int(r["k"]) and r["k"] == max(r["shape"][-2:])
+                 and r["k"] <= protocol["gate"] and isinstance(r["bitwise_equal"], bool)
+                 and isinstance(r["finite"], bool) for r in zr["rows"]),
              "zero_regression covers K <= gate only")
     expected_launches = [(s, k) for s in spec["launch_shapes"] for k in protocol["kernels"]]
     _require(_exact_equal([(r["shape"], r["kernel"]) for r in zr["launches"]], expected_launches),
              "zero_regression launches differ from the protocol")
-    _require(all(_is_int(r["native"]) and r["native"] > 0 and _is_int(r["legacy"]) and r["legacy"] > 0
+    zr_launch_keys = {"shape", "kernel", "native", "legacy", "native_sync_free", "legacy_sync_free"}
+    _require(all(set(r.keys()) == zr_launch_keys and _is_int(r["native"]) and r["native"] > 0
+                 and _is_int(r["legacy"]) and r["legacy"] > 0
                  and isinstance(r["native_sync_free"], bool) and isinstance(r["legacy_sync_free"], bool)
                  for r in zr["launches"]),
              "zero_regression launches invalid fields")
     _validate_timing(payload)
     _validate_long_k(payload)
     _validate_mma(payload)
-    _assert_close(payload["derived"], json.loads(json.dumps(derive(payload), allow_nan=False)), "derived", 1e-12)
+    _assert_close_strict(payload["derived"], json.loads(json.dumps(derive(payload), allow_nan=False)), "derived", 1e-12)
     if canonical:
+        design = c3.design_ceilings(list(protocol["kernels"]))
         d = payload["derived"]
         _require(d["zero_regression"]["bitwise_equal"] == d["zero_regression"]["cells"] > 0, "a K <= gate cell differs")
         _require(all(r["finite"] for r in zr["rows"]), "a K <= gate cell is non-finite")
         _require(d["zero_regression"]["launches_equal"] == d["zero_regression"]["launch_cells"]
                  and _exact_equal(d["zero_regression"]["launches_at_512x2048"], spec["launch_expected"])
-                 and d["zero_regression"]["sync_free"] == d["zero_regression"]["launch_cells"],
+                 and d["zero_regression"]["sync_free"] == d["zero_regression"]["launch_cells"]
+                 and all(r["legacy_sync_free"] for r in zr["launches"]),
                  "launch counts differ")
         _require(d["long_k"]["grid_above_design_ceiling"] == 0, "a chunked cell exceeds its own design ceiling")
         _require(d["long_k"]["grid_bitwise_c4_03"] == d["long_k"]["grid_cells"], "grid C4-03 mismatch")
@@ -1411,9 +1619,28 @@ def validate_results(payload: dict, *, canonical: bool | None = None) -> None:
         _require(d["long_k"]["boundaries_unchunked_equal_control"][0]
                  == d["long_k"]["boundaries_unchunked_equal_control"][1],
                  "promotion: long_k boundaries_unchunked_equal_control")
+        _require(all(r["sigma_max"] <= design[r["kernel"]] for r in payload["long_k"]["boundaries"]),
+                 "promotion: long_k boundaries sigma_max")
         _require(d["long_k"]["inputs_sync_free"][0] == d["long_k"]["inputs_sync_free"][1],
                  "promotion: long_k inputs_sync_free")
-        _require(all(r["finite"] for r in payload["long_k"]["graphs"]), "promotion: long_k graphs finite")
+        for r in payload["long_k"]["inputs"]:
+            if r["case"].startswith("mixed"):
+                _require(r["normal_quality"]["finite"] is True
+                         and r["normal_quality"]["sigma_max"] <= design[r["kernel"]]
+                         and r["finite_per_matrix"][:3] == [True, True, True],
+                         "promotion: long_k inputs mixed normal_quality")
+                if r["kernel"] != "ps3_55":
+                    _require(r["finite_per_matrix"] == [True] * 5 and r["degenerate_zero"] == [True] * 4,
+                             "promotion: long_k inputs mixed degenerate_zero")
+            else:
+                _require(all(r["finite_per_matrix"]), "promotion: long_k inputs finite")
+        _require(all(r["finite"] for r in payload["long_k"]["graphs"])
+                 and d["long_k"]["graphs_max_abs_diff"] == 0.0,
+                 "promotion: long_k graphs finite")
+        _require(all(r["native"]["finite"] and r["control"]["finite"] for r in payload["long_k"]["opus_l6"]),
+                 "promotion: long_k opus_l6 finite")
+        _require(all(c["finite"] for r in payload["long_k"]["grid"] for c in r["cells"].values()),
+                 "promotion: long_k grid finite")
         m = d["mma"]
         _require(m["all_dot_products"][0] == m["all_dot_products"][1] > 0, "promotion: mma all_dot_products")
         for key in ("witnesses", "witness_permutations", "exponent_table", "edge_cases", "syrk_fused_store",
