@@ -1,9 +1,9 @@
 {
   "program": "Autonomous Verifiable AI Research",
   "repo": "https://github.com/domainus/ai",
-  "cycle": 5,
-  "phase": "cycle5_c5_02_verified_and_merged",
-  "last_updated": "2026-11-27T08:16:04-07:00",
+  "cycle": 6,
+  "phase": "cycle5_complete_on_bazzite_c6_01_launched",
+  "last_updated": "2026-11-27T14:18:00-07:00",
   "fleet": {
     "bazzite": {
       "environment_id": "6fb39dcd-f3b7-4929-a1d5-637d67eb79bb",
@@ -25,14 +25,15 @@
     }
   },
   "kpis": {
-    "experiments_run": 28,
-    "verified_wins": 13,
+    "experiments_run": 29,
+    "verified_wins": 14,
     "best_speedup_vs_pe": 2.7,
     "best_speedup_vs_ps": 2.58,
-    "tests_passing": 1468,
-    "audits_completed": 20
+    "tests_passing": 1560,
+    "audits_completed": 21
   },
   "completed": [
+    "C5-03 120M NVFP4 W4A4 & QUANTIZER FUSION (PASS — HOLD LIFTED): Beats C4-02 on 24/24 dyn graph GEMMs (1.0104-1.1551x) & BF16 on 30/32 ((1024,512,1408) none 1.044x, static_gs 1.074x, dyn had 0.959x), 1.023-1.046x C4 fwd graph (1.188-1.291x compiled BF16 120m); 120m 3-seed 20.97M-tok muon_ps3_blackwell val-best awq_w4a4_adaptive_butterfly_b16_gptq test dNLL +0.01521 dyn/+0.01518 static/+0.00311 W4A16 (alpha=0.25 6/6; 80.6% act loss; 63/63 hw, 60 FP4 GEMMs, 1260 decodes, <=0.000166 diff)",
     "C5-02 ISO-LOSS 5-SEED PTQ & MITIGATIONS (PASS — HOLD LIFTED): 5/5 val-matched (|gap|<=0.0033, test +0.0037); Muon loses 1.57-2.98x dNLL across 6 cells (Holm6<=0.00031, 48<=0.0053); 200 W4A4 rows (180+20), 60 FP4 GEMMs, 6000 decodes (5400+600), <=0.000171 hw-emul; AdamW/QAT cooldown hurt BF16 (+0.0264/+0.0065) & net NLL; weight-only AWQ neutral (-0.00036 W4A4, p>=0.485); defaults unchanged",
     "C5-01 NATIVE CHUNKED SYRK & SM120 MMA (PASS — HOLD LIFTED): K<=65536 260/260 bitwise, 15/15 launches, 0.994-1.012x timing (0% reg); K>65536 0/654 grid ceil, 28.0-84.0x K=2^25, 515k single-round, grid-y cap; sm_120 MMA floor -133 exact 1,027,034/1,027,034 (226/226 digests) & 91,742/91,742 oracle",
     "C4-03 WIDE/CKPT/DRIFT (H1/M1/H2): w1536/w2048 SS3 +12-15.5% vs PE; SS3_53 beats PS3 (+0.68/+0.82%, p<=0.025); 5-seed ckpt loss p=1; MMA accum causes 15.6% long-K bias (ChunkedGram 0.002%, 29-85x)",
@@ -44,15 +45,21 @@
   ],
   "wip": [
     "C3-04: M5 Max open-lid 4096^2 rerun + live pytest tests/test_mlx.py (waiting for MacBook Pro)",
-    "C5-03: 120m real-checkpoint hardware NVFP4 W4A4 perplexity + small-shape dynamic activation quantizer fusion (launching on RTX 5080)"
+    "C6-01: Wide Hadamard-rotated Muon W4A4 QAT at 50m (3 seeds) + 120m NVFP4 transfer (launching on RTX 5080, Claude Fable 5.2)"
   ],
   "blockers": [
     "C4-03: SS3_54 w1536 joint p=0.130; C5-01 MMA model verified on RTX 5080 sm_120 m16n8k16 FP16/BF16 only",
     "C5-02 recipe-scoped (50m 5-seed df=4, 0.0625 sign-flip floor, seed-0 shakedowns scored test.bin, weight-only AWQ proxy, no spectral penalty tested); C4-01a fixed LRs (ps3_blackwell stays 120m default)",
-    "C4-02 dyn had_b16 0.860x vs BF16 @ (1024,512,1408) & 1-seed 50m Part C (targeted by C5-03); SS3_54 @ (512,2048) 0.987x vs PS3",
+    "C5-03: 120m 3-seed df=2 (0.25 sign-flip floor; butterfly & AWQ Holm6 p=0.052/0.062); dyn had_b16 (1024,512,1408) 0.9594x vs BF16 (static_gs 1.0739x); SS3_54 @ (512,2048) 0.987x vs PS3",
     "MacBook Pro unreachable (C3-04 deferred); 3 Metal-only + 3 large-size tests skipped on Linux"
   ],
   "audits": [
+    {
+      "auditor": "GPT 6.2 Astra (C5-03 live GPU + v2-v4 closed signoff, high)",
+      "verdict": "PASS — HOLD LIFTED",
+      "artifact": "audits/AUDIT_cycle5_c5_03_gpt62_astra.md",
+      "summary": "Live RTX 5080 v1-v4 verification: 279/279 quant parity, 0 D2H syncs, 63/63 unique Part C rows, 60 FP4 GEMMs/fwd, 1260/1260 int32 decodes, <=0.000166 diff; closed v2-v3 exact 27-partial, CUPTI FP4/quantizer, symlink/alias canonical path, dynamic caveats & dir_fd writer findings (276 + 3 tests pass)."
+    },
     {
       "auditor": "GPT 6.2 Astra (C5-02 live GPU + v2-v4 closed signoff, high)",
       "verdict": "FAIL -> REMEDIATED -> PASS — HOLD LIFTED",
@@ -191,6 +198,7 @@
   ],
   "next_queue": [
     "C3-04 (MacBook Pro): Open-lid caffeinate 4096^2 Metal SYRK + live pytest tests/test_mlx.py + F5 profile",
-    "C5-03 (Active on RTX 5080): Real 120m hardware NVFP4 W4A4 perplexity + small-shape dynamic activation quantizer fusion"
+    "C6-01 (RTX 5080, Claude Fable 5.2): Wide Hadamard-rotated Muon W4A4 QAT (50m 3-seed + 120m NVFP4 transfer)",
+    "C6-02 (RTX 5080, queued): Blackwell NVFP4 Fused Multi-Row / Split-K Activation Quantizer & Sparse-Hadamard Projection for (1024, 512, 1408)"
   ]
 }
