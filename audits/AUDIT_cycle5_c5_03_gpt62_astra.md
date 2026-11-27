@@ -177,3 +177,48 @@ PYTHONPATH=. /home/ryan/Documents/projects/ai/.venv/bin/pytest -q tests/test_c5_
 ```
 
 The first command passed **249 tests** in 394.71 seconds with 10 warnings. The second passed **3 tests**, with 97 deselected, in 23.66 seconds. The live timing calls used the canonical seed and timing settings with `part_a_shape`, `ablation_shape` and the 120m entry to `part_b`. Checkpoint reconstruction used `Study.candidate`, `calibrate`, `Study.seqcal` and `Study.measure` after loading seed 1. The original result still has the pinned digest. The scope of the live evidence is the specified GPU, toolchain, shapes, model and checkpoint.
+
+## Post-Remediation Re-Check (v2)
+
+**FAIL — HOLD PROMOTION.** The published measurements retain their provenance. The public split launcher still silently produces incorrect operands for two invalid positive partial counts. The measured-result validator also accepts incorrect kernel identities, and the canonical validator certifies inconsistent postprocess metadata.
+
+The diff from `dbf82ab` to `f3055ee` contains exactly the two specified Python modules, their C5-03 test file and the canonical JSON. The JSON SHA-256 is `72b56275198eacebae016511ce25dbc82f330b8faea857e335a0bac2d5b19316`. Independently serializing the ten raw fields of v1 and v2 gave identical bytes and SHA-256 `bacb1484441a8413315daecb19187528f3bf6900c736813073ad810f0482f5f3`. The v1 Git blob, all three retained files, Part C analysis and top-level summary matched their respective references.
+
+| Original finding | Re-check |
+|---|---|
+| 1. Calibration — closed | The independent seed-20261126 draw reproduced all 128 starts and 65,536 tokens. All seven additional edits failed, including a one-window shift of every start. The suite rejected eight calibration cases. |
+| 2. Evidence and writer — partial | All 29 regression cases rejected invalid parameter counts, durations, cooperative records, AWQ fields or kernel profiles. On a genuine quick measurement, three independent one-name replacements still passed full validation. A BF16 GEMM satisfied the FP4 check, and unrelated amax and quant names satisfied the C5-03 role checks. All three edits to the pinned result failed raw-source comparison. Match the observed quantizer names and require FP4-specific GEMM evidence. [Profile validator](../research/quant_ptq/bench_c5_03_nvfp4_120m_fusion.py#L2141) |
+| 3. Public split API — partial | Dynamic default zero, static count one and the tested dtype, device, shape, stride and capacity errors raised `ValueError`. All three rotations matched the reference with the returned count. On a 129 × 768 BF16 identity input, pass 1 returned 27. At 27, packed bytes, block scales and global scale matched. At 26, all three differed. At 28, both scales differed. The global scales were 0.09523810, 0.00037202 and 24.38095284, respectively. Enforce the count already computed by `_n_partials(M, K, rotation)`. All seven requested kernel, helper, class and plan definitions matched the original text, including decorators. [Count check](../research/quant_ptq/nvfp4_inference_blackwell.py#L448) |
+| 4. Measurement limits — closed for the published result | Both retained runs scored the same test shard. At 1024 × 768 × 2048, the static graph ratio crossed parity from 0.9920 to 1.0066. The 120m Hadamard eager ratio moved from 0.9635 to 1.0030 while the graph ratio stayed near 1.0242. Omitting the rerun attribution from quick output is correct. Two report-generation issues remain. The quick run used eight calibration sequences and eight tiny-model training steps, yet its caveats said 128 sequences and 640 steps at 120m. A fresh canonical measurement would also receive the historical attribution to `38cef48`. Bind these statements to the actual protocol and source. [Caveats](../research/quant_ptq/bench_c5_03_nvfp4_120m_fusion.py#L1548) |
+| 5. Bitwise equality — closed | Nine GPU comparisons across BF16, FP16 and FP32 distinguished signed zeros and distinct NaN payloads, and accepted copies of identical NaN bits. All floating layer-output and logit comparisons now use integer views. |
+
+**Writer.** Target and ancestor symlink tests and reserved destination checks passed. Three observed same-directory temp creations used `O_EXCL`. Injected `fsync` and replacement failures each preserved the old JSON and left zero staging files. Static review found a remaining limit on path binding. The guard inspects an `abspath`-normalized path, while the file operations use the original path and reopen its parent by name. Reject parent traversal and use one verified parent directory descriptor for guarded writes. Concurrent directory replacement was outside the live checks. [Writer](../research/quant_ptq/bench_c5_03_nvfp4_120m_fusion.py#L1763)
+
+**Postprocess provenance.** All 44 repository provenance controls passed, including the producer, source and non-v2 commit cases, raw and file digests, dirty state, retained evidence, command syntax and caller downgrade. The CLI also rejected abbreviations and all eight measuring options in postprocess mode. An unpinned source failed before a reserved write. An independent v2 Git fixture with a changed summary module and its genuine code digest failed at the summary-code comparison.
+
+Two single-field edits still received `certified_canonical=True`. A bare script basename passed even though the v2 recorder always emits its repository-relative path and the basename does not exist at the repository root. A postprocess timestamp of 11:29:48 MST passed even though the source-result commit dates to 11:30:16 and the credited postprocessor to 12:16:27 on the same host. Validate the recorded script path and check the recorded chronology. Separately, the parser accepted an ordinary output filename for the pinned source, but the postprocessor rejected it during canonical command validation. [Command recorder](../research/quant_ptq/bench_c5_03_nvfp4_120m_fusion.py#L1935) · [Provenance checks](../research/quant_ptq/bench_c5_03_nvfp4_120m_fusion.py#L2460)
+
+**Reproduction.** From the isolated worktree on the RTX 5080 (sm_120), the first command passed 273 tests. The second passed 3 in 23.26 s, with 97 deselected. The supplemental split probe below uses a known finite value in the workspace tail. No canonical training or scoring was repeated.
+
+```bash
+export PYTHONPATH=.
+py=/home/ryan/Documents/projects/ai/.venv/bin/python
+"$py" -m pytest -q tests/test_nvfp4_inference.py tests/test_c5_03_nvfp4_120m_fusion.py
+"$py" -m pytest -q tests/test_c5_02_isoloss_ptq_mitigation.py -k test_committed_canonical_artifact
+"$py" - <<'PY'
+import torch
+from research.quant_ptq import nvfp4_inference_blackwell as nb
+
+x = torch.ones((129, 768), device="cuda", dtype=torch.bfloat16)
+x[-1, -1] = 256
+ws = torch.full((nb.MAX_PARTIALS,), 65536., device="cuda")
+n = nb.launch_amax(x, ws)
+ref = nb.quantize_activation_ref(x)
+packed = torch.empty_like(ref.packed.view(torch.uint8))
+scale = torch.empty_like(ref.scale.view(torch.uint8))
+gs = torch.empty_like(ref.global_scale)
+for count in (n, n - 1, n + 1):
+    nb.launch_quant(x, packed, scale, gs, workspace=ws, n_part=count)
+    print(count, gs.item(), ref.global_scale.item())
+PY
+```
