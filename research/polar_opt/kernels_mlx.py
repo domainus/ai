@@ -84,6 +84,83 @@ PS3_55 = (
 )
 
 
+# Discovered circuits: copied verbatim from results/schatten_switch_search_cycle2.json.
+_CIRCUIT_SPECS: dict = {
+    "SS3_54": {
+        "name": "SS3_54",
+        "buffers": 3,
+        "u_safe": 1.05,
+        "lo": 0.00286,
+        "error": 0.07982588482306929,
+        "bf16_verified": False,
+        "squarings": [5, 4],
+        "flops": "(6α + 9)n³",
+        "table": [
+            [0.0, [
+                [1, 0, 0, 1.0, -1.035678364265212, 0.0],
+                [2, 1, 1, -44.95361416143577, -13.51553474507387, -0.015878595332442222],
+                [1, 2, 2, -4.569196296690892, 5.092643625703066, -0.9179839421935934],
+                [2, 1, 2, 1.4182468064291267, 0.32580136819175276, -0.4130735383448542],
+                [0, 2, 0, 44.21037324366673, -1.0366534520808317, 1.1258551001231605],
+            ]],
+            [0.0, [
+                [1, 0, 0, 1.0, -1.2041354084316795, 0.3052004453155656],
+                [0, 1, 0, -11.240335609969362, 0.4504520793471352, 0.6056874882617449],
+                [1, 0, 0, -1.3154792860430617, 1.3183888243288422, -0.16196259793937848],
+                [0, 1, 0, 7.874247039551604, -2.8721964431448384, 3.7453983723791087],
+            ]],
+        ],
+    },
+    "SS3_53": {
+        "name": "SS3_53",
+        "buffers": 3,
+        "u_safe": 1.05,
+        "lo": 0.003,
+        "error": 0.08754726536476465,
+        "bf16_verified": False,
+        "squarings": [5, 3],
+        "flops": "(6α + 8)n³",
+        "table": [
+            [0.0, [
+                [1, 0, 0, 1.0, -1.032065172692518, 0.001612489358901909],
+                [2, 1, 1, -44.83263019846355, -13.422258161051742, -0.004608695563609776],
+                [1, 2, 2, -4.342606921772448, 4.829840332286762, -0.8696248777205423],
+                [2, 1, 2, 1.3884720693911183, 0.30675032509703015, -0.3803835190493494],
+                [0, 2, 0, 42.34652174703252, -1.3667245866292133, 1.489476103920553],
+            ]],
+            [0.0, [
+                [1, 0, 0, 1.0, -1.3619545837223892, 0.36463278427406026],
+                [2, 1, 0, -10.626973938205918, -0.8699357489607156, 0.4129312898142153],
+                [0, 2, 0, 6.067460139311178, -3.0603231352476334, 2.802011219993987],
+            ]],
+        ],
+    },
+    "SS3_35": {
+        "name": "SS3_35",
+        "buffers": 3,
+        "u_safe": 1.05,
+        "lo": 0.004,
+        "error": 0.083091071092388,
+        "bf16_verified": True,
+        "squarings": [3, 5],
+        "flops": "(6α + 8)n³",
+        "table": [
+            [0.0, [
+                [1, 0, 0, 1.0, -1.0932562497193754, 0.0],
+                [2, 1, 1, 39.96168457119626, 14.266031068292616, 0.9999999999999999],
+                [0, 2, 0, 12.502107468117961, -0.11270651203942335, 0.17461401290128586],
+            ]],
+            [0.0, [
+                [1, 0, 0, 1.0, -1.094787000847377, 0.006046824763652966],
+                [2, 1, 1, 32.52847526518725, 11.903537182257438, 0.926832022503135],
+                [0, 2, 0, 1.1443577301804355, -0.4951256590911481, -0.14435773018043516],
+                [1, 0, 1, 1.2879235989542381, -0.6561721992471682, -0.28395584065060986],
+                [0, 1, 0, 15.770356077625026, 6.036080816655014, 3.5066207509983927],
+            ]],
+        ],
+    },
+}
+
 def detect_backend(requested="auto"):
     if requested not in ("auto", "mlx", "mps", "cpu"):
         raise ValueError(f"Unknown backend {requested!r}")
@@ -304,13 +381,21 @@ def metal_symprod(x, addend, a, b, c):
     mirrors it, so callers must pass a symmetric addend. Metal rounds once at
     the mirrored store, whereas the dense fallback rounds the Gram first.
     """
+    return _metal_symprod_vec(x, addend, (a, b, c))
+
+
+def _metal_symprod_vec(x, addend, coeff):
+    """Accept cached static coefficients or a lazy three-element FP32 MLX array."""
     import mlx.core as mx
     if x.ndim != 2 or min(x.shape) == 0 or addend.shape != (x.shape[0], x.shape[0]):
         raise ValueError("Expected a nonempty matrix and a square addend matching its row count")
     kernel = (_metal_kernel(x.dtype, True, x.size < 8 or addend.size < 8)
               if x.shape[0] <= _METAL_MAX_N else None)
     if kernel is not None:
-        return kernel(x, addend, _metal_coefficients(a, b, c))
+        if isinstance(coeff, tuple):
+            coeff = _metal_coefficients(*coeff)
+        return kernel(x, addend, coeff)
+    a, b, c = coeff
     return (a * (x @ x.T).astype(mx.float32) + b * addend.astype(mx.float32)
             + c * mx.eye(x.shape[0])).astype(x.dtype)
 
@@ -358,6 +443,7 @@ class _Work:
         if dtype not in DTYPES:
             raise ValueError(f"Unknown working dtype {dtype!r}")
         module = type(x).__module__.split(".")[0]
+        self.dtype = dtype
         self.metal = use_metal_syrk and module == "mlx" and dtype in _METAL_FAST_DTYPES
         if module == "mlx":
             import mlx.core as mx
@@ -375,13 +461,40 @@ class _Work:
         return metal_syrk(x) if self.metal else self.mm(x, x.T)
 
 
-def _normalized(x, safety=1.0):
-    if x.ndim != 2 or min(x.shape) == 0:
+def _array_module(x):
+    module = type(x).__module__.split(".")[0]
+    if module == "mlx":
+        import mlx.core as mx
+        return mx
+    if module == "torch":
+        import torch
+        return torch
+    return np
+
+
+def _oriented(matrix):
+    if matrix.ndim != 2 or min(matrix.shape) == 0:
         raise ValueError("Expected a nonempty 2-D real matrix")
-    x = _float32(x)
-    if x.shape[0] > x.shape[1]:
-        x = x.T
-    return x / (safety * (x * x).sum() ** 0.5 + 1e-7)
+    x = _float32(matrix)
+    return x.T if x.shape[0] > x.shape[1] else x
+
+
+def _safe_norm(x, xp):
+    """Scale the FP32 sum of squares by an exact, representable power of two."""
+    amax = xp.max(xp.abs(x))
+    safe_amax = xp.where((amax > 0) & xp.isfinite(amax), amax, 1.0)
+    exponent = xp.clip(-xp.floor(xp.log2(safe_amax)), -126, 126)
+    inv_scale = 2.0 ** exponent
+    scaled = x * inv_scale
+    return xp.sqrt((scaled * scaled).sum()) / inv_scale
+
+
+def _normalized(x, safety=1.0):
+    x = _oriented(x)
+    xp = _array_module(x)
+    norm = _safe_norm(x, xp)
+    valid = xp.isfinite(norm)
+    return xp.where(valid, x, 0.0) / (safety * xp.where(valid, norm, 1.0) + 1e-7)
 
 
 def _identity(x):
@@ -455,30 +568,123 @@ def polar_switch(matrix, variant="PS2_55", dtype="float32", use_metal_syrk=False
         raise ValueError(f"Unknown Polar Switch variant {variant!r}")
     work = _Work(matrix, dtype, use_metal_syrk)
     x = work.cast(_normalized(matrix))
-    identity = None if work.metal else _identity(x)
     for residual, steps in table:
-        buffers = {0: work.gram(x)}
-        for dst, src, add, a, b, c in steps:
-            operand, addend = buffers[src], buffers[add]
-            if work.metal:
-                buffers[dst] = metal_symprod(operand, addend, a, b, c)
-            else:
-                buffers[dst] = work.cast(a * _float32(work.gram(operand)) + b * _float32(addend)
-                                         + c * identity)
-        update = work.mm(buffers[dst], x)
-        x = work.cast(update + residual * x) if residual else update
+        x = _switch_segment(x, residual, steps, work)
     return _restore(x, matrix)
+
+
+def _switch_segment(x, residual, steps, work):
+    identity = None if work.metal else _identity(x)
+    buffers = {0: work.gram(x)}
+    for dst, src, add, a, b, c in steps:
+        operand, addend = buffers[src], buffers[add]
+        if work.metal:
+            buffers[dst] = metal_symprod(operand, addend, a, b, c)
+        else:
+            buffers[dst] = work.cast(a * _float32(work.gram(operand)) + b * _float32(addend)
+                                     + c * identity)
+    update = work.mm(buffers[dst], x)
+    return work.cast(update + residual * x) if residual else update
+
+
+_SLACK = 1.0 + 2.0**-12
+_ROUNDING = {"float16": (2.0**-11, 2.0**-25), "bfloat16": (2.0**-8, 0.0),
+             "float32": (2.0**-24, 2.0**-150)}
+
+
+def _upper(norm_r, norm_s, n, k, dtype, prescale, alpha, xp):
+    u, e = _ROUNDING[dtype]
+    slack = _SLACK / max(0.5, 1.0 - 1e-8 * k)
+    trace = prescale**2 * (1.0 + u)**2 * slack
+    schatten = xp.sqrt(((1.0 + u) * norm_s * slack + n * e) / alpha)
+    upper = schatten + u * norm_r * slack + n * e
+    return xp.where((norm_s > 0) & (upper < trace), upper, trace)
+
+
+def _dense_scaled_gram(x, alpha, work, xp):
+    # Apply alpha to the accumulator. Casting an unscaled square can overflow
+    # FP16 even when the scaled square is small (e.g. a coordinate spike).
+    if xp is np:
+        return work.cast(alpha * (x @ x.T))
+    zero = xp.zeros_like(x[:1, :1])
+    return xp.addmm(zero, x, x.T, alpha=alpha, beta=0.0)
+
+
+def _schatten_first_segment(x, rows, kappa, alpha, r, square, work, xp):
+    b0, c0 = rows[0][4:]
+    factor = {0: 1.0 / kappa, 1: alpha / (kappa * kappa)}
+    identity = _identity(x) if c0 or not work.metal else None
+    row0 = _float32(square) + (alpha * b0 / kappa) * _float32(r)
+    if c0:
+        row0 = row0 + (c0 * factor[1]) * identity
+    buffers = {0: r, 1: work.cast(row0)}
+    one = xp.ones_like(kappa)
+    for j, (dst, src, add, a, b, c) in enumerate(rows[1:], 1):
+        t = xp.sqrt(kappa) if j == len(rows) - 1 else one
+        fa, fb, fc = a * t / (factor[src] * factor[src]), b * t / factor[add], c * t
+        operand, addend = buffers[src], buffers[add]
+        if work.metal:
+            buffers[dst] = _metal_symprod_vec(operand, addend, xp.stack([fa, fb, fc]))
+        elif work.dtype == "bfloat16":
+            # The coherent rank-one gate requires one BF16 rounding after the
+            # affine sum. Rounding the dense square first can exceed the cap.
+            wide = _float32(operand)
+            buffers[dst] = work.cast(fa * (wide @ wide.T) + fb * _float32(addend) + fc * identity)
+        else:
+            if j == 1:
+                # Buffer 1 stores alpha/kappa² times the polynomial. Undo its
+                # power-of-two scale before narrowing the dense square.
+                scale = 2.0 ** (-xp.floor(xp.log2(factor[1])))
+                operand = work.cast(_float32(operand) * scale)
+                fa = fa / (scale * scale)
+            buffers[dst] = work.cast(fa * _float32(work.gram(operand))
+                                     + fb * _float32(addend) + fc * identity)
+        factor[dst] = t
+    return work.mm(buffers[dst], x)
+
+
+def schatten_switch(matrix, variant="SS3_54", dtype="float16", use_metal_syrk=False,
+                    allow_unsafe_bf16=False):
+    """Two-segment Schatten-8 circuit. All data-dependent scalars stay on device."""
+    if variant not in _CIRCUIT_SPECS:
+        raise ValueError(f"Unknown Schatten Switch variant {variant!r}")
+    spec = _CIRCUIT_SPECS[variant]
+    if dtype == "bfloat16" and not spec["bf16_verified"] and not allow_unsafe_bf16:
+        raise ValueError(f"{variant} is not verified for bfloat16")
+    work = _Work(matrix, dtype, use_metal_syrk)
+    x = _oriented(matrix)
+    xp = _array_module(x)
+    n, k = x.shape
+    prescale = 64.0 if n >= 1024 else 1.0
+    alpha = 2.0**13 / prescale**4
+    norm = _safe_norm(x, xp)
+    valid = (norm > 1e-12) & xp.isfinite(norm)
+    x = work.cast((xp.where(valid, x, 0.0) / xp.where(valid, norm, 1.0)) * prescale)
+    r = work.gram(x)
+    square = (_metal_symprod_vec(r, r, _metal_coefficients(alpha, 0.0, 0.0)) if work.metal
+              else _dense_scaled_gram(r, alpha, work, xp))
+    upper = _upper(_safe_norm(_float32(r), xp), _safe_norm(_float32(square), xp),
+                   n, k, dtype, prescale, alpha, xp)
+    kappa = 1.0 / (spec["u_safe"]**2 * upper)
+    (_, rows), (residual, steps) = spec["table"]
+    x = _schatten_first_segment(x, rows, kappa, alpha, r, square, work, xp)
+    x = _switch_segment(x, residual, steps, work)
+    return _restore(xp.where(valid, x, 0.0), matrix)
 
 
 METHODS = {"jordan_ns5": jordan_ns5, "polar_express": polar_express, "gram_ns": gram_ns,
            "PS2_55": polar_switch, "PS3_55": partial(polar_switch, variant="PS3_55")}
 
 
-def _block_orders(rng, count):
+SCHATTEN_METHODS = {name: partial(schatten_switch, variant=name) for name in _CIRCUIT_SPECS}
+ALL_METHODS = {**METHODS, **SCHATTEN_METHODS}
+
+
+def _block_orders(rng, count, names=None):
     """Randomized Latin squares balance every method across all time slots."""
     orders = []
     while len(orders) < count:
-        base = list(METHODS)
+        base = list(METHODS if names is None else names)
         rng.shuffle(base)
         for offset in rng.permutation(len(base)):
             orders.append(base[offset:] + base[:offset])
@@ -501,54 +707,126 @@ def _quality(output, reference):
                 relative_frobenius_error=error, sigma_max=sigma, orthogonality_err=orth)
 
 
-def _measure(x, reference, backend, dtype, requested, rng, warmups, repeats):
-    calls = {name: partial(fn, x, dtype=dtype, use_metal_syrk=requested)
-             for name, fn in METHODS.items()}
+def thermal_snapshot():
+    snapshot = {"timestamp": datetime.now(timezone.utc).isoformat()}
+    if platform.system() == "Darwin":
+        for key, cmd in (("therm", ["pmset", "-g", "therm"]), ("batt", ["pmset", "-g", "batt"]),
+                         ("clamshell", ["ioreg", "-r", "-k", "AppleClamshellState", "-d", "4"])):
+            output = subprocess.check_output(cmd, text=True)
+            if key == "clamshell":
+                output = "\n".join(line.strip() for line in output.splitlines()
+                                   if '"AppleClamshellState" =' in line)
+            snapshot[key] = output.strip()
+    return snapshot
+
+
+def _time_blocks(calls, backend, rng, warmups, repeats):
+    for block in _block_orders(rng, warmups, calls):
+        for name in block:
+            synchronize(calls[name](), backend)
+    orders = _block_orders(rng, repeats, calls)
+    samples = {name: [] for name in calls}
+    walls = {name: [] for name in calls}
+    outputs = {}
+    for block in orders:
+        for name in block:
+            wall = time.time()
+            start = time.perf_counter_ns()
+            out = calls[name]()
+            synchronize(out, backend)
+            samples[name].append((time.perf_counter_ns() - start) / 1e6)
+            walls[name].append(time.time() - wall)
+            outputs[name] = out
+    return samples, walls, outputs, orders
+
+
+def _sample_stats(samples, walls):
+    p25, median, p75 = np.percentile(samples, [25, 50, 75]).tolist()
+    return dict(samples_ms=samples, sample_wall_s=walls, median_ms=median, latency_ms=median,
+                iqr_ms=p75-p25, p25_ms=p25, p75_ms=p75, min_ms=min(samples),
+                sleep_detected=any(w > 0.002 * s + 0.5 for w, s in zip(walls, samples)))
+
+
+def _measure(x, reference, backend, dtype, requested, rng, warmups, repeats, methods, ab_metal):
+    paired = ab_metal and backend == "mlx" and dtype in _METAL_FAST_DTYPES
+    arms = {}
+    skipped = []
+    for name, fn in methods.items():
+        for metal in ((False, True) if paired else (requested,)):
+            arm = "metal" if metal else "dense"
+            label = f"{name}__{arm}" if paired else name
+            if dtype == "bfloat16" and name in _CIRCUIT_SPECS and not _CIRCUIT_SPECS[name]["bf16_verified"]:
+                skipped.append(dict(method=label, base_method=name, reason="bf16_verified=False"))
+                continue
+            arms[label] = name, metal, partial(fn, x, dtype=dtype, use_metal_syrk=metal)
+    if not arms:
+        return [], [], skipped
     syrk_fn = symprod_fn = None
-    if (requested and backend == "mlx" and dtype in _METAL_FAST_DTYPES
+    if ((requested or paired) and backend == "mlx" and dtype in _METAL_FAST_DTYPES
             and min(x.shape) <= _METAL_MAX_N):
         import mlx.core as mx
         work_dtype = getattr(mx, dtype)
         syrk_fn = _metal_kernel(work_dtype, False, x.size < 8)
         symprod_fn = _metal_kernel(work_dtype, True, min(x.shape) ** 2 < 8)
-    syrk = syrk_fn is not None
-    symprod = symprod_fn is not None
-    syrk_tile = syrk_fn.keywords["tile_size"] if syrk_fn is not None else None
-    symprod_tile = symprod_fn.keywords["tile_size"] if symprod_fn is not None else None
-    for block in _block_orders(rng, warmups):
-        for name in block:
-            synchronize(calls[name](), backend)
-    orders = _block_orders(rng, repeats)
-    times = {name: [] for name in calls}
-    outputs = {}
-    for block in orders:
-        for name in block:
-            start = time.perf_counter_ns()
-            out = calls[name]()
-            synchronize(out, backend)
-            times[name].append((time.perf_counter_ns() - start) / 1e6)
-            outputs[name] = out
+    calls = {label: run for label, (_, _, run) in arms.items()}
+    samples, walls, outputs, orders = _time_blocks(calls, backend, rng, warmups, repeats)
     rows = []
-    for name, samples in times.items():
-        p25, median, p75 = np.percentile(samples, [25, 50, 75]).tolist()
-        rows.append(dict(method=name, shape=list(x.shape), backend=backend, dtype=dtype,
-                         use_metal_syrk=syrk, use_metal_symprod=symprod and name.startswith("PS"),
-                         metal_syrk_tile=syrk_tile,
-                         metal_symprod_tile=symprod_tile if name.startswith("PS") else None,
-                         output_dtype=str(outputs[name].dtype), median_ms=median, latency_ms=median,
-                         iqr_ms=p75-p25, p25_ms=p25, p75_ms=p75, min_ms=min(samples),
-                         samples_ms=samples, **_quality(outputs[name], reference)))
-    return rows, orders
+    for label, (name, metal, _) in arms.items():
+        syrk = metal and syrk_fn is not None
+        fused = metal and name.startswith(("PS", "SS")) and symprod_fn is not None
+        row = dict(method=label, shape=list(x.shape), backend=backend, dtype=dtype,
+                   use_metal_syrk=syrk, use_metal_symprod=fused,
+                   metal_syrk_tile=syrk_fn.keywords["tile_size"] if syrk else None,
+                   metal_symprod_tile=symprod_fn.keywords["tile_size"] if fused else None,
+                   output_dtype=str(outputs[label].dtype), **_sample_stats(samples[label], walls[label]),
+                   **_quality(outputs[label], reference))
+        if paired:
+            row.update(base_method=name, arm="metal" if metal else "dense")
+        rows.append(row)
+    return rows, orders, skipped
+
+
+def _paired_summary(rows):
+    dense = {(row["seed"], tuple(row["shape"]), row["dtype"], row["base_method"]): row["samples_ms"]
+             for row in rows if row.get("arm") == "dense"}
+    groups = {}
+    for row in rows:
+        if row.get("arm") == "metal":
+            key = tuple(row["shape"]), row["dtype"], row["base_method"]
+            times = dense[(row["seed"],) + key]
+            groups.setdefault(key, []).extend(d / m for d, m in zip(times, row["samples_ms"], strict=True))
+    summary = []
+    for (shape, dtype, name), ratios in groups.items():
+        p25, median, p75 = np.percentile(ratios, [25, 50, 75]).tolist()
+        summary.append(dict(shape=list(shape), dtype=dtype, method=name, median=median, p25=p25,
+                            p75=p75, iqr=p75-p25, min=min(ratios), max=max(ratios), n_blocks=len(ratios)))
+    return summary
+
+
+def git_provenance():
+    cwd = Path(__file__).resolve().parent
+    try:
+        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=cwd, text=True).strip()
+        dirty = subprocess.check_output(["git", "status", "--porcelain"], cwd=cwd, text=True)
+        return dict(git_sha=sha, git_dirty=bool(dirty))
+    except (OSError, subprocess.CalledProcessError):
+        return dict(git_sha=None, git_dirty=None)
 
 
 def benchmark(*, backend="auto", quick=False, warmups=5, repeats=20, seed=0, seeds=None,
-              reference_dtype="float64", dtypes=("float32",), shapes=None, use_metal_syrk=False):
+              reference_dtype="float64", dtypes=("float32",), shapes=None, use_metal_syrk=False,
+              methods=None, ab_metal=False):
     if warmups < 0 or repeats < 1 or reference_dtype not in ("float64", "float32"):
         raise ValueError("Expected nonnegative warmups, positive repeats and a float64 or float32 SVD")
     if isinstance(dtypes, str):
         dtypes = dtypes.split(",")
     if not dtypes or any(dtype not in DTYPES for dtype in dtypes):
         raise ValueError(f"Expected working dtypes from {DTYPES}")
+    names = methods.split(",") if isinstance(methods, str) else methods
+    if names is not None and (not names or len(set(names)) != len(names)
+                              or any(name not in ALL_METHODS for name in names)):
+        raise ValueError(f"Expected a nonempty subset of {list(ALL_METHODS)}")
+    selected = METHODS if names is None else {name: ALL_METHODS[name] for name in names}
     if shapes is None:
         shapes = QUICK_SHAPES if quick else FULL_SHAPES
     if not shapes or any(len(shape) != 2 or min(shape) < 1 for shape in shapes):
@@ -561,7 +839,9 @@ def benchmark(*, backend="auto", quick=False, warmups=5, repeats=20, seed=0, see
         import mlx.core as mx
         mx.set_default_device(mx.gpu)
     timestamp = datetime.now(timezone.utc).isoformat()
-    rows, orders = [], []
+    provenance = git_provenance()
+    thermal_before = thermal_snapshot()
+    rows, orders, skipped = [], [], []
     for input_seed in seeds:
         rng = np.random.default_rng(input_seed)
         order_rng = np.random.default_rng(np.random.SeedSequence([input_seed, 1]))
@@ -572,22 +852,24 @@ def benchmark(*, backend="auto", quick=False, warmups=5, repeats=20, seed=0, see
             x = native_array(sample, backend)
             synchronize(x, backend)
             for dtype in dtypes:
-                measured, blocks = _measure(x, reference, backend, dtype, use_metal_syrk,
-                                            order_rng, warmups, repeats)
+                case = dict(shape=list(shape), dtype=dtype, seed=input_seed)
+                before = thermal_snapshot()
+                measured, blocks, omissions = _measure(x, reference, backend, dtype, use_metal_syrk,
+                                                       order_rng, warmups, repeats, selected, ab_metal)
+                orders.append(dict(**case, blocks=blocks, thermal_before=before, thermal_after=thermal_snapshot()))
                 rows.extend(dict(row, seed=input_seed) for row in measured)
-                orders.append(dict(shape=list(shape), dtype=dtype, seed=input_seed, blocks=blocks))
+                skipped.extend(dict(**case, **entry) for entry in omissions)
     library = {"cpu": "numpy", "mps": "torch", "mlx": "mlx"}[backend]
     thread_vars = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
     source = Path(__file__).resolve()
-    try:
-        git_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source.parent,
-                                          stderr=subprocess.DEVNULL, text=True).strip()
-    except (OSError, subprocess.CalledProcessError):
-        git_sha = None
     return {"backend": backend, "library": library, "library_version": version(library),
             "thread_environment": {key: os.environ[key] for key in thread_vars if key in os.environ},
             "hardware": hardware_metadata(), "quick": quick, "seed": seeds[0], "seeds": seeds,
-            "created_at": timestamp, "timestamp": timestamp, "git_sha": git_sha,
+            "created_at": timestamp, "timestamp": timestamp, **provenance,
+            "thermal_before": thermal_before, "thermal_after": thermal_snapshot(),
+            "sleep_detected": any(row["sleep_detected"] for row in rows),
+            "ab_metal": ab_metal, "methods": list(selected), "skipped_methods": skipped,
+            "paired_ab_summary": _paired_summary(rows),
             "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
             "dtype": dtypes[0] if len(dtypes) == 1 else list(dtypes), "dtypes": list(dtypes),
             "input_dtype": "float32", "use_metal_syrk_requested": use_metal_syrk,
@@ -614,6 +896,8 @@ if __name__ == "__main__":
     parser.add_argument("--dtypes", default="float32", help="Comma-separated working precisions")
     parser.add_argument("--shapes", type=_parse_shapes, help="Comma-separated shapes, e.g. 512x2048,2048x2048")
     parser.add_argument("--use-metal-syrk", action="store_true", help="Use triangular SYRK and fused PS on MLX")
+    parser.add_argument("--ab-metal", action="store_true", help="Interleave dense and Metal arms on MLX")
+    parser.add_argument("--methods", help="Comma-separated method names")
     seed_group = parser.add_mutually_exclusive_group()
     seed_group.add_argument("--seed", type=int, default=0)
     seed_group.add_argument("--seeds", help="Comma-separated independent input seeds")
@@ -624,7 +908,7 @@ if __name__ == "__main__":
     data = benchmark(backend=args.backend, quick=args.quick, warmups=args.warmups, repeats=repeats,
                      seed=args.seed, seeds=list(map(int, args.seeds.split(","))) if args.seeds else None,
                      reference_dtype=args.reference_dtype, dtypes=args.dtypes, shapes=args.shapes,
-                     use_metal_syrk=args.use_metal_syrk)
+                     use_metal_syrk=args.use_metal_syrk, methods=args.methods, ab_metal=args.ab_metal)
     data["command"] = [sys.executable, *sys.argv]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(data, indent=2, allow_nan=False) + "\n", encoding="utf-8")
