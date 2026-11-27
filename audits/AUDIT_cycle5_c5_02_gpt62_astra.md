@@ -311,3 +311,17 @@ The fresh-run path has the same defect. From the unmodified `61d14f2` JSON, set 
 | Targeted pytest | With CUDA hidden, **97 passed and 3 hardware-dependent tests skipped** in 421.48 s. On the live NVIDIA GeForce RTX 5080 (driver 615.78.08), **100 passed** in 351.63 s. Both runs used the project virtual environment, disabled bytecode and separate pytest caches. |
 
 **Secondary command metadata finding.** On the synthetic fresh `a7c4be2` canonical control, append either `["--checkpoint-d", "elsewhere"]` or `["--data-d", "elsewhere"]` to `meta.command`. In each case the parser selects `elsewhere`, the corresponding recorded path remains different, and validation returns `certified_canonical=True`. The parser accepts unambiguous option abbreviations. The directory checks look for the fully spelled option in the raw arguments. These two metadata cases are outside the 106 prior probes. [Option detection](../research/quant_ptq/bench_c5_02_isoloss_ptq_mitigation.py#L1864) · [Directory checks](../research/quant_ptq/bench_c5_02_isoloss_ptq_mitigation.py#L2041)
+
+## Closed Final Signoff (`bfeef23`)
+
+**2026-11-27 · PASS — HOLD LIFTED.** The v2 attribution defect and abbreviated-option defect from the `e0d5450` review are closed. The re-check found no new blocker.
+
+| Check | Observed result |
+|---|---|
+| Commit scope | `92897b6` is the direct child of `e0d5450` and changes only the driver and its test. Its child `bfeef23` changes only the result JSON. |
+| Provenance | The result SHA-256 is `98ca25e62255e5449660bc08e3ada0e2a7df346c9637ecc18c033342c7603e53`. The recorded postprocessor is `92897b6676a9fa762011cc43721b462ab26f65c4`. Hashing its 16 named Git blobs in order reproduced `9596c2eca718444d58921660020d86531d50375766e54394eca6e9c2bea32d50`. |
+| Raw measurements and replay | The source JSON at `da148c2` hashes to `4944c2832056524f994a2d4931950983244ac20e547cc9e281d5e7e0defeddb8`. All ten raw fields matched individually under canonical JSON serialization. Their combined SHA-256 matched `source_raw_measurements_sha256` at `ed181be0228efaa060e2ae197958137158fb4f7466ce0a6974451c9a24c0acd1`. Replaying the recorded command in a clean clone at `92897b6` reproduced every field except the generation timestamp. |
+| Attribution | **4/4 rejected** at the summary-code check. Both `9473f90` and `a7c4be2` failed with their genuine code digests on the postprocessed and fresh canonical paths. The fresh `9473f90` case used unit hash `346808d5e324305a` and run hash `cc4be683cba148ee`. The published artifact and the synthetic fresh control credited to `92897b6` both certified. |
+| CLI metadata | **6/6 rejected** at command parsing. Each of `--checkpoint-d`, `--data-d` and `--postprocess-f` failed in both the fresh control’s `meta.command` and the artifact’s `postprocess_command`. Full directory options accepted matching paths and rejected mismatches in both space-separated and equals forms. |
+| Prior probes | Replayed the original field edits and the additional suite. **66/66 original** and **40/40 additional** probes rejected. The original 66 also rejected when explicitly requesting exploratory validation of the canonical payload. |
+| Targeted pytest | With CUDA hidden, **97 passed and 3 hardware-dependent tests skipped** in 425.63 s. On the live NVIDIA GeForce RTX 5080 (driver 615.78.08), **100 passed** in 353.55 s. |
