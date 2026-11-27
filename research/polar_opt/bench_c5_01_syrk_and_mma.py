@@ -49,6 +49,7 @@ import math
 import os
 import random
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -924,23 +925,123 @@ def _validate_long_k(payload: dict) -> None:
                          f"grid {name}: singular values out of order")
 
 
+def _fp32_word(text: str) -> int:
+    """Decode a hex/inf FP32 string from ``_hex`` into its 32-bit IEEE-754 word (rejects NaN)."""
+    if not isinstance(text, str):
+        raise ValueError(f"expected string FP32 value, got {text!r}")
+    if text == "inf":
+        value = math.inf
+    elif text == "-inf":
+        value = -math.inf
+    else:
+        value = float.fromhex(text)
+    try:
+        packed = struct.pack("<f", value)
+    except OverflowError as exc:
+        raise ValueError(f"FP32 overflow in {text!r}") from exc
+    _require(not math.isnan(value) and struct.unpack("<f", packed)[0] == value,
+             f"expected exact finite or infinite FP32 value, got {text!r}")
+    return struct.unpack("<I", packed)[0]
+
+
 def _validate_mma(payload: dict) -> None:
+    from research.polar_opt.kernels_blackwell import _CONFIGS
+
     mma, spec = payload["mma"], payload["protocol"]["mma"]
+    expected_witnesses = [
+        ("Astra FP16 4-term diagonal", "fp16", math.perm(mm.GROUP, len(mm.ASTRA_FP16_WITNESS)),
+         mm.ASTRA_FP16_HARDWARE),
+        ("BF16 5-term diagonal (reconstructed)", "bf16", math.perm(mm.GROUP, len(mm.BF16_WITNESS)),
+         mm.ASTRA_BF16_HARDWARE),
+    ]
+    _require([(w["name"], w["dtype"], w["permutations"]) for w in mma["witnesses"]]
+             == [(n, dt, perms) for n, dt, perms, _ in expected_witnesses],
+             "witnesses differ from the protocol")
+    for w, (_, _, _, expected_audit) in zip(mma["witnesses"], expected_witnesses):
+        audit_word = _fp32_word(w["audit_hardware"])
+        _require(audit_word == _fp32_word(expected_audit), f"witness {w['name']}: audit_hardware differs")
+        _require(len(w["syrk_configs_hardware"]) == len(_CONFIGS), f"witness {w['name']}: config count differs")
+        expected_model_eq = (_fp32_word(w["sm120_model"]) == _fp32_word(w["probe_hardware"]) == audit_word)
+        _require(w["model_equals_hardware"] is expected_model_eq,
+                 f"witness {w['name']}: model_equals_hardware differs from recorded words")
+        expected_cfg_eq = all(_fp32_word(v) == audit_word for v in w["syrk_configs_hardware"])
+        _require(w["configs_equal_hardware"] is expected_cfg_eq,
+                 f"witness {w['name']}: configs_equal_hardware differs from recorded words")
+        _require(0 <= w["permutations_equal_hardware"] <= w["permutations"],
+                 f"witness {w['name']}: permutation count")
+
+    _require([r["name"] for r in mma["exponent_table"]] == [c["name"] for c in mm.ASTRA_EXPONENT_TABLE],
+             "exponent_table rows differ from the protocol")
+    for r, case in zip(mma["exponent_table"], mm.ASTRA_EXPONENT_TABLE):
+        audit_word = _fp32_word(r["audit_hardware"])
+        _require(audit_word == _fp32_word(mm._hex(case["hardware"])),
+                 f"exponent_table {r['name']}: audit_hardware differs")
+        expected_eq = (_fp32_word(r["sm120_model"]) == _fp32_word(r["probe_hardware"]) == audit_word)
+        _require(r["model_equals_hardware"] is expected_eq,
+                 f"exponent_table {r['name']}: model_equals_hardware differs from recorded words")
+
+    _require([(r["name"], r["dtype"]) for r in mma["edge_cases"]]
+             == [(name, dtype) for name, dtype, *_ in mm.EDGE_CASES],
+             "edge_cases differ from the protocol")
+    for r in mma["edge_cases"]:
+        bits_text = r.get("hardware_bits")
+        _require(isinstance(bits_text, str) and bits_text.startswith("0x") and _is_hex(bits_text[2:], 8),
+                 f"edge_case {r['name']}: hardware_bits format")
+        hw_word = int(bits_text, 16)
+        if r["hardware"] == "nan":
+            _require((hw_word & 0x7F800000) == 0x7F800000 and (hw_word & 0x007FFFFF) != 0,
+                     f"edge_case {r['name']}: non-NaN hardware_bits")
+            expected_eq = (r["sm120_model"] == "nan" and hw_word == mm.NAN_BITS)
+        else:
+            _require(hw_word == _fp32_word(r["hardware"]),
+                     f"edge_case {r['name']}: hardware_bits differs from hardware")
+            expected_eq = (r["sm120_model"] != "nan" and _fp32_word(r["sm120_model"]) == hw_word)
+        _require(r["model_equals_hardware"] is expected_eq,
+                 f"edge_case {r['name']}: model_equals_hardware differs from recorded words")
+
     for r in [*mma["stress"], *mma["syrk_configs"], *mma["audit_seeds"]]:
         _require(0 <= r["bit_matches"] <= r["cases"] and _is_hex(r["hardware_sha256"], 64), f"{r['category']}: counts")
         _require(len(r["mismatches"]) == min(4, r["cases"] - r["bit_matches"]), f"{r['category']}: mismatch records")
-    singles = [r for r in mma["stress"] if r["kind"] == "single"]
-    _require(len(singles) == len(mm.STRESS_CATEGORIES) * len(mm.DTYPES)
-             and all(r["cases"] == spec["stress_dots"] for r in singles), "stress categories differ")
-    chains = [(r["k"], r["bk"]) for r in mma["stress"] if r["kind"] == "chain"]
-    _require(chains == [tuple(c) for c in spec["chains"]] * len(mm.DTYPES), "chains differ from the protocol")
-    from research.polar_opt.kernels_blackwell import _CONFIGS
 
-    _require(len(mma["syrk_configs"]) == len(_CONFIGS) * len(spec["syrk_shapes"]) * len(mm.DTYPES),
-             "syrk_configs must cover every configuration, shape and dtype")
-    _require({tuple(sorted(r["config"].items())) for r in mma["syrk_configs"]}
-             == {tuple(sorted(mm.config_record(c).items())) for c in _CONFIGS}, "syrk_configs differ from _CONFIGS")
-    _require(set(r["hypothesis"] for r in mma["hypotheses"]) == set(mm.HYPOTHESES), "hypotheses differ")
+    expected_stress = []
+    for dt in mm.DTYPES:
+        for cat in mm.STRESS_CATEGORIES:
+            expected_stress.append((f"{cat}/{dt}", dt, "single", mm.GROUP, mm.GROUP, spec["stress_dots"]))
+        for k, bk in spec["chains"]:
+            expected_stress.append((f"chain_k{k}_bk{bk}/{dt}", dt, "chain", k, bk, spec["chain_dots"]))
+    _require([(r["category"], r["dtype"], r["kind"], r["k"], r["bk"], r["cases"]) for r in mma["stress"]]
+             == expected_stress, "stress rows differ from the protocol")
+    _require(all(isinstance(r["scalar_crosscheck"], list) and len(r["scalar_crosscheck"]) == 2
+                 and 0 <= r["scalar_crosscheck"][0] <= r["scalar_crosscheck"][1] == spec["scalar_crosscheck"]
+                 for r in mma["stress"] if r["kind"] == "single"), "scalar_crosscheck differs")
+
+    cfg_records = [mm.config_record(c) for c in _CONFIGS]
+    expected_syrk = [(f"syrk_{n}x{k}/{dt}", dt, [n, k], cfg, n * (n + 1) // 2)
+                     for dt in mm.DTYPES for n, k in spec["syrk_shapes"] for cfg in cfg_records]
+    _require([(r["category"], r["dtype"], r["shape"], r["config"], r["cases"]) for r in mma["syrk_configs"]]
+             == expected_syrk, "syrk_configs differ from the protocol")
+    _require(all(0 <= r["fused_store_matches"] <= r["cases"] for r in mma["syrk_configs"]),
+             "syrk_configs fused_store_matches")
+
+    expected_audit = []
+    for dt in mm.DTYPES:
+        for label in ("seed419_9x2033", "seed419_9x2033_unit_frobenius"):
+            for cfg in cfg_records:
+                expected_audit.append((f"{label}/{dt}", dt, cfg, 45))
+        for cfg in cfg_records:
+            for part in ("offdiag", "diag0"):
+                expected_audit.append((f"seed927_4096x2x16_{part}/{dt}", dt, cfg, 4096))
+        for cfg in cfg_records:
+            expected_audit.append((f"seed719_32768x2x16_offdiag/{dt}", dt, cfg, 32768))
+    _require([(r["category"], r["dtype"], r["config"], r["cases"]) for r in mma["audit_seeds"]]
+             == expected_audit, "audit_seeds differ from the protocol")
+    _require(all(0 <= r["fused_store_matches"] <= r["cases"]
+                 for r in mma["audit_seeds"] if r["category"].startswith("seed719_")),
+             "audit_seeds fused_store_matches")
+
+    _require([(r["hypothesis"], r["dtype"], r["cases"]) for r in mma["hypotheses"]]
+             == [(name, dt, spec["hypothesis_dots"]) for dt in mm.DTYPES for name in mm.HYPOTHESES],
+             "hypotheses differ")
 
 
 def validate_results(payload: dict, *, canonical: bool | None = None) -> None:

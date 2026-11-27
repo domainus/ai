@@ -635,8 +635,22 @@ def _mma_mismatch(payload):
     record["mismatches"] = [{"index": 0, "hardware": "0x1.0p+0", "model": "0x1.000002p+0"}]
 
 
+def _witness_consistent_fail(payload):
+    payload["mma"]["witnesses"][0]["syrk_configs_hardware"][0] = "0x1.2c63f60000000p-5"
+    payload["mma"]["witnesses"][0]["configs_equal_hardware"] = False
+
+
+def _edge_consistent_fail(payload):
+    payload["mma"]["edge_cases"][0]["sm120_model"] = "0x1.0p+0"
+    payload["mma"]["edge_cases"][0]["model_equals_hardware"] = False
+
+
+def _duplicate_stress(payload):
+    payload["mma"]["stress"][1] = copy.deepcopy(payload["mma"]["stress"][0])
+
+
 def _structural_probes(canonical):
-    """Astra's validator bypasses (C5-01 audit): each must now be rejected."""
+    """Astra's validator bypasses (C5-01 audit + re-audit open Finding 5): each must be rejected."""
     probes = [
         (_set(["timing", "cells", 0, "dtype"], "fp64"), "dtype differs"),
         (lambda p: p["long_k"]["opus_l6"].pop(), "opus_l6 rows"),
@@ -647,13 +661,31 @@ def _structural_probes(canonical):
         (lambda p: p["long_k"]["boundaries"].pop(0), "boundaries rows"),
         (lambda p: p["long_k"]["inputs"].pop(), "inputs rows"),
         (_set(["long_k", "graphs", 0, "shape"], [2, 16]), "graphs rows"),
+        (_set(["mma", "witnesses", 0, "sm120_model"], "0x1.2c63f60000000p-5"),
+         "model_equals_hardware differs from recorded words"),
+        (_set(["mma", "witnesses", 0, "syrk_configs_hardware", 0], "0x1.2c63f60000000p-5"),
+         "configs_equal_hardware differs from recorded words"),
+        (_set(["mma", "witnesses", 0, "configs_equal_hardware"], False),
+         "configs_equal_hardware differs from recorded words"),
+        (_set(["mma", "exponent_table", 0, "sm120_model"], "0x1.0000020000000p-123"),
+         "model_equals_hardware differs from recorded words"),
+        (_set(["mma", "edge_cases", 0, "model_equals_hardware"], False),
+         "model_equals_hardware differs from recorded words"),
+        (lambda p: _set(["mma", "edge_cases", next(i for i, r in enumerate(p["mma"]["edge_cases"])
+                                                   if r["hardware"] == "nan"), "hardware_bits"],
+                        "0x7ffffffe")(p), "model_equals_hardware differs from recorded words"),
+        (lambda p: p["mma"]["audit_seeds"].clear(), "audit_seeds differ"),
+        (lambda p: p["mma"]["edge_cases"].clear(), "edge_cases differ"),
+        (_duplicate_stress, "stress rows differ"),
+        (lambda p: p["mma"]["syrk_configs"].pop(), "syrk_configs differ"),
+        (lambda p: p["mma"]["hypotheses"].pop(), "hypotheses differ"),
     ]
     if canonical:
         probes += [
             (_mma_mismatch, "promotion: mma all_dot_products"),
-            (_set(["mma", "edge_cases", 0, "model_equals_hardware"], False), "promotion: mma edge_cases"),
+            (_edge_consistent_fail, "promotion: mma edge_cases"),
             (_set(["mma", "edge_cases", 0, "vectorized_equals_hardware"], False), "promotion: mma edge_cases"),
-            (_set(["mma", "witnesses", 0, "configs_equal_hardware"], False), "promotion: mma witnesses"),
+            (_witness_consistent_fail, "promotion: mma witnesses"),
             (_set(["mma", "syrk_configs", 0, "fused_store_matches"], 0), "promotion: mma syrk_fused_store"),
             (lambda p: p["meta"]["code_modules"].append("research.polar_opt.bogus"), "code_modules"),
             (lambda p: p["meta"]["code_modules"].append(p["meta"]["code_modules"][0]), "code_modules"),
