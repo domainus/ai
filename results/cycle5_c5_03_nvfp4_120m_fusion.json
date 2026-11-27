@@ -20825,18 +20825,18 @@
     "source_result_git_sha": "726b20c9590aba911361e300e7d2079c7bb55cfa",
     "source_artifact_sha256": "9ed6c9fd3879566f78e943f5aa54657b1f0e1c27e543e3e93f11103413da14ce",
     "source_raw_measurements_sha256": "bacb1484441a8413315daecb19187528f3bf6900c736813073ad810f0482f5f3",
-    "postprocess_git_sha": "0df8a0e29b74e2a66f9a4c44ade41aa493151cf0",
+    "postprocess_git_sha": "a7a5d57380de144ca7220ee749be70839c1eb1ca",
     "postprocess_git_dirty": false,
-    "postprocess_code_sha256": "4db73aec54cf4ed5552fb4273c0a6e702d06964a08a9ac4317f7fbfe42effea3",
+    "postprocess_code_sha256": "a97a338637a201c9a451b61f1e4bca47830d1c78b682d4ec24114e6aa99e8218",
     "postprocess_code_modules": ["research.polar_opt.baselines", "research.polar_opt.circuits", "research.polar_opt.harness_tier1", "research.polar_opt.harness_tier2_lm", "research.polar_opt.harness_tier2_real", "research.polar_opt.kernels_blackwell", "research.polar_opt.polar_switch_blackwell", "research.polar_opt.real_text_data", "research.polar_opt.schatten_switch_blackwell", "research.polar_opt.spectral_scaling", "research.polar_opt.tier2_candidates", "research.quant_ptq.bench_c5_02_isoloss_ptq_mitigation", "research.quant_ptq.bench_c5_03_nvfp4_120m_fusion", "research.quant_ptq.bench_isoloss_ptq", "research.quant_ptq.bench_nvfp4_e2e", "research.quant_ptq.micro_rotated_ptq", "research.quant_ptq.nvfp4_inference_blackwell"],
     "postprocess_command": ["/home/ryan/Documents/projects/ai/.venv/bin/python", "research/quant_ptq/bench_c5_03_nvfp4_120m_fusion.py", "--postprocess-from-git", "726b20c9590aba911361e300e7d2079c7bb55cfa"],
-    "postprocess_timestamp": "2026-11-27T12:48:55-0700",
+    "postprocess_timestamp": "2026-11-27T13:03:31-0700",
     "retained_evidence_sha256": {
       "canonical_38cef48.log": "d6ebd7f655fe300df39764447a17fceee6262df52a7cd1087a8937fd4e210408",
       "superseded_canonical_4736807.log": "807781a3d86bd47e413075186cde26b55645d9dd07cb9d60b002875ac993724e",
       "superseded_result_4736807.json": "aafd8ebe571bb512ac02e5c20403ac900e930cd11e4a74c5c5152a3e3b2f9c5a"
     },
-    "reason": "Remediation of the C5-03 audit and post-remediation re-check (audits/AUDIT_cycle5_c5_03_gpt62_astra.md, findings 1-5 and v2 closures): the raw measurements of the canonical result 726b20c (measured by the clean commit 38cef48) are preserved unchanged, so test.bin is not scored a third time. part_c.analysis, summary and caveats are recomputed (the caveats bind to the actual protocol/source and record the superseded 4736807 run and measurement limits), and the result is checked by the hardened validator (calibration draw, linear parameter counts, FP4-specific GEMM and exact quantizer kernel profiles, cooperative launch record, AWQ fields, exact script path and commit chronology). The exact n_part public launcher contract, verified dir_fd atomic writer, and integer-view bitwise checks are verified by the test suite and audit replay. Nothing was retrained or re-measured."
+    "reason": "Remediation of the C5-03 audit and post-remediation re-checks (audits/AUDIT_cycle5_c5_03_gpt62_astra.md, findings 1-5 and v2-v3 closures): the raw measurements of the canonical result 726b20c (measured by the clean commit 38cef48) are preserved unchanged, so test.bin is not scored a third time. part_c.analysis, summary and caveats are recomputed (the caveats bind to the actual protocol, test-split SHA-256, analysis availability and source, recording the superseded 4736807 run and measurement limits), and the result is checked by the hardened validator (calibration draw, linear parameter counts, FP4-specific GEMM and exact quantizer kernel profiles, cooperative launch record, AWQ fields, exact script path, unified canonical path guard and commit chronology). The exact n_part public launcher contract, verified dir_fd atomic writer, and integer-view bitwise checks are verified by the test suite and audit replay. Nothing was retrained or re-measured."
   },
   "summary": {
     "part_a": [
