@@ -42,9 +42,9 @@ def test_canonical_protocol_is_the_predeclared_one():
     assert p["adamw_cooldown"]["cooldown_steps"] == 64 and p["qat_cooldown"]["cooldown_steps"] == 48
     assert p["qat_cooldown"]["muon_steps"] == 272 and p["awq"]["alphas"] == [0.0, 0.25, 0.5, 0.75]
     assert p["calibration_sequences"] == 128 and p["weight_formats"] == list(q.FORMATS)
-    assert SPEC == {"lr": 0.001, "cosine_steps": 464, "first_eval_step": 400, "eval_grid": 16, "max_steps": 1280}
+    assert SPEC == {"lr": 0.001, "cosine_steps": 464, "first_eval_step": 400, "eval_grid": 16, "max_steps": 2560}
     grid = b.adamw_eval_steps(SPEC)
-    assert grid[0] == 400 and grid[-1] == 1280 and SPEC["cosine_steps"] in grid and len(grid) == 56
+    assert grid[0] == 400 and grid[-1] == 2560 and SPEC["cosine_steps"] in grid and len(grid) == 136
     assert all(y - x == 16 for x, y in zip(grid, grid[1:]))
     assert 320 * 32768 == 10_485_760  # T_muon in tokens
     for quick_key in ("adamw_cooldown", "qat_cooldown"):
@@ -58,7 +58,7 @@ def test_adamw_schedule_is_cosine_to_the_floor_then_the_floor():
     for step in range(cosine):
         assert b.adamw_multiplier(step, SPEC) == b.schedule_multiplier(step, cosine)  # the C4-01b schedule
     assert b.schedule_multiplier(cosine, cosine) == pytest.approx(b.MIN_LR_RATIO)
-    assert all(b.adamw_multiplier(step, SPEC) == b.MIN_LR_RATIO for step in (cosine, cosine + 1, 1279, 5000))
+    assert all(b.adamw_multiplier(step, SPEC) == b.MIN_LR_RATIO for step in (cosine, cosine + 1, 2559, 5000))
     assert b.adamw_multiplier(399, SPEC) < 0.16  # the first measured step is already near the floor LR
     assert b.adamw_stops(0.0) and b.adamw_stops(-1e-9) and not b.adamw_stops(1e-9)
 

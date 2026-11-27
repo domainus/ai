@@ -18,7 +18,7 @@ Stage A  Training and matching. The stage receives a mapping with ``train`` and 
            ``adamw``                one run at LR 0.001: warmup + cosine to the floor LR at step
                                     464, then the floor LR. Val NLL is measured every 16 steps
                                     from step 400; the run stops at the first measured step where
-                                    AdamW is at or below Muon (cap 1280 steps). ``select_adamw``
+                                    AdamW is at or below Muon (cap 2560 steps). ``select_adamw``
                                     takes the measured step with the smallest |val NLL(adamw) -
                                     val NLL(muon)| (then fewer steps); it is matched when the gap
                                     is <= 0.02 nats.
@@ -129,14 +129,19 @@ ENV_KEYS = ("torch", "triton", "cuda", "driver", "device", "capability")
 #   5.338 / 5.262. A match by fresh runs is therefore a lottery.
 # * Inside one run the val NLL falls smoothly at the floor LR (about 0.0044 nats per 8 steps), so one run per
 #   seed is stopped on a 16-step grid instead. Three runs with ``cosine_steps`` = 464 were 0.05 to 0.28 nats
-#   above Muon when the floor LR was reached; the worst needs about 500 floor-LR steps, hence the cap of 1280.
+#   above Muon when the floor LR was reached; the worst needs about 500 floor-LR steps.
 # * The floor-LR phase does not change the PTQ sensitivity of AdamW at equal loss: identity-GPTQ val NLL
 #   increase 0.0010 (NVFP4) / 0.0096 (INT2 g16) at val NLL 5.41 of a stopped run, against 0.0010 / 0.0106 and
 #   0.0008 / 0.0106 for fresh cosine runs of 544 and 608 steps (val NLL 5.30 and 5.24).
+# Protocol amendment before any Stage B work (val.bin only; test.bin had not been opened). The first canonical
+# attempt (commit 05ea4ae, ``max_steps`` = 1280) was stopped during Stage A: seed 1 matched at 640 steps
+# (gap 0.003 nats), but the AdamW run of seed 2 was 0.58 nats above Muon at step 400 and still 0.09 nats above
+# it at step 1280. AdamW at LR 0.001 has such slow runs, so the cap is 2560 steps (about 0.9 nats of floor-LR
+# progress). Nothing else changed. A run that needs more is reported as unmatched.
 CANONICAL = {
     "preset": "50m", "device": "cuda", "seeds": [1, 2, 3, 4, 5], "tolerance_nats": 0.02,
     "muon": {"steps": 320, "lr": 0.02, "auxiliary_lr": 0.001},
-    "adamw": {"lr": 0.001, "cosine_steps": 464, "first_eval_step": 400, "eval_grid": 16, "max_steps": 1280},
+    "adamw": {"lr": 0.001, "cosine_steps": 464, "first_eval_step": 400, "eval_grid": 16, "max_steps": 2560},
     "adamw_cooldown": {"muon_steps": 256, "cooldown_steps": 64, "lr": 0.001},
     "qat_cooldown": {"muon_steps": 272, "cooldown_steps": 48, "format": QAT_FORMAT},
     "weight_decay": WEIGHT_DECAY, "min_lr_ratio": MIN_LR_RATIO,
@@ -1357,10 +1362,12 @@ def caveats(payload: dict) -> list[str]:
         "Iso-loss is not iso-compute and not iso-schedule: AdamW uses more training tokens than Muon "
         "(adamw_over_muon_tokens per seed) and ends with a seed-dependent number of floor-LR steps "
         "(adamw_floor_lr_steps), while Muon ends when its cosine reaches the floor.",
-        "The AdamW cosine length, the first measured step and the step cap come from a seed-0 design pilot "
-        "(val.bin only). In that pilot the PTQ loss of AdamW at LR 0.001 was about the same with and without the "
-        "floor-LR phase at equal val NLL; it is about three times the PTQ loss of the C4-01b AdamW recipe "
-        "(LR 0.0015), so the Muon-versus-AdamW ratio depends on the AdamW recipe.",
+        "The AdamW cosine length and the first measured step come from a seed-0 design pilot (val.bin only). "
+        "The AdamW step cap was raised from 1280 to 2560 after a first canonical attempt was stopped in Stage A "
+        "(val.bin only, before test.bin was opened): the AdamW run of seed 2 was 0.58 nats above Muon at step 400 "
+        "and unmatched at step 1280. In the pilot the PTQ loss of AdamW at LR 0.001 was about the same with and "
+        "without the floor-LR phase at equal val NLL; it is about three times the PTQ loss of the C4-01b AdamW "
+        "recipe (LR 0.0015), so the Muon-versus-AdamW ratio depends on the AdamW recipe.",
         "Both cooldown arms branch from snapshots of the seed's Muon run, so their first 256 / 272 steps are that "
         "run's steps. Their BF16 baselines differ from Muon; bf16_nll_diff and nll_diff report the net effect.",
         "The alpha of the activation-aware scaling is selected per checkpoint, format and rotation on val.bin "
