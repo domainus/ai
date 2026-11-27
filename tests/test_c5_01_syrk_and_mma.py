@@ -683,6 +683,18 @@ def _audit_fused_cancel(payload):
     payload["mma"]["audit_seeds"][-1]["fused_store_matches"] -= 1
 
 
+def _opus_above_design(payload):
+    row = payload["long_k"]["opus_l6"][0]
+    row["native"]["sigma_max"] = 1.15
+    row["native"]["rel_fro_err"] = 0.2
+    key = (tuple(row["shape"]), payload["protocol"]["long_k"]["opus_seed"])
+    grid_row = next((r for r in payload["long_k"]["grid"] if (tuple(r["shape"]), r["seed"]) == key), None)
+    if grid_row is not None:
+        cell = grid_row["cells"][f"{row['kernel']}_{row['dtype']}"]
+        cell["sigma_max"] = 1.15
+        cell["rel_fro_err"] = 0.2
+
+
 def _hyp_overcount(payload):
     payload["mma"]["hypotheses"][0]["bit_matches"] = payload["mma"]["hypotheses"][0]["cases"] + 1
 
@@ -757,6 +769,14 @@ def _structural_probes(canonical):
         (lambda p: p["meta"]["section_seconds"].pop("mma"), "section_seconds"),
         (_set(["long_k", "syrk", 0, "view_strides"], [1, 1, 1]), "view_strides|invalid fields"),
         (_set(["long_k", "boundaries", 0, "sigma_max"], -1.0), "sigma_max|invalid fields"),
+        (lambda p: next(r for r in p["long_k"]["inputs"] if "normal_quality" in r)["normal_quality"].__setitem__(
+            "rel_fro_err", 10.0), "violates singular-value bounds"),
+        (lambda p: [side.__setitem__("time", side["time"] + 86400) for side in p["meta"]["gpu_telemetry"].values()],
+         "gpu_telemetry"),
+        (_set(["meta", "gpu_telemetry", "end", "utilization.gpu"], 101.0), "utilization.gpu"),
+        (lambda p: p["meta"]["gpu_telemetry"]["start"].pop("time"), "gpu_telemetry"),
+        (lambda p: p["timing"]["cells"][0]["rounds"][0]["native"].__setitem__(
+            "gpu_ms", p["timing"]["cells"][0]["rounds"][0]["native"]["wall_ms"] + 1.0), "gpu_ms exceeds wall_ms"),
     ]
     if canonical:
         probes += [
@@ -776,7 +796,12 @@ def _structural_probes(canonical):
             (_set(["long_k", "opus_l6", 0, "bitwise_equal_c4_03"], False), "promotion: long_k opus_l6_bitwise_c4_03"),
             (_set(["long_k", "boundaries", 0, "bitwise_equal_reference"], False),
              "promotion: long_k boundaries_bitwise_reference"),
-            (_set(["long_k", "opus_l6", 0, "native", "sigma_max"], 2.0), "Opus L6 cell exceeds"),
+            (_opus_above_design, "Opus L6 cell exceeds"),
+            (_set(["long_k", "opus_l6", 12, "native", "sigma_min"], 0.5),
+             "rank-1 matrix must have sigma_min == sigma_max"),
+            (_set(["long_k", "grid", 96, "cells", "ps3_55_fp16", "sigma_min"], 0.5),
+             "rank-1 matrix must have sigma_min == sigma_max"),
+            (_set(["long_k", "opus_l6", 0, "native", "sigma_max"], 0.93), "vs grid"),
         ]
     return probes
 

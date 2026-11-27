@@ -902,14 +902,22 @@ def _assert_close_strict(found, expected, path: str, tol: float) -> None:
             raise ValueError(f"{path}: {found!r} differs from the recomputed {expected!r}")
 
 
-def _validate_polar_quality(q: dict, where: str, extra_keys: set[str] | None = None) -> None:
+def _validate_polar_quality(q: dict, where: str, *, rank: int, extra_keys: set[str] | None = None) -> None:
     expected_keys = {"finite", "sigma_min", "sigma_max", "rel_fro_err"} | (extra_keys or set())
     _require(isinstance(q, dict) and set(q.keys()) == expected_keys, f"{where}: unexpected keys")
     _require(isinstance(q["finite"], bool), f"{where}: finite must be bool")
     if q["finite"]:
-        _require(_is_number(q["sigma_min"]) and _is_number(q["sigma_max"]) and _is_number(q["rel_fro_err"])
-                 and 0 <= q["sigma_min"] <= q["sigma_max"] and q["rel_fro_err"] >= 0,
+        smin, smax, err = q["sigma_min"], q["sigma_max"], q["rel_fro_err"]
+        _require(_is_number(smin) and _is_number(smax) and _is_number(err) and 0 <= smin <= smax and err >= 0,
                  f"{where}: singular values out of order")
+        if rank == 1:
+            _require(abs(smax - smin) <= 1e-12, f"{where}: rank-1 matrix must have sigma_min == sigma_max")
+            lo, hi = abs(smax - 1.0), smax + 1.0
+        else:
+            mid_lo = (smin - 1.0) ** 2 if smin > 1.0 else ((1.0 - smax) ** 2 if smax < 1.0 else 0.0)
+            lo = math.sqrt(((smin - 1.0) ** 2 + (smax - 1.0) ** 2 + (rank - 2) * mid_lo) / rank)
+            hi = 1.0 + math.sqrt((smin ** 2 + (rank - 1) * smax ** 2) / rank)
+        _require(lo - 1e-12 <= err <= hi + 1e-12, f"{where}: rel_fro_err violates singular-value bounds")
     else:
         _require(q["sigma_min"] is None and q["sigma_max"] is None and q["rel_fro_err"] is None,
                  f"{where}: non-finite quality metrics must be None")
@@ -958,6 +966,9 @@ def _validate_meta(meta: dict, *, canonical: bool) -> None:
     _require(isinstance(meta["command"], list) and len(meta["command"]) >= 2
              and all(isinstance(x, str) and x for x in meta["command"]),
              "meta.command invalid")
+    if canonical:
+        _require(meta["command"][1].endswith("bench_c5_01_syrk_and_mma.py") and "--quick" not in meta["command"],
+                 "meta.command invalid for canonical run")
     env = meta["environment"]
     expected_env_keys = {"python", "platform", "torch", "cuda", "cudnn", "host_cpus", "numpy", "env",
                          "triton", "device", "capability", "driver"}
@@ -969,10 +980,12 @@ def _validate_meta(meta: dict, *, canonical: bool) -> None:
     _require(_is_int(env["host_cpus"]) and env["host_cpus"] > 0, "meta.environment.host_cpus invalid")
     _require(env["cudnn"] is None or (_is_int(env["cudnn"]) and env["cudnn"] > 0), "meta.environment.cudnn invalid")
     _require(isinstance(env["env"], dict)
-             and all(isinstance(k, str) and (v is None or isinstance(v, str)) for k, v in env["env"].items()),
+             and set(env["env"].keys()) == {"CUDA_VISIBLE_DEVICES", "PYTHONPATH", "OMP_NUM_THREADS"}
+             and all(v is None or isinstance(v, str) for v in env["env"].values()),
              "meta.environment.env invalid")
     cap = env["capability"]
-    _require(isinstance(cap, list) and len(cap) == 2 and all(_is_int(x) for x in cap),
+    _require(isinstance(cap, list) and len(cap) == 2 and all(_is_int(x) for x in cap)
+             and cap[0] >= 0 and 0 <= cap[1] < 10,
              "meta.environment.capability invalid")
 
     numerics = meta["numerics"]
@@ -1006,8 +1019,8 @@ def _validate_meta(meta: dict, *, canonical: bool) -> None:
     _require(isinstance(ss, dict) and set(ss.keys()) == {"zero_regression", "timing", "long_k", "mma"}
              and all(_is_number(v) and v > 0 for v in ss.values()),
              "meta.section_seconds must contain positive timings for all four sections")
-    _require(_is_number(meta["total_seconds"]) and meta["total_seconds"] >= sum(ss.values()),
-             "meta.total_seconds must be >= sum(meta.section_seconds)")
+    _require(_is_number(meta["total_seconds"]) and 0.0 <= meta["total_seconds"] - sum(ss.values()) <= 5.0,
+             "meta.total_seconds inconsistent with sum(meta.section_seconds)")
     t_start = _parse_iso_timestamp(meta["timestamp_start"], "timestamp_start")
     t_end = _parse_iso_timestamp(meta["timestamp_end"], "timestamp_end")
     elapsed = (t_end - t_start).total_seconds()
@@ -1019,18 +1032,37 @@ def _validate_meta(meta: dict, *, canonical: bool) -> None:
                  f"meta.{field} invalid")
     gt = meta["gpu_telemetry"]
     _require(isinstance(gt, dict) and set(gt.keys()) == {"start", "end"}, "meta.gpu_telemetry keys differ")
-    numeric_gt = ("clocks.sm", "clocks.mem", "temperature.gpu", "power.draw", "utilization.gpu", "memory.used")
-    str_gt = ("pstate", "clocks_event_reasons.active")
-    for side in ("start", "end"):
+    telemetry_keys = {"time", "clocks.sm", "clocks.mem", "temperature.gpu", "power.draw", "utilization.gpu",
+                      "pstate", "memory.used", "clocks_event_reasons.active"}
+    telemetry_bounds = {
+        "clocks.sm": (0.0, 50000.0, True),
+        "clocks.mem": (0.0, 50000.0, True),
+        "temperature.gpu": (0.0, 150.0, False),
+        "power.draw": (0.0, 2000.0, False),
+        "utilization.gpu": (0.0, 100.0, False),
+        "memory.used": (0.0, 1_048_576.0, False),
+    }
+    for side, ref_ts in (("start", t_start.timestamp()), ("end", t_end.timestamp())):
         sample = gt[side]
-        _require(isinstance(sample, dict) and len(sample) > 0, f"meta.gpu_telemetry.{side} invalid")
-        for key in numeric_gt:
-            if key in sample:
-                _require(_is_number(sample[key]) and sample[key] >= 0, f"meta.gpu_telemetry.{side}.{key} invalid")
-        for key in str_gt:
-            if key in sample:
-                _require(isinstance(sample[key], str) and bool(sample[key]),
-                         f"meta.gpu_telemetry.{side}.{key} invalid")
+        if not canonical and isinstance(sample, dict) and set(sample.keys()) == {"error"}:
+            _require(isinstance(sample["error"], str) and bool(sample["error"]),
+                     f"meta.gpu_telemetry.{side}.error invalid")
+            continue
+        _require(isinstance(sample, dict) and set(sample.keys()) == telemetry_keys,
+                 f"meta.gpu_telemetry.{side} keys differ from schema")
+        _require(_is_number(sample["time"]) and sample["time"] > 0 and abs(sample["time"] - ref_ts) <= 5.0,
+                 f"meta.gpu_telemetry.{side}.time inconsistent with meta timestamp")
+        for key, (lo, hi, strict_lo) in telemetry_bounds.items():
+            val = sample[key]
+            ok = _is_number(val) and (val > lo if strict_lo else val >= lo) and val <= hi
+            _require(ok, f"meta.gpu_telemetry.{side}.{key} invalid")
+        ps = sample["pstate"]
+        _require(isinstance(ps, str) and len(ps) >= 2 and ps[0] == "P" and ps[1:].isdigit()
+                 and 0 <= int(ps[1:]) <= 15,
+                 f"meta.gpu_telemetry.{side}.pstate invalid")
+        er = sample["clocks_event_reasons.active"]
+        _require(isinstance(er, str) and er.startswith("0x") and _is_hex(er[2:], 16),
+                 f"meta.gpu_telemetry.{side}.clocks_event_reasons.active invalid")
     if "time" in gt["start"] and "time" in gt["end"]:
         ts0, ts1 = gt["start"]["time"], gt["end"]["time"]
         _require(_is_number(ts0) and ts0 > 0 and _is_number(ts1) and ts1 >= ts0
@@ -1070,6 +1102,7 @@ def _validate_timing(payload: dict) -> None:
                 _require(_is_number(r[v]["gpu_ms"]) and r[v]["gpu_ms"] > 0
                          and _is_number(r[v]["wall_ms"]) and r[v]["wall_ms"] > 0,
                          f"{where}: non-positive sample")
+                _require(r[v]["gpu_ms"] <= r[v]["wall_ms"] + 0.005, f"{where}: gpu_ms exceeds wall_ms")
         _assert_close_strict(c["summary"], timing_summary(c["rounds"]), f"{where}.summary", 1e-9)
 
 
@@ -1143,7 +1176,8 @@ def _validate_long_k(payload: dict) -> None:
         if r["case"].startswith("mixed"):
             _require(set(r.keys()) == (input_base_keys | {"degenerate_zero", "normal_quality"}),
                      f"long_k inputs {r['case']}: unexpected keys")
-            _validate_polar_quality(r["normal_quality"], f"long_k inputs {r['case']} {r['kernel']} {r['dtype']}")
+            _validate_polar_quality(r["normal_quality"], f"long_k inputs {r['case']} {r['kernel']} {r['dtype']}",
+                                    rank=min(r["shape"][-2], r["shape"][-1]))
             _require(r["normal_quality"]["finite"] is r["finite_per_matrix"][0],
                      f"long_k inputs {r['case']}: normal_quality.finite differs from finite_per_matrix[0]")
             if r["kernel"] == "ps3_55":
@@ -1153,6 +1187,9 @@ def _validate_long_k(payload: dict) -> None:
                 _require(isinstance(r["degenerate_zero"], list) and len(r["degenerate_zero"]) == 4
                          and all(isinstance(x, bool) for x in r["degenerate_zero"]),
                          f"long_k inputs {r['case']}: degenerate_zero must have 4 bool entries")
+                _require(all(r["finite_per_matrix"][idx + 1] is True
+                             for idx, is_zero in enumerate(r["degenerate_zero"]) if is_zero),
+                         f"long_k inputs {r['case']}: degenerate_zero entry cannot be non-finite")
         else:
             _require(set(r.keys()) == input_base_keys, f"long_k inputs {r['case']}: unexpected keys")
     graph_keys = {"shape", "kernel", "dtype", "bitwise_equal", "max_abs_diff", "finite"}
@@ -1168,9 +1205,10 @@ def _validate_long_k(payload: dict) -> None:
                  "samples", "bitwise_equal_c4_03", "speedup", "speedup_paired"}
     for r in lk["opus_l6"]:
         where = f"opus_l6 {r['shape']} {r['kernel']} {r['dtype']}"
+        rank = min(r["shape"][-2], r["shape"][-1])
         _require(set(r.keys()) == opus_keys, f"{where}: unexpected keys")
-        _validate_polar_quality(r["native"], f"{where}.native")
-        _validate_polar_quality(r["control"], f"{where}.control")
+        _validate_polar_quality(r["native"], f"{where}.native", rank=rank)
+        _validate_polar_quality(r["control"], f"{where}.control", rank=rank)
         _require(isinstance(r["bitwise_equal_c4_03"], bool), f"{where}: bitwise_equal_c4_03 must be bool")
         _require(len(r["samples"]) == spec["opus_reps"], f"{where}: sample count differs")
         for i, s in enumerate(r["samples"]):
@@ -1198,10 +1236,19 @@ def _validate_long_k(payload: dict) -> None:
         _require(_exact_equal(r["chunked"], r["k"] > protocol["gate"])
                  and _exact_equal(r["k"], 1 << r["k_exponent"]), "grid chunk flag")
         for name, c in r["cells"].items():
-            _validate_polar_quality(c, f"grid {name}", extra_keys={"design_ceiling", "bitwise_equal_c4_03"})
+            _validate_polar_quality(c, f"grid {name}", rank=r["n"],
+                                    extra_keys={"design_ceiling", "bitwise_equal_c4_03"})
             _require(isinstance(c["bitwise_equal_c4_03"], bool), f"grid {name}: flags must be bool")
             _assert_close_strict(c["design_ceiling"], design[name.rsplit("_", 1)[0]],
                                  f"grid {name}.design_ceiling", 1e-12)
+    grid_by_shape_seed = {(tuple(r["shape"]), r["seed"]): r["cells"] for r in lk["grid"]}
+    for r in lk["opus_l6"]:
+        key = (tuple(r["shape"]), spec["opus_seed"])
+        if key in grid_by_shape_seed:
+            gc = grid_by_shape_seed[key][f"{r['kernel']}_{r['dtype']}"]
+            twin = {k: gc[k] for k in ("finite", "sigma_min", "sigma_max", "rel_fro_err")}
+            _assert_close_strict(r["native"], twin,
+                                 f"opus_l6 {r['shape']} {r['kernel']} {r['dtype']}.native vs grid", 1e-12)
 
 
 def _digest_words(x: Tensor) -> str:
@@ -1608,10 +1655,10 @@ def validate_results(payload: dict, *, canonical: bool | None = None) -> None:
                  and d["zero_regression"]["sync_free"] == d["zero_regression"]["launch_cells"]
                  and all(r["legacy_sync_free"] for r in zr["launches"]),
                  "launch counts differ")
-        _require(d["long_k"]["grid_above_design_ceiling"] == 0, "a chunked cell exceeds its own design ceiling")
-        _require(d["long_k"]["grid_bitwise_c4_03"] == d["long_k"]["grid_cells"], "grid C4-03 mismatch")
         _require(d["timing"]["outputs_bitwise_equal"] == d["timing"]["cells"], "a timing cell's outputs differ")
         _require(d["long_k"]["opus_l6_native_above_design"] == 0, "an Opus L6 cell exceeds its own design ceiling")
+        _require(d["long_k"]["grid_above_design_ceiling"] == 0, "a chunked cell exceeds its own design ceiling")
+        _require(d["long_k"]["grid_bitwise_c4_03"] == d["long_k"]["grid_cells"], "grid C4-03 mismatch")
         _require(all(payload["long_k"]["launches_at_graph_shape"]["sync_free"].values()),
                  "launches_at_graph_shape sync_free failed")
         _require(all(r["api_equals_helper"] for r in payload["long_k"]["syrk"]),
