@@ -216,3 +216,74 @@ Each archive is named `seed<seed>_<arm>.pt`. The rightmost column matches the co
 | 5 | adamw | `b1e7e655c0103f2f9432a5318d967262a5ed2cab7b95c77ea1050250153a24bc` | `609133172d7d1c6ee9bf4cca7ac0fa536ba2b1c022189688f840528226ff7184` |
 | 5 | muon_adamw_cooldown | `c61bedf038fb7eefde1558d147ea25c50b9442bed24df79671ddacfacf312487` | `3e86c6f288d7c5186b4bc3c02672873cb85afbcdd21bb31614e86626402f166a` |
 | 5 | muon_qat_cooldown | `ad292a5c13edd1eaac790a02f150284e1ad5889297983acb8375b56a94602862` | `f688f0efa98c76d1ed99d7540297c1538b364177bb6e447a501ff60eae86d30d` |
+
+## Post-Remediation Re-Check (`5fb3e90`)
+
+**2026-11-27 · FAIL — HOLD REMAINS.** The committed result preserves the original measurements. All 66 original malformed records now fail canonical validation. The v2 validator still certifies a v1-only revision as either the postprocessor or the producer of fresh v2 measurements. The public CLI also writes a validated exploratory result to the reserved canonical filename. Both failures are reproducible without changing a measurement.
+
+### Provenance of the published result
+
+I read the files with `git show <commit>:<path>`. For each of the ten raw keys I compared sorted, compact JSON encodings on both sides. This distinguishes booleans, integers and floating-point values. The ten matching keys were `quick`, `canonical`, `meta`, `run_config_hash`, `preset`, `config`, `protocol`, `data`, `stage_a` and `stage_b`. The parent of `5fb3e90` is `9473f90`. Its only changed file is the result JSON.
+
+| Independently hashed input | SHA-256 |
+|---|---|
+| Result blob at `5fb3e90`, also equal to the checked-out bytes | `21fa1862996aebcf54d6a6c82d59ee7ea1184f5326db549043dcb1eb4caf7e05` |
+| Source result blob at `da148c2` | `4944c2832056524f994a2d4931950983244ac20e547cc9e281d5e7e0defeddb8` |
+| Ten-key raw object from `da148c2` | `ed181be0228efaa060e2ae197958137158fb4f7466ce0a6974451c9a24c0acd1` |
+| Postprocessing code at `9473f90b3eb340cb162cb5d6f96bc6ec3e4dff32` | `12ded47a9e5dd26c0e893285aad190f3f40e9ecf36d4e2bc1a17438a1c98ba33` |
+| Measuring code at `0355d16f258133b5fb7aec8e90fd223f781595e9` | `424055b21b6f894ef850151501425839e5731e9919ac7399138d75788f7dc85b` |
+
+I independently traversed the imports in each Git tree and hashed the 16 modules in sorted order, including their names and NUL separators. Both sets matched their recorded module lists. I also rehashed the four retained evidence files listed in the appendix. All four matched the published pins. Running the v2 postprocess CLI on the original source reproduced every field outside `postprocess`. Inside it, only the invocation, timestamp and checkout commit differed. This carries forward the prior RTX 5080 replay of 43,145 non-timing leaves from eight checkpoints. I did not repeat that replay.
+
+### Validator and CLI findings
+
+The original audit session retained the 66 exact field paths and replacement values. I ran them against fresh copies of the published v2 result. The canonical rejection counts by family were **9/9** provenance, **10/10** Stage A, **8/8** Stage B, **7/7** hardware, **7/7** summary statistics, **7/7** schema and **18/18** previously accepted fixtures. Explicit `canonical=False` also rejected **66/66**, including the dirty tree, unrelated entry point and unverified shards. That mode refuses the canonical label even on the unmodified control. It does not represent a second pass of all the field checks.
+
+Of **40 additional negative validator probes**, **32 raised `ValueError` and 8 returned success**. Seven successes returned canonical certification and one returned exploratory status. Rejected probes covered source and code digests, malformed provenance keys and types, source chronology, command options, nested fields, caller mode types, fit keys and counts, and zero-alpha twins. Changing just an inherited time in each of the dynamic, static and fake-quantized modes failed. Changing a copied geometry value or replacing a float alpha with an integer also failed. Two further boundary probes exercised the real writer and the real butterfly fitter. They are excluded from the 40.
+
+The unchanged artifact returned `{mode: canonical, certified_canonical: true, postprocessed: true}` with either inferred or explicit canonical mode. A fresh one-seed CPU run returned `{mode: noncanonical, certified_canonical: false, postprocessed: false}` with either inferred or explicit exploratory mode. The fresh canonical control below is a synthetic validator fixture. Its measurements were copied from the pinned file.
+
+**Blocking findings.** Driver line numbers in this section refer to `5fb3e90`. Each validator case starts from an independent copy.
+
+1. **The cited commit cannot perform the claimed operation.** On the published JSON, set `postprocess.postprocess_git_sha = meta.git_sha` and `postprocess.postprocess_code_sha256 = meta.code_sha256`. Canonical validation succeeds with `postprocessed=True`. The cited `0355d16` driver declares v1 at line 92 and has no `--postprocess-from-git` option. Conversely, set `postprocess=null`, `meta.unit_config_hash="cbfff5bca778de98"` and `run_config_hash="e33921c7bd8cc41b"`. These are the ordinary v2 hashes for the unmodified v1 producer metadata. Canonical validation now succeeds with `postprocessed=False`. The first check hashes blobs at the claimed revision but parses the command with the current driver. The second selects the hash schema from the nullable field without checking that the cited producer emitted it. Both contradictions can be resolved from Git alone. [Postprocessor check](../research/quant_ptq/bench_c5_02_isoloss_ptq_mitigation.py#L2427) · [Fresh-run check](../research/quant_ptq/bench_c5_02_isoloss_ptq_mitigation.py#L1982) · [Schema selection](../research/quant_ptq/bench_c5_02_isoloss_ptq_mitigation.py#L2515)
+2. **The reserved output accepts a genuine noncanonical run.** In a disposable clone, I ran the clean `0355d16` producer with `--quick --device cpu --no-verify --seeds 1 --silent`, synthetic train/val/test shards and a private output. I placed that genuine v1 JSON at the standard result path in a temporary source commit. From clean `9473f90` I ran the driver with `--postprocess-from-git <temporary-source-commit> --silent` and omitted `--output`. It exited successfully and replaced the clone's pinned canonical result with the one-seed CPU result. The resulting certificate was `{mode: noncanonical, certified_canonical: false, postprocessed: true}`. A separate `canonical=True` request correctly rejected it. The writer asks for the source label even when the destination requires canonical certification. The reviewed checkout's result was untouched. [Destination](../research/quant_ptq/bench_c5_02_isoloss_ptq_mitigation.py#L2758) · [Validation request](../research/quant_ptq/bench_c5_02_isoloss_ptq_mitigation.py#L2714) · [Write](../research/quant_ptq/bench_c5_02_isoloss_ptq_mitigation.py#L2799)
+3. **The butterfly error check accepts a worse fit and rejects a possible fit from its own producer.** For the fresh canonical control, clear `postprocess`, set the producer commit and code hash to the genuine `9473f90` pair in the table above, and recompute the v2 unit/run hashes. On seed 1 Muon's first NVFP4 butterfly QKV fit, set `layers_improved=0`, `start=float(np.float32(0.001))`, `fitted=float(np.nextafter(np.float32(start), np.float32(1)))`, and `relative_error_reduction=1-fitted/start`. Here `start` denotes `weight_sq_error_hadamard_start` and `fitted` denotes `weight_sq_error_fitted`. Canonical validation accepts the increase. With zero improved layers, the fitter retained every original error, so the two sums must match. In the other direction, a real CPU fit gave one improved layer and two identical rounded FP32 sums of **190367301632.0**. The validator rejected this producer output. A layer can improve without a change in the rounded sum. [Validator](../research/quant_ptq/bench_c5_02_isoloss_ptq_mitigation.py#L2174) · [Per-layer decisions and FP32 sums](../research/quant_ptq/micro_rotated_ptq.py#L424)
+
+The CPU fit in finding 3 can be reproduced independently with the repository's `micro_rotated_ptq` imported as `q` and single-threaded CPU PyTorch.
+
+```python
+g = torch.Generator().manual_seed(7)
+w = torch.randn(2, 1, 16, generator=g)
+rot = q.Butterfly(16, q.Butterfly.initial_angles((2,), 16, 16))
+fmt = q.FORMATS["nvfp4_g16"]
+z = q.quantize_rtn(rot.forward(w), fmt)
+noise = torch.randn(2, 1, 16, generator=g)
+w[:1] = rot.inverse(z + 0.001 * noise)[:1] * 100_000_000
+_, fit = q.fit_butterfly(w, fmt, steps=5)
+```
+
+**Five further accepted metadata cases** complete the eight successes. On the published result, replacing `postprocess_command[1]` with `tests/test_bench_c5_02_isoloss_ptq_mitigation.py`, or `postprocess_command[0]` with `not-a-python-interpreter`, still certifies the invocation. The parser uses a filename suffix and an interpreter substring. On the synthetic fresh canonical control, appending `--resume` while `meta.unit_log.resume=False`, or appending `--checkpoint-dir elsewhere` while retaining the original directory, still certifies a fresh run. On the real exploratory CPU run, replacing the producer SHA with 40 zeros and recomputing the two configuration hashes passes exploratory validation. The fresh-run docstring should scope its Git guarantee to the modes that enforce it. [Invocation checks](../research/quant_ptq/bench_c5_02_isoloss_ptq_mitigation.py#L1812) · [Metadata checks](../research/quant_ptq/bench_c5_02_isoloss_ptq_mitigation.py#L1964) · [Documented guarantee](../research/quant_ptq/bench_c5_02_isoloss_ptq_mitigation.py#L2460)
+
+### Measurement, reporting and resume checks
+
+**B2.** I recovered each selected step by minimizing the absolute gap to Muon's validation NLL, with earlier steps breaking ties. The last recorded evaluation gives the terminal step. Each exact token-equivalent ratio is the step count times 32,768 divided by 26,004,518. All five selected steps, terminal steps and both unrounded ratios matched `derived.stage_a`. Caveat 7 correctly describes 64 independent 513-token slices drawn with replacement per update, each supplying 512 targets.
+
+| Seed | Selected / terminal steps | Selected / trained token equivalents |
+|---:|---:|---:|
+| 1 | 720 / 720 | 0.907264 / 0.907264 |
+| 2 | 944 / 944 | 1.189524 / 1.189524 |
+| 3 | 880 / 896 | 1.108878 / 1.129039 |
+| 4 | 784 / 800 | 0.987910 / 1.008071 |
+| 5 | 672 / 672 | 0.846780 / 0.846780 |
+
+One reporting correction remains. Caveat 2 calls the evaluated checkpoints “the stopped weights”. For seeds 3 and 4 the Stage B AdamW digest matches the selected step and differs from the terminal digest. The selected/terminal prefixes are `81d3e9a7/5adef294` and `602766b1/a06e34ac`, respectively. The selected weights were evaluated without retraining. [Selection and return](../research/quant_ptq/bench_c5_02_isoloss_ptq_mitigation.py#L682) · [Caveat 2](../research/quant_ptq/bench_c5_02_isoloss_ptq_mitigation.py#L1665) · [Committed caveats](../results/cycle5_c5_02_isoloss_ptq_mitigation.json#L87203)
+
+**B3 and C1–C3.** The docstring, stage comments, split-order errors and caveats now distinguish startup file verification from the first Stage B scoring view. Verification reads each shard for its hash and again for token/document checks. Stage A receives train and validation only. Both seed-0 logs contain test scores, and the full shakedown ended at 23:26 MST on Nov 26. The stopped `05ea4ae` log ends in Stage A with seed 1 matched at 640 and seed 2 still +0.0925 at 1280. The `0355d16` log starts with zero cached units and scores test after all five selections. The floor-LR pilot spans validation NLL 5.235–5.414. The caveats identify the coupled training choices, identity NVFP4 RTN QAT, weight-only AWQ selection and the absence of an explicit spectral intervention. They state the paired-t assumption, the 6- and 48-cell Holm families, the 0.0625 sign-flip floor, the shared corpus and the model/device scope. Caveat 4 still describes the change relative to C4-01b as “about three times” without naming a cell or an aggregate. The six ratios of primary AdamW test ΔNLL means are 2.60, 1.42, 1.38, 1.97, 3.54 and 4.02 in result order. A cell-specific comparison would make that sentence checkable. [Pilot and amendment](../research/quant_ptq/bench_c5_02_isoloss_ptq_mitigation.py#L198) · [Caveat 4](../research/quant_ptq/bench_c5_02_isoloss_ptq_mitigation.py#L1686)
+
+**H2.** I identified copied rows by AWQ method and selected zero alpha, located the unscaled sibling by format/mode/method, and compared all fields except the three copy labels. All 58 sibling pairs matched. Across the 620 rows, the independent count gave **180 unique + 20 inherited** hardware profiles, **90 + 10** decode rows and **5,400 + 600** matrix comparisons from the individual row counts. Both `analysis.hardware` and `derived.hardware` matched all nine counts. The committed artifact has 510 per-kind butterfly fit summaries.
+
+**H3.** Both cache paths reload the retained tensor dictionary on CPU with `weights_only=True` and recompute its digest. With both stages cached, the integration tests replaced a seed's checkpoint with garbage and then another seed's readable weights. Resume regenerated the affected Stage A unit. When the file changed after Stage A verification, cached Stage B reuse failed and reloading raised the read or digest error. Restoring the file permitted all 25 units to be reused. The focused verifier tests also covered empty, truncated, missing and non-dictionary checkpoints. [Digest verifier](../research/quant_ptq/bench_c5_02_isoloss_ptq_mitigation.py#L845) · [Stage A reuse](../research/quant_ptq/bench_c5_02_isoloss_ptq_mitigation.py#L2613) · [Stage B reuse](../research/quant_ptq/bench_c5_02_isoloss_ptq_mitigation.py#L2639)
+
+**Independent pytest runs.** Both runs used the requested project interpreter, `PYTHONPATH=.`, disabled bytecode, separate pytest caches and an isolated temporary directory. With CUDA hidden, **96 passed and 3 skipped** in 335.24 s. The skips require native NVFP4, canonical hardware rows or a static W4A4 fixture. On the live NVIDIA GeForce RTX 5080 (driver 615.78.08), **99 passed** in 233.22 s.
+
+**Signoff.** Preserve the published raw measurement and replay evidence. Keep the merge on hold for the provenance, reserved-output and butterfly defects above.
