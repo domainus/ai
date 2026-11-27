@@ -903,7 +903,8 @@ def _assert_close_strict(found, expected, path: str, tol: float) -> None:
             raise ValueError(f"{path}: {found!r} differs from the recomputed {expected!r}")
 
 
-def _validate_polar_quality(q: dict, where: str, *, rank: int, extra_keys: set[str] | None = None) -> None:
+def _validate_polar_quality(q: dict, where: str, *, rank: int, numel: int | None = None,
+                            extra_keys: set[str] | None = None) -> None:
     expected_keys = {"finite", "sigma_min", "sigma_max", "rel_fro_err"} | (extra_keys or set())
     _require(isinstance(q, dict) and set(q.keys()) == expected_keys, f"{where}: unexpected keys")
     _require(isinstance(q["finite"], bool), f"{where}: finite must be bool")
@@ -911,6 +912,9 @@ def _validate_polar_quality(q: dict, where: str, *, rank: int, extra_keys: set[s
         smin, smax, err = q["sigma_min"], q["sigma_max"], q["rel_fro_err"]
         _require(_is_number(smin) and _is_number(smax) and _is_number(err) and 0 <= smin <= smax and err >= 0,
                  f"{where}: singular values out of order")
+        if numel is not None:
+            max_sigma = math.sqrt(numel) * float(torch.finfo(torch.float32).max)
+            _require(smax <= max_sigma, f"{where}: sigma_max exceeds finite FP32 matrix norm bound")
         if rank == 1:
             _require(abs(smax - smin) <= 1e-12, f"{where}: rank-1 matrix must have sigma_min == sigma_max")
             lo, hi = abs(smax - 1.0), smax + 1.0
@@ -1021,6 +1025,8 @@ def _validate_meta(meta: dict, *, canonical: bool) -> None:
     _require(isinstance(cap, list) and len(cap) == 2 and all(_is_int(x) for x in cap)
              and 0 <= cap[0] <= 99 and 0 <= cap[1] < 10,
              "meta.environment.capability invalid")
+    if env["device"] == "NVIDIA GeForce RTX 5080":
+        _require(cap == [12, 0], "NVIDIA GeForce RTX 5080 must have compute capability [12, 0]")
 
     numerics = meta["numerics"]
     expected_num_keys = {"allow_tf32", "cudnn_allow_tf32", "float32_matmul_precision",
@@ -1093,7 +1099,7 @@ def _validate_meta(meta: dict, *, canonical: bool) -> None:
             _require(ok, f"meta.gpu_telemetry.{side}.{key} invalid")
         ps = sample["pstate"]
         _require(isinstance(ps, str) and len(ps) >= 2 and ps[0] == "P" and ps[1:].isdigit()
-                 and 0 <= int(ps[1:]) <= 15,
+                 and ps == f"P{int(ps[1:])}" and 0 <= int(ps[1:]) <= 15,
                  f"meta.gpu_telemetry.{side}.pstate invalid")
         er = sample["clocks_event_reasons.active"]
         _require(isinstance(er, str) and er.startswith("0x") and _is_hex(er[2:], 16),
@@ -1171,6 +1177,9 @@ def _validate_long_k(payload: dict, *, canonical: bool = False) -> None:
              and set(lgs["sync_free"]) == set(kernels)
              and all(isinstance(v, bool) for v in lgs["sync_free"].values()),
              "launches_at_graph_shape differs from the protocol")
+    if max(lgs["shape"][-2:]) > protocol["gate"]:
+        _require(all(lgs["native"][k] >= LAUNCHES[k] + 4 for k in kernels),
+                 "launches_at_graph_shape native count below two-phase chunked SYRK minimum")
     identities = {
         "syrk": ([(r["shape"], r["dtype"], r["out_dtype"]) for r in lk["syrk"]],
                  [(s, d, o) for s in spec["symmetry_shapes"] for d in dtypes for o in (out_dtypes[d], "float32")]),
@@ -1211,9 +1220,10 @@ def _validate_long_k(payload: dict, *, canonical: bool = False) -> None:
     boundary_keys = {"k", "shape", "kernel", "dtype", "chunked", "reference",
                      "bitwise_equal_reference", "bitwise_equal_control", "sigma_max"}
     for r in lk["boundaries"]:
+        max_sigma = math.sqrt(r["shape"][-2] * r["shape"][-1]) * float(torch.finfo(torch.float32).max)
         _require(set(r.keys()) == boundary_keys, f"long_k boundaries k={r['k']}: unexpected keys")
         _require(isinstance(r["bitwise_equal_reference"], bool) and isinstance(r["bitwise_equal_control"], bool)
-                 and _is_number(r["sigma_max"]) and r["sigma_max"] > 0,
+                 and _is_number(r["sigma_max"]) and 0 < r["sigma_max"] <= max_sigma,
                  f"long_k boundaries k={r['k']}: invalid fields or sigma_max")
     input_base_keys = {"case", "shape", "kernel", "dtype", "bitwise_equal_c4_03", "finite_per_matrix", "sync_free"}
     for r in lk["inputs"]:
@@ -1231,12 +1241,15 @@ def _validate_long_k(payload: dict, *, canonical: bool = False) -> None:
             _require(set(r.keys()) == (input_base_keys | {"degenerate_zero", "normal_quality"}),
                      f"long_k inputs {r['case']}: unexpected keys")
             _validate_polar_quality(r["normal_quality"], f"long_k inputs {r['case']} {r['kernel']} {r['dtype']}",
-                                    rank=min(r["shape"][-2], r["shape"][-1]))
+                                    rank=min(r["shape"][-2], r["shape"][-1]),
+                                    numel=r["shape"][-2] * r["shape"][-1])
             _require(r["normal_quality"]["finite"] is r["finite_per_matrix"][0],
                      f"long_k inputs {r['case']}: normal_quality.finite differs from finite_per_matrix[0]")
             if r["kernel"] == "ps3_55":
                 _require(r["degenerate_zero"] is None,
                          f"long_k inputs {r['case']}: ps3_55 degenerate_zero must be None")
+                _require(r["finite_per_matrix"][3:] == [False, False],
+                         f"long_k inputs {r['case']}: ps3_55 propagates NaN/inf inputs")
             else:
                 _require(isinstance(r["degenerate_zero"], list) and len(r["degenerate_zero"]) == 4
                          and all(isinstance(x, bool) for x in r["degenerate_zero"]),
@@ -1260,9 +1273,10 @@ def _validate_long_k(payload: dict, *, canonical: bool = False) -> None:
     for r in lk["opus_l6"]:
         where = f"opus_l6 {r['shape']} {r['kernel']} {r['dtype']}"
         rank = min(r["shape"][-2], r["shape"][-1])
+        numel = r["shape"][-2] * r["shape"][-1]
         _require(set(r.keys()) == opus_keys, f"{where}: unexpected keys")
-        _validate_polar_quality(r["native"], f"{where}.native", rank=rank)
-        _validate_polar_quality(r["control"], f"{where}.control", rank=rank)
+        _validate_polar_quality(r["native"], f"{where}.native", rank=rank, numel=numel)
+        _validate_polar_quality(r["control"], f"{where}.control", rank=rank, numel=numel)
         _require(isinstance(r["bitwise_equal_c4_03"], bool), f"{where}: bitwise_equal_c4_03 must be bool")
         _require(len(r["samples"]) == spec["opus_reps"], f"{where}: sample count differs")
         min_opus_wall_ms = 0.1 if canonical else 1e-3
@@ -1291,7 +1305,7 @@ def _validate_long_k(payload: dict, *, canonical: bool = False) -> None:
         _require(_exact_equal(r["chunked"], r["k"] > protocol["gate"])
                  and _exact_equal(r["k"], 1 << r["k_exponent"]), "grid chunk flag")
         for name, c in r["cells"].items():
-            _validate_polar_quality(c, f"grid {name}", rank=r["n"],
+            _validate_polar_quality(c, f"grid {name}", rank=r["n"], numel=r["shape"][-2] * r["shape"][-1],
                                     extra_keys={"design_ceiling", "bitwise_equal_c4_03"})
             _require(isinstance(c["bitwise_equal_c4_03"], bool), f"grid {name}: flags must be bool")
             _assert_close_strict(c["design_ceiling"], design[name.rsplit("_", 1)[0]],
@@ -1651,7 +1665,14 @@ def _validate_mma(payload: dict) -> None:
 
 
 def validate_results(payload: dict, *, canonical: bool | None = None) -> None:
-    """Raise ValueError unless ``payload`` is a complete, internally consistent C5-01 result."""
+    """Offline schema, git provenance, mathematical consistency, and promotion-gate validator.
+
+    Verifies producer-emitted JSON structure, exact protocol identity, committed git-object code
+    hashes, CPU MMA digest/agreement consistency, and canonical promotion bounds. It is an offline
+    consistency check rather than a cryptographic hardware-attestation proof against arbitrary
+    adversarial edits to unconstrained leaf measurements; independent RTX 5080 execution is
+    verified separately by live GPU audit replay.
+    """
     expected_top_keys = {"schema_version", "task", "quick", "canonical", "meta", "protocol",
                          "run_config_hash", "zero_regression", "timing", "long_k", "mma", "derived"}
     _require(isinstance(payload, dict) and set(payload.keys()) == expected_top_keys, "top-level keys differ from schema")
@@ -1723,9 +1744,9 @@ def validate_results(payload: dict, *, canonical: bool | None = None) -> None:
         _require(d["long_k"]["grid_bitwise_c4_03"] == d["long_k"]["grid_cells"], "grid C4-03 mismatch")
         _require(all(payload["long_k"]["launches_at_graph_shape"]["sync_free"].values()),
                  "launches_at_graph_shape sync_free failed")
-        _require(all(payload["long_k"]["launches_at_graph_shape"]["native"][k] > LAUNCHES[k]
+        _require(all(payload["long_k"]["launches_at_graph_shape"]["native"][k] >= LAUNCHES[k] + 4
                      for k in protocol["kernels"]),
-                 "promotion: long_k launches_at_graph_shape must exceed unchunked launch count")
+                 "promotion: long_k launches_at_graph_shape below two-phase chunked SYRK minimum")
         _require(all(r["api_equals_helper"] for r in payload["long_k"]["syrk"]),
                  "promotion: long_k syrk api_equals_helper")
         diag_bias_ceiling = {"float32": 1e-3, "float16": 2e-3, "bfloat16": 1e-2}
@@ -1750,6 +1771,9 @@ def validate_results(payload: dict, *, canonical: bool | None = None) -> None:
                 if r["kernel"] != "ps3_55":
                     _require(r["finite_per_matrix"] == [True] * 5 and r["degenerate_zero"] == [True] * 4,
                              "promotion: long_k inputs mixed degenerate_zero")
+                else:
+                    _require(r["finite_per_matrix"] == [True, True, True, False, False],
+                             "promotion: long_k inputs mixed ps3_55 finiteness")
             else:
                 _require(all(r["finite_per_matrix"]), "promotion: long_k inputs finite")
         _require(all(r["finite"] for r in payload["long_k"]["graphs"])

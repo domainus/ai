@@ -730,6 +730,11 @@ def _hidden_cuda_env(payload):
     _refresh_run_config_hash(payload)
 
 
+def _rtx5080_sm130_cap(payload):
+    payload["meta"]["environment"]["capability"] = [13, 0]
+    _refresh_run_config_hash(payload)
+
+
 def _structural_probes(canonical):
     """Astra's validator bypasses (C5-01 audit + re-audit v2, v3, v4): each must be rejected."""
     probes = [
@@ -832,6 +837,11 @@ def _structural_probes(canonical):
         (lambda p: p["timing"].update(l2_cache_bytes=1, flush_bytes=4), "plausible CUDA GPU L2 range"),
         (_hidden_cuda_env, "CUDA_VISIBLE_DEVICES cannot hide GPUs"),
         (_set(["meta", "numerics", "autocast"], "bogus"), "full-precision numerics are required"),
+        (_set(["long_k", "launches_at_graph_shape", "native", "ps3_55"], 17), "chunked SYRK minimum"),
+        (lambda p: next(
+            r for r in p["long_k"]["inputs"] if r["case"].startswith("mixed") and r["kernel"] == "ps3_55"
+        )["finite_per_matrix"].__setitem__(slice(3, None), [True, True]), "propagates NaN/inf inputs"),
+        (_set(["meta", "gpu_telemetry", "start", "pstate"], "P08"), "pstate invalid"),
     ]
     if canonical:
         probes += [
@@ -863,7 +873,10 @@ def _structural_probes(canonical):
             (lambda p: p["timing"].update(l2_cache_bytes=16 << 20, flush_bytes=64 << 20), "RTX 5080 64 MiB L2"),
             (_tree_git_sha, "not a commit object"),
             (lambda p: p["zero_regression"]["launches"][3].update(native=99, legacy=99), "launch counts differ"),
-            (_set(["long_k", "launches_at_graph_shape", "native", "ps3_55"], 1), "must exceed unchunked launch count"),
+            (_set(["long_k", "launches_at_graph_shape", "native", "ps3_55"], 1), "chunked SYRK minimum"),
+            (lambda p: p["long_k"]["opus_l6"][12]["control"].update(
+                sigma_min=1e100, sigma_max=1e100, rel_fro_err=1e100), "finite FP32 matrix norm bound"),
+            (_rtx5080_sm130_cap, r"compute capability \[12, 0\]"),
         ]
     return probes
 
