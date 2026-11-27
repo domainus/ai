@@ -5,8 +5,12 @@ held-out seeds met the 0.02-nat target, and its checkpoints were not kept. This 
 every seed on ``val.bin`` alone, keeps the matched weights, and tests three mitigations on the
 same five paired seeds.
 
-Stage A  Training and matching. The stage receives a mapping with ``train`` and ``val`` only;
-         ``test.bin`` is not opened by the process until the stage has finished for every seed.
+Stage A  Training and matching. The stage receives a mapping with ``train`` and ``val`` only:
+         ``Shards.open`` maps ``train.bin`` and ``val.bin`` for Stage A and maps ``test.bin`` for the
+         first time for the Stage B scoring. This is not the first read of ``test.bin`` by the
+         process: ``Shards(verify=True)`` reads all three shard files twice at startup (SHA-256, then
+         token range and document boundaries for the manifest and disjointness checks). That
+         verification scores no model.
          Per seed (one ``initial_state``, one batch stream):
            ``muon_ss3_54``          320 steps, snapshots after steps 256 and 272.
            ``muon_adamw_cooldown``  branch of the step-256 snapshot: the last 64 steps update the
@@ -41,16 +45,33 @@ Analysis Paired per-seed differences (df = 4): Student-t test and 95% interval, 
          against AdamW; with one val-selected method for both sides ("primary") and with each
          side's own val-selected method ("own_best").
 
+``test.bin`` is held out from the canonical selection rules: training, stopping, checkpoint
+selection, calibration, alpha selection and method selection read ``train.bin`` and ``val.bin``
+only. It is not a previously unseen study-level holdout. Seed-0 shakedown runs (the logs
+``timing_seed0.log`` and ``timing_seed0b.log``, and the shakedown JSON with SHA-256 ``39f2d27e...``)
+scored the same ``test.bin`` before the initial commit ``05ea4ae`` and the amendment ``0355d16``.
+
 ``cycle5_c5_02*.json`` is reserved in every checkout and through symlinks: only the canonical
 protocol, on an sm_120+ device and a clean git tree, may write it. Both guards run before any
 GPU work. ``validate_results`` documents what an offline check can and cannot establish.
 
-Run (alone on the GPU, from a clean commit, about 3.3 hours on an RTX 5080: each of the 620 grid
-rows reads the complete val.bin and test.bin; ``--resume`` continues an interrupted run):
+Schema ``cycle5_c5_02.v2`` adds the top-level ``postprocess`` field. It is ``None`` for a run that
+measures. ``--postprocess-from-git <commit>`` reads the committed ``cycle5_c5_02.v1`` result of that
+commit with ``git show``, keeps every raw measurement unchanged (``RAW_MEASUREMENT_KEYS``),
+recomputes only ``analysis``, ``derived`` and ``caveats``, and records the provenance of the source
+and of the postprocessing code in ``postprocess``. It needs no GPU and does not retrain.
+
+Run (alone on the GPU, from a clean commit, about 3.3 hours on an RTX 5080: each measured grid row
+reads the complete val.bin and test.bin; 562 of the 620 canonical rows are measured, 58 are copies of
+alpha = 0 twins. ``--resume`` continues an interrupted run; it reuses a finished unit only after the
+tensor digest of every retained checkpoint of that unit is verified):
     PYTHONPATH=. .venv/bin/python research/quant_ptq/bench_c5_02_isoloss_ptq_mitigation.py
 Smoke run:
     PYTHONPATH=. .venv/bin/python research/quant_ptq/bench_c5_02_isoloss_ptq_mitigation.py --quick \\
         --output /tmp/c5_02.json
+Postprocess the committed v1 measurements (clean tree, no GPU):
+    PYTHONPATH=. .venv/bin/python research/quant_ptq/bench_c5_02_isoloss_ptq_mitigation.py \\
+        --postprocess-from-git da148c296a4b8750fa9e67c0145e4f0789ecba54
 """
 
 from __future__ import annotations
@@ -89,11 +110,14 @@ from research.quant_ptq import micro_rotated_ptq as q
 from research.quant_ptq import nvfp4_inference_blackwell as nb
 
 ROOT = Path(__file__).resolve().parents[2]
-SCHEMA_VERSION = "cycle5_c5_02.v1"
+SCHEMA_VERSION = "cycle5_c5_02.v2"
+SOURCE_SCHEMA_VERSION = "cycle5_c5_02.v1"  # the schema that ``--postprocess-from-git`` reads
 TASK = ("Cycle 5 C5-02: per-seed validation-only iso-loss Muon-vs-AdamW PTQ and Muon PTQ-sensitivity "
         "mitigations (AdamW cooldown, NVFP4 QAT cooldown, activation-aware scaling) on Blackwell")
 SCRIPT_NAME = "bench_c5_02_isoloss_ptq_mitigation.py"
-CANONICAL_OUTPUT = ROOT / "results" / "cycle5_c5_02_isoloss_ptq_mitigation.json"
+RESULT_REPO_PATH = "results/cycle5_c5_02_isoloss_ptq_mitigation.json"
+CANONICAL_OUTPUT = ROOT / RESULT_REPO_PATH
+DRIVER_MODULE = "research.quant_ptq.bench_c5_02_isoloss_ptq_mitigation"
 QUICK_OUTPUT = ROOT / "results" / "c5_02_quick.json"
 CANONICAL_CHECKPOINT_DIR = ROOT / "artifacts" / "c5_02_checkpoints"
 RESERVED_PATTERN = "cycle5_c5_02*.json"
@@ -110,7 +134,48 @@ HW_MODES = ("w4a4_hw_dynamic", "w4a4_hw_static")
 EMULATED_METHOD, EMULATED_MODE = "hadamard_b16_gptq", "w4a4_emulated_fp32_dynamic"
 EMULATION_PARITY_NATS = 1e-3
 STATIC_CALIBRATION = "train.bin calibration windows, BF16 model, max |(x / s) R^T| / 2688"
-VAL_TOKENS, TEST_TOKENS = 2_001_920, 1_999_872  # complete 512-token windows of val.bin and test.bin
+# Scored targets of the complete 512-token windows of the canonical val.bin and test.bin (3,910 and 3,906
+# windows). For reference: the validator recomputes the coverage from the split lengths (``expected_coverage``).
+VAL_TOKENS, TEST_TOKENS = 2_001_920, 1_999_872
+# Identity of the canonical shards (FineWeb-Edu, GPT-2 BPE). The SHA-256 values are ``q.EXPECTED_SHA256``.
+CANONICAL_DATA = {
+    "source": {"dataset": "HuggingFaceFW/fineweb-edu", "config": "sample-10BT", "split": "train",
+               "streaming": True, "name": "fineweb-edu", "fallback_from": None},
+    "encoding": "gpt2",
+    "tokens": {"train": 26_004_518, "val": 2_002_330, "test": 2_000_081},
+}
+ROLES = {"training": "train", "calibration": "train", "static_scales": "train", "matching": "val",
+         "method_and_alpha_selection": "val", "evaluation": "test"}
+CANONICAL_ORTHOGONALIZER = "schatten_switch_blackwell SS3_54 FP16 (Triton)"
+ADAMW_ORTHOGONALIZER = "fused AdamW"
+TRAIN_LOSS_NOTE = "train_loss is the mean of the last 10 optimizer steps (of this arm's own phase)"
+BUTTERFLY_FAMILY, BUTTERFLY_LR = "adaptive_butterfly_b16", 0.01  # ``q.fit_butterfly`` default LR
+GPTQ_DAMP_TRIES = 8  # ``q.gptq_quantize`` multiplies the damping by 10 at most 7 times
+HARDWARE_SKIP_NOTE = "skipped: needs CUDA sm_100+ with F.scaled_mm"
+
+# Raw measurements of a result. ``--postprocess-from-git`` copies them unchanged from the source.
+RAW_MEASUREMENT_KEYS = ("quick", "canonical", "meta", "run_config_hash", "preset", "config", "protocol", "data",
+                        "stage_a", "stage_b")
+POSTPROCESS_KEYS = ("source_schema_version", "source_result_git_sha", "source_artifact_sha256",
+                    "source_raw_measurements_sha256", "postprocess_git_sha", "postprocess_git_dirty",
+                    "postprocess_code_sha256", "postprocess_code_modules", "postprocess_command",
+                    "postprocess_timestamp", "retained_evidence_sha256", "reason")
+# The committed v1 result that the canonical postprocess reads: result commit -> SHA-256 of the file.
+CANONICAL_SOURCE_ARTIFACTS = {
+    "da148c296a4b8750fa9e67c0145e4f0789ecba54": "4944c2832056524f994a2d4931950983244ac20e547cc9e281d5e7e0defeddb8"}
+# Run evidence that is retained outside git (artifacts/c5_02_design_pilot/), as hashed by the C5-02 audit:
+# aborted_canonical_05ea4ae.log, canonical_0355d16.log, timing_seed0b.json and probe_hold.out.
+RETAINED_EVIDENCE_SHA256 = {
+    "stopped_canonical_log": "d877d6862b98b8d140aeb2436f0085ce18173ccada7252e0d140910e64c0d046",
+    "final_canonical_log": "cfde4b04bc416c04cb5d98c39f94ee59312b62c2f24bfe840acd35c065b843fe",
+    "seed0_shakedown_json": "39f2d27e6661e89f7f3e7f4cef7bab7ed78441b73236e81bc92fb8c303421803",
+    "floor_lr_probe_output": "adf722e3ab295959d11bb6a0889d8c8e376d2c65f5a540656caecfb5ba44a2a5",
+}
+POSTPROCESS_REASON = (
+    "Remediation of the C5-02 audit (audits/AUDIT_cycle5_c5_02_gpt62_astra.md): the raw measurements of the "
+    "source result are unchanged; analysis, derived and caveats are recomputed with the corrected token-exposure "
+    "statement, the corrected split-access and pilot chronology, the unique and inherited hardware counts and "
+    "the tightened caveats, and the result is checked by the hardened validator. Nothing was retrained.")
 SPLITS = ("val", "test")
 N_SEEDS = 5
 T975_DF4 = 2.7764451051977987  # Student-t 0.975 quantile, 4 degrees of freedom
@@ -123,21 +188,28 @@ ENDPOINTS = ("delta_nll", "nll")
 TOL = 1e-12
 ENV_KEYS = ("torch", "triton", "cuda", "driver", "device", "capability")
 
-# Design-time pilot (seed 0, val.bin only, never part of a result). Muon: val NLL 5.343 to 5.346.
+# Design-time pilot (seed 0, never part of a result). Muon: val NLL 5.343 to 5.346.
 # * Fresh warmup + cosine AdamW runs at LR 0.001 with 456 .. 704 steps: two runs of one configuration differed
 #   by 0.06 nats (640 steps) and 0.07 nats (472 steps), and 496 / 512 / 528 / 536 steps gave 5.393 / 5.500 /
 #   5.338 / 5.262. A match by fresh runs is therefore a lottery.
 # * Inside one run the val NLL falls smoothly at the floor LR (about 0.0044 nats per 8 steps), so one run per
 #   seed is stopped on a 16-step grid instead. Three runs with ``cosine_steps`` = 464 were 0.05 to 0.28 nats
 #   above Muon when the floor LR was reached; the worst needs about 500 floor-LR steps.
-# * The floor-LR phase does not change the PTQ sensitivity of AdamW at equal loss: identity-GPTQ val NLL
-#   increase 0.0010 (NVFP4) / 0.0096 (INT2 g16) at val NLL 5.41 of a stopped run, against 0.0010 / 0.0106 and
-#   0.0008 / 0.0106 for fresh cosine runs of 544 and 608 steps (val NLL 5.30 and 5.24).
-# Protocol amendment before any Stage B work (val.bin only; test.bin had not been opened). The first canonical
-# attempt (commit 05ea4ae, ``max_steps`` = 1280) was stopped during Stage A: seed 1 matched at 640 steps
-# (gap 0.003 nats), but the AdamW run of seed 2 was 0.58 nats above Muon at step 400 and still 0.09 nats above
-# it at step 1280. AdamW at LR 0.001 has such slow runs, so the cap is 2560 steps (about 0.9 nats of floor-LR
-# progress). Nothing else changed. A run that needs more is reported as unmatched.
+# * Floor-LR probe (val.bin and train calibration only). It is a sensitivity check at different losses, not
+#   an equal-loss proof: identity-GPTQ val NLL increase 0.0010 (NVFP4) / 0.0096 (INT2 g16) at val NLL 5.414 of
+#   a run stopped at 848 steps, against 0.0010 / 0.0106 at 5.298 and 0.0008 / 0.0106 at 5.235 for fresh cosine
+#   runs of 544 and 608 steps. The magnitudes are similar across 5.235 to 5.414; a floor-phase effect at equal
+#   loss is not excluded.
+# * Seed-0 shakedowns of the complete pipeline (timing_seed0.log, timing_seed0b.log) scored test.bin before
+#   the initial commit 05ea4ae and before the amendment 0355d16. test.bin is therefore held out from the
+#   canonical selection rules, but it is not a previously unseen study-level holdout.
+# Protocol amendment. The first canonical attempt (commit 05ea4ae, ``max_steps`` = 1280) was stopped during
+# Stage A and has no Stage B scores: seed 1 matched at 640 steps (gap 0.003 nats), but the AdamW run of seed 2
+# was 0.58 nats above Muon at step 400 and still 0.0925 nats above it at step 1280, where the log ends. Its
+# startup verification had read test.bin (hashes and document boundaries); no model was scored on it. AdamW at
+# LR 0.001 has such slow runs, so the cap is 2560 steps (about 0.9 nats of floor-LR progress). Nothing else
+# changed. The fresh runs of 0355d16 follow other trajectories; every one of them stopped below step 1280. A
+# run that needs more than the cap is reported as unmatched.
 CANONICAL = {
     "preset": "50m", "device": "cuda", "seeds": [1, 2, 3, 4, 5], "tolerance_nats": 0.02,
     "muon": {"steps": 320, "lr": 0.02, "auxiliary_lr": 0.001},
@@ -218,25 +290,40 @@ def require_canonical_host(device: torch.device, git: dict, output: Path, canoni
         raise RuntimeError("A canonical run needs a clean, committed git tree (git_dirty must be False)")
 
 
+def require_clean_tree(git: dict, output: Path) -> None:
+    """A postprocess that writes a reserved filename needs a clean, committed tree (no GPU)."""
+    if reserved(output) and (git.get("git_dirty") is not False or not _is_hex(git.get("git_sha"), 40)):
+        raise RuntimeError(f"Postprocessing into {Path(output).name} needs a clean, committed git tree "
+                           "(git_dirty must be False)")
+
+
 def _module_path(name: str) -> Path:
     return ROOT.joinpath(*name.split(".")).with_suffix(".py")
 
 
-@functools.cache
-def code_modules() -> tuple[str, ...]:
-    """Every ``research.*`` module this driver imports, directly or transitively (static ``ast`` closure)."""
-    found, todo = set(), ["research.quant_ptq.bench_c5_02_isoloss_ptq_mitigation"]
+def _import_closure(source_of) -> tuple[str, ...]:
+    """Static ``ast`` import closure of the driver. ``source_of(module)`` gives the source text or None."""
+    found, todo = set(), [DRIVER_MODULE]
     while todo:
         name = todo.pop()
-        if name in found or not _module_path(name).is_file():
+        if name in found:
+            continue
+        text = source_of(name)
+        if text is None:
             continue
         found.add(name)
-        for node in ast.walk(ast.parse(_module_path(name).read_text())):
+        for node in ast.walk(ast.parse(text)):
             if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("research"):
                 todo += [node.module, *(f"{node.module}.{alias.name}" for alias in node.names)]
             elif isinstance(node, ast.Import):
                 todo += [alias.name for alias in node.names if alias.name.startswith("research")]
     return tuple(sorted(found))
+
+
+@functools.cache
+def code_modules() -> tuple[str, ...]:
+    """Every ``research.*`` module this driver imports, directly or transitively (static ``ast`` closure)."""
+    return _import_closure(lambda name: _module_path(name).read_text() if _module_path(name).is_file() else None)
 
 
 def code_sha256() -> str:
@@ -246,26 +333,84 @@ def code_sha256() -> str:
     return digest.hexdigest()
 
 
+def _git(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True)
+
+
+def _require_git_commit(sha: str, label: str) -> None:
+    kind = _git("cat-file", "-t", sha) if _is_hex(sha, 40) else None
+    if kind is None or kind.returncode != 0 or kind.stdout.strip() != b"commit":
+        raise ValueError(f"{label} {sha} is not a commit object")
+
+
+def _git_blob(git_sha: str, repo_path: str) -> bytes:
+    """The committed bytes of ``repo_path`` at ``git_sha`` (``git show <sha>:<path>``)."""
+    blob = _git("show", f"{git_sha}:{repo_path}")
+    if blob.returncode != 0:
+        raise ValueError(f"cannot read {repo_path} at commit {git_sha}")
+    return blob.stdout
+
+
+def _module_repo_path(name: str) -> str:
+    return "/".join(name.split(".")) + ".py"
+
+
+@functools.cache
+def _code_modules_at_commit(git_sha: str) -> tuple[str, ...]:
+    """The static import closure of the driver, computed from the git blobs of ``git_sha``."""
+    _require_git_commit(git_sha, "git_sha")
+    listing = _git("ls-tree", "-r", "--name-only", git_sha, "--", "research")
+    if listing.returncode != 0:
+        raise ValueError(f"cannot list the tree of commit {git_sha}")
+    files = set(listing.stdout.decode().splitlines())
+
+    def source_of(name: str) -> str | None:
+        repo_path = _module_repo_path(name)
+        return _git_blob(git_sha, repo_path).decode() if repo_path in files else None
+
+    return _import_closure(source_of)
+
+
+@functools.cache
+def _code_sha256_at_commit(git_sha: str, modules: tuple[str, ...]) -> str:
+    _require_git_commit(git_sha, "git_sha")
+    digest = hashlib.sha256()
+    for module in modules:
+        blob = _git("show", f"{git_sha}:{_module_repo_path(module)}")
+        if blob.returncode != 0:
+            raise ValueError(f"cannot read {module} at git_sha {git_sha}")
+        digest.update(module.encode() + b"\0" + blob.stdout)
+    return digest.hexdigest()
+
+
 def _digest(obj) -> str:
     return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()[:16]
 
 
 def run_config_hash(quick: bool, protocol: dict, config: dict, code: str, git_sha: str | None, env: dict,
-                    data_sha256: dict) -> str:
-    return _digest({"schema": SCHEMA_VERSION, "quick": quick, "protocol": protocol, "config": config,
+                    data_sha256: dict, schema: str = SCHEMA_VERSION) -> str:
+    """``schema`` is the schema version of the run that measured (the source schema after a postprocess)."""
+    return _digest({"schema": schema, "quick": quick, "protocol": protocol, "config": config,
                     "code_sha256": code, "git_sha": git_sha, "env": {k: env.get(k) for k in ENV_KEYS},
                     "data_sha256": data_sha256})
 
 
-def unit_config_hash(protocol: dict, config: dict, code: str, env: dict, data_sha256: dict) -> str:
+def unit_config_hash(protocol: dict, config: dict, code: str, env: dict, data_sha256: dict,
+                     schema: str = SCHEMA_VERSION) -> str:
     """Resume key of a per-seed unit: everything that determines it, without the seed list.
 
     Transitive code, torch / triton / cuda / driver / device, shard hashes, the model config and the
     protocol (calibration seed included). A changed dependency or runtime therefore reuses nothing.
     """
-    return _digest({"schema": SCHEMA_VERSION, "protocol": {k: v for k, v in protocol.items() if k != "seeds"},
+    return _digest({"schema": schema, "protocol": {k: v for k, v in protocol.items() if k != "seeds"},
                     "config": config, "code_sha256": code, "env": {k: env.get(k) for k in ENV_KEYS},
                     "data_sha256": data_sha256})
+
+
+def raw_measurements_sha256(payload: dict) -> str:
+    """SHA-256 of the raw measurements in one canonical JSON form (sorted keys, no whitespace)."""
+    raw = {key: payload[key] for key in RAW_MEASUREMENT_KEYS}
+    return hashlib.sha256(json.dumps(raw, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
 
 class UnitLog:
@@ -314,10 +459,18 @@ def unit_log_path(output: Path) -> Path:
 
 
 # ======================================================================================
-# Data: splits are opened one by one, so a stage can be given a mapping without test.bin
+# Data: ``Shards.open`` maps splits one by one, so a stage can be given a mapping without test.bin
 # ======================================================================================
 class Shards:
-    """Verified shard directory. ``open`` memory-maps single splits and records the order."""
+    """Verified shard directory. ``open`` memory-maps single splits and records the order.
+
+    Split access. With ``verify=True`` the constructor reads ``train.bin``, ``val.bin`` and ``test.bin``
+    twice each: once for the SHA-256 and once for the token range and the document boundaries
+    (manifest and disjointness checks of ``real_text_data.verify_manifest``). No model is scored there.
+    ``opened`` records the ``open`` calls only: train and val for Stage A, then test for the Stage B
+    scoring. It is therefore the order in which the splits are mapped for training and scoring, not
+    the order of the first file read.
+    """
 
     def __init__(self, directory: Path, *, verify: bool, expected: dict | None):
         self.directory = Path(directory)
@@ -326,6 +479,11 @@ class Shards:
         found = {k: v["sha256"] for k, v in self.manifest["splits"].items()}
         if expected and any(found.get(k) != v for k, v in expected.items()):
             raise ValueError(f"Shard SHA-256 values differ from the pinned hashes: {found}")
+        if not verify:  # ``verify_manifest`` makes the same size check; here it is a stat, not a read
+            for name, entry in self.manifest["splits"].items():
+                size = (self.directory / entry["file"]).stat().st_size
+                if size != 2 * entry["tokens"]:
+                    raise ValueError(f"{name}: size {size} != 2 * {entry['tokens']} tokens")
         self.opened: list[str] = []
 
     def open(self, *names: str) -> dict[str, np.ndarray]:
@@ -469,7 +627,7 @@ def _training_row(arm: str, sha256: str, config: h.ModelConfig, train: np.ndarra
             "init_fingerprint": h.state_fingerprint(init),
             "stream_fingerprint": h.stream_fingerprint(train, config, seed),
             "train_loss": math.fsum(losses[-10:]) / len(losses[-10:]), "last_train_loss": losses[-1],
-            "train_loss_note": "train_loss is the mean of the last 10 optimizer steps (of this arm's own phase)",
+            "train_loss_note": TRAIN_LOSS_NOTE,
             "train_curve": [[first_step + i + 1, v] for i, v in enumerate(losses) if i == 0 or (i + 1) % 10 == 0],
             "train_seconds": seconds, "checkpoint_sha256": sha256, **extra}
 
@@ -529,7 +687,7 @@ def train_adamw_matched(config, train, device, protocol: dict, *, seed: int, ini
     chosen = next(e for e in evaluations if e["step"] == best[1])
     row = _training_row(ADAMW, chosen["checkpoint_sha256"], config, train, seed=seed, steps=chosen["step"],
                         lr=spec["lr"], auxiliary_lr=None, init=init, losses=losses[:chosen["step"]], first_step=0,
-                        seconds=time.perf_counter() - began - eval_seconds, orthogonalizer="fused AdamW",
+                        seconds=time.perf_counter() - began - eval_seconds, orthogonalizer=ADAMW_ORTHOGONALIZER,
                         schedule_steps=spec["cosine_steps"], cosine_steps=spec["cosine_steps"], trained_steps=done,
                         eval_seconds=eval_seconds, evaluations=evaluations)
     row.update(val_nll=chosen["val_nll"], val_ppl=math.exp(chosen["val_nll"]), val_tokens=chosen["val_tokens"],
@@ -537,9 +695,22 @@ def train_adamw_matched(config, train, device, protocol: dict, *, seed: int, ini
     return state, row
 
 
+def cooldown_recipe(arm: str, protocol: dict) -> dict:
+    """The ``cooldown`` record of a cooldown arm. It follows from the locked protocol alone."""
+    if arm == COOL_ADAMW:
+        return {"optimizer": "fused AdamW on the hidden matrices (fresh moments); auxiliary AdamW continues",
+                "lr": protocol["adamw_cooldown"]["lr"]}
+    if arm == COOL_QAT:  # identity coordinates and round to nearest only: no GPTQ, no rotation
+        return {"optimizer": "Muon continues (same momentum and auxiliary AdamW)",
+                "fake_quant": f"{protocol['qat_cooldown']['format']} round-to-nearest, straight-through, weight and "
+                              "input of every quantized linear, identity coordinates"}
+    raise ValueError(f"Unknown cooldown arm {arm!r}")
+
+
 def train_cooldown(arm: str, config, train, device, protocol: dict, *, seed: int, init: dict, snapshot: dict):
     """A cooldown arm: the Muon run up to ``snapshot``, then its own last steps on the same batches."""
     total = protocol["muon"]["steps"]
+    extra = {"cooldown": cooldown_recipe(arm, protocol)}
     spec = protocol["adamw_cooldown" if arm == COOL_ADAMW else "qat_cooldown"]
     first = spec["muon_steps"]
     if first + spec["cooldown_steps"] != total:
@@ -552,9 +723,7 @@ def train_cooldown(arm: str, config, train, device, protocol: dict, *, seed: int
     if arm == COOL_ADAMW:
         losses = _run_steps(model, CooldownAdamW(muon, spec["lr"]), stream, first, total, multiplier,
                             f"{arm} seed {seed}")
-        extra = {"cooldown": {"optimizer": "fused AdamW on the hidden matrices (fresh moments); auxiliary AdamW "
-                                           "continues", "lr": spec["lr"]}}
-    elif arm == COOL_QAT:
+    else:
         fmt = q.FORMATS[spec["format"]]
         wrapped = {name: FakeQuantLinear(linear, fmt) for name, linear in q.quantized_linears(model).items()}
         previous = e2e._swap(model, wrapped)
@@ -562,11 +731,6 @@ def train_cooldown(arm: str, config, train, device, protocol: dict, *, seed: int
             losses = _run_steps(model, muon, stream, first, total, multiplier, f"{arm} seed {seed}")
         finally:
             e2e._swap(model, previous)
-        extra = {"cooldown": {"optimizer": "Muon continues (same momentum and auxiliary AdamW)",
-                              "fake_quant": f"{spec['format']} round-to-nearest, straight-through, weight and "
-                                            "input of every quantized linear, identity coordinates"}}
-    else:
-        raise ValueError(f"Unknown cooldown arm {arm!r}")
     row = _training_row(arm, e2e._checkpoint_sha256(model.eval()), config, train, seed=seed, steps=total,
                         lr=protocol["muon"]["lr"],
                         auxiliary_lr=protocol["muon"]["auxiliary_lr"], init=init, losses=losses, first_step=first,
@@ -666,16 +830,52 @@ def stage_a_seed(config: h.ModelConfig, view: dict, device: torch.device, protoc
             "seconds": time.perf_counter() - began}
 
 
+def state_sha256(state: dict[str, Tensor]) -> str:
+    """Tensor-content SHA-256 of a state dict: the digest of ``e2e._checkpoint_sha256`` without a model.
+
+    Sorted names, a NUL separator, the shape and the contiguous FP32 bytes of every tensor, on the CPU.
+    """
+    digest = hashlib.sha256()
+    for name, tensor in sorted(state.items()):
+        array = tensor.detach().float().contiguous().cpu().numpy()
+        digest.update(name.encode("utf-8") + b"\0" + str(array.shape).encode("utf-8") + array.tobytes())
+    return digest.hexdigest()
+
+
+def checkpoint_file_matches_sha256(path: Path, sha256: str) -> bool:
+    """True when ``path`` loads (CPU, ``weights_only=True``) and its tensor-content SHA-256 is ``sha256``.
+
+    False for a missing, unreadable, corrupt or different file. No GPU and no model are needed.
+    """
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        return isinstance(state, dict) and bool(state) and state_sha256(state) == sha256
+    except Exception:  # any load failure means the retained weights cannot be trusted
+        return False
+
+
 def load_checkpoint(config: h.ModelConfig, device: torch.device, path: Path, sha256: str) -> Transformer:
     """The saved state dict of a Stage A arm; raises unless its SHA-256 is the recorded one."""
-    model = _new_model(config, device, torch.load(path, map_location="cpu", weights_only=True)).eval()
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as exc:
+        raise RuntimeError(f"{path.name}: the retained checkpoint cannot be read") from exc
+    model = _new_model(config, device, state).eval()
     if e2e._checkpoint_sha256(model) != sha256:
         raise RuntimeError(f"{path.name}: checkpoint SHA-256 differs from the Stage A record")
     return model
 
 
-def checkpoints_present(unit: dict, checkpoint_dir: Path) -> bool:
-    return all((checkpoint_dir / entry["file"]).is_file() for entry in unit["checkpoints"].values())
+def checkpoints_verified(unit: dict, checkpoint_dir: Path) -> bool:
+    """A cached Stage A unit is usable only when every retained checkpoint has its recorded digest."""
+    return all(checkpoint_file_matches_sha256(checkpoint_dir / entry["file"], entry["sha256"])
+               for entry in unit["checkpoints"].values())
+
+
+def stage_b_unit_verified(record: dict, entry: dict, checkpoint_dir: Path) -> bool:
+    """A cached Stage B unit is usable only for the Stage A digest, and only while the retained file has it."""
+    return (record["checkpoint_sha256"] == entry["sha256"]
+            and checkpoint_file_matches_sha256(checkpoint_dir / entry["file"], entry["sha256"]))
 
 
 # ======================================================================================
@@ -1137,6 +1337,11 @@ def _holm_cells(cells: list[dict], key: str) -> None:
                 block[key] = p
 
 
+def inherited(row: dict) -> bool:
+    """True for an activation-aware row with alpha = 0: its values are copied from the unscaled twin row."""
+    return row.get("awq_alpha") == 0
+
+
 def analyze(stage_a: dict, stage_b: dict, protocol: dict) -> dict:
     """Paired statistics over the five seeds. Every difference is x - y of the named contrast."""
     seeds, tolerance = protocol["seeds"], protocol["tolerance_nats"]
@@ -1244,7 +1449,11 @@ def analyze(stage_a: dict, stage_b: dict, protocol: dict) -> dict:
               "threshold_nats": EMULATION_PARITY_NATS, "passed": worst is not None and worst <= EMULATION_PARITY_NATS}
     hw_rows = [r for rows in tables.values() for r in rows.values() if r["mode"] in HW_MODES]
     decode_rows = [r for rows in tables.values() for r in rows.values() if "hw_weights_checked_matrices" in r]
+    # An alpha = 0 row is a copy of its unscaled twin: it was not profiled or decoded again.
+    hw_copies, decode_copies = [r for r in hw_rows if inherited(r)], [r for r in decode_rows if inherited(r)]
     hardware = {"w4a4_rows": len(hw_rows),
+                "w4a4_unique_profiled_rows": len(hw_rows) - len(hw_copies),
+                "w4a4_inherited_zero_alpha_rows": len(hw_copies),
                 "fp4_gemms_per_forward": sorted({r["fp4_gemms_per_forward"] for r in hw_rows}),
                 "fp4_gemms_per_forward_emulated": sorted({r["fp4_gemms_per_forward"] for rows in tables.values()
                                                           for r in rows.values() if r["mode"] == EMULATED_MODE}),
@@ -1252,7 +1461,12 @@ def analyze(stage_a: dict, stage_b: dict, protocol: dict) -> dict:
                     {c["hardware_w4a4"]["fp4_gemms_per_forward_bf16_baseline"] for c in stage_b["checkpoints"]
                      if c["hardware_w4a4"]["available"]}),
                 "decode_checked_rows": len(decode_rows),
+                "decode_unique_checked_rows": len(decode_rows) - len(decode_copies),
+                "decode_inherited_zero_alpha_rows": len(decode_copies),
                 "decode_checked_matrices": sum(r["hw_weights_checked_matrices"] for r in decode_rows),
+                "decode_unique_checked_matrices": sum(r["hw_weights_checked_matrices"] for r in decode_rows
+                                                      if not inherited(r)),
+                "decode_inherited_zero_alpha_matrices": sum(r["hw_weights_checked_matrices"] for r in decode_copies),
                 "decode_exact_rows": sum(r["hw_weights_decode_to_fakequant_weights"] is True for r in decode_rows)}
 
     # Layer geometry: per-arm seed means of the all-layer mean, and paired tests for the arm contrasts.
@@ -1301,12 +1515,35 @@ def analyze(stage_a: dict, stage_b: dict, protocol: dict) -> dict:
             "layer_geometry": layers, "quantization_geometry": quant, "awq_selected_alpha": alphas}
 
 
+def token_exposure(payload: dict) -> list[dict]:
+    """Per seed: optimizer steps and training-set token equivalents (tokens drawn / tokens of train.bin).
+
+    ``BatchStream`` draws every window with replacement, so a token equivalent is not an epoch of distinct
+    tokens. ``adamw_trained_*`` counts every step that the AdamW run made, also the steps after the selected one.
+    """
+    config, train_tokens = payload["config"], payload["data"]["splits"]["train"]["tokens"]
+    step_tokens = config["micro_batch"] * config["grad_accum"] * config["sequence_length"]
+    out = []
+    for unit in payload["stage_a"]["seeds"]:
+        rows = {r["arm"]: r for r in unit["rows"]}
+        muon, adamw = rows[MUON], rows[ADAMW]
+        out.append({"seed": unit["seed"], "muon_steps": muon["steps"],
+                    "muon_token_equivalents": muon["steps"] * step_tokens / train_tokens,
+                    "adamw_selected_steps": adamw["steps"], "adamw_trained_steps": adamw["trained_steps"],
+                    "adamw_selected_token_equivalents": adamw["steps"] * step_tokens / train_tokens,
+                    "adamw_trained_token_equivalents": adamw["trained_steps"] * step_tokens / train_tokens})
+    return out
+
+
 def derive(payload: dict) -> dict:
     """Headline numbers, copied from the stored stages and the analysis."""
     stage_a, stage_b, analysis = payload["stage_a"], payload["stage_b"], payload["analysis"]
     keys = ("matched", "t_adamw", "adamw_floor_lr_steps", "adamw_evaluations", "abs_val_gap",
             "val_gap_muon_minus_adamw", "adamw_over_muon_tokens")
-    out = {"stage_a": [{"seed": s["seed"], **{k: s["selection"][k] for k in keys}} for s in stage_a["seeds"]],
+    exposure_keys = ("adamw_trained_steps", "adamw_selected_token_equivalents", "adamw_trained_token_equivalents")
+    out = {"stage_a": [{"seed": s["seed"], **{k: s["selection"][k] for k in keys},
+                        **{k: exposure[k] for k in exposure_keys}}
+                       for s, exposure in zip(stage_a["seeds"], token_exposure(payload))],
            "checkpoints": len(stage_b["checkpoints"]),
            "grid_rows": sum(len(c["grid"]) for c in stage_b["checkpoints"]),
            "analysis_available": analysis is not None}
@@ -1339,6 +1576,7 @@ def derive(payload: dict) -> dict:
                 **{f"{field}_diff_significant_holm_0p05": sum(
                     e["test"][f"{field}_diff"]["significant_holm_0p05"] for e in contrast[family])
                    for field in ENDPOINTS}}
+    # Totals and, next to them, the unique executions (alpha = 0 rows are copies of their unscaled twins).
     out["hardware"] = {**analysis["hardware"],
                        "emulation_max_abs_nll_difference": analysis["hardware_vs_emulation"]["max_abs_nll_difference"],
                        "emulation_parity_passed": analysis["hardware_vs_emulation"]["passed"]}
@@ -1348,35 +1586,125 @@ def derive(payload: dict) -> dict:
     return out
 
 
+def _span(values: list, fmt: str) -> str:
+    low, high = format(min(values), fmt), format(max(values), fmt)
+    return low if low == high else f"{low}-{high}"
+
+
+def _join(items: list[str]) -> str:
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def exposure_caveat(payload: dict) -> str:
+    """Token exposure and compute, generated from the selected and the terminal AdamW steps of every seed."""
+    config = payload["config"]
+    exposure = token_exposure(payload)
+    slices, length = config["micro_batch"] * config["grad_accum"], config["sequence_length"] + 1
+    train_tokens = payload["data"]["splits"]["train"]["tokens"]
+    selected = [e["adamw_selected_token_equivalents"] for e in exposure]
+    trained = [e["adamw_trained_token_equivalents"] for e in exposure]
+    text = (f"One {payload['preset']} model family, one calibration draw and short training. Training batches are "
+            f"BatchStream draws with replacement: every optimizer step takes {slices} independent {length}-token "
+            f"slices at uniform random starts (no sequential cursor), so exposure is given in training-set token "
+            f"equivalents (tokens drawn / {train_tokens:,} tokens of train.bin), not in epochs of distinct tokens. "
+            f"Muon and both cooldown arms draw {_span([e['muon_token_equivalents'] for e in exposure], '.3f')} "
+            f"token equivalents ({_span([e['muon_steps'] for e in exposure], 'd')} steps). The selected AdamW "
+            f"checkpoints are at steps {_span([e['adamw_selected_steps'] for e in exposure], 'd')}, "
+            f"{_span(selected, '.3f')} token equivalents")
+    above = [e for e in exposure if e["adamw_selected_token_equivalents"] > 1.0]
+    if above:
+        names = _join([str(e["seed"]) for e in above])
+        values = _join([format(e["adamw_selected_token_equivalents"], ".3f") for e in above])
+        text += (f"; the selected checkpoint{'' if len(above) == 1 else 's'} of seed{'' if len(above) == 1 else 's'} "
+                 f"{names} {'is' if len(above) == 1 else 'are'} above one token equivalent ({values})")
+    else:
+        text += "; no selected checkpoint is above one token equivalent"
+    text += (f". The AdamW runs actually trained {_span([e['adamw_trained_steps'] for e in exposure], 'd')} steps, "
+             f"{_span(trained, '.3f')} token equivalents")
+    beyond = [e for e in exposure if e["adamw_trained_steps"] != e["adamw_selected_steps"]]
+    if beyond:
+        text += ": " + _join([
+            f"seed {e['seed']} trained {e['adamw_trained_steps']} steps = "
+            f"{e['adamw_trained_token_equivalents']:.3f} token equivalents before the selection of step "
+            f"{e['adamw_selected_steps']} = {e['adamw_selected_token_equivalents']:.3f}" for e in beyond])
+    else:
+        text += " (every seed selected its last measured step)"
+    return (text + ". A compute comparison must count every step actually run. More exposure both repeats and adds "
+            "training positions and can change generalization and geometry; there is no fixed-step or "
+            "fixed-exposure control. PTQ sensitivity of longer-trained or larger models can differ.")
+
+
 def caveats(payload: dict) -> list[str]:
     analysis, protocol = payload["analysis"], payload["protocol"]
+    env = payload["meta"]["environment"]
+    capability = env.get("capability")
+    device = f"{env['device']} (sm_{capability[0]}{capability[1]})" if capability else "CPU (no CUDA device)"
+    if analysis is None:
+        families = gap = hardware = ""
+    else:
+        cells, contrasts = len(analysis["contrasts"][0][FAMILIES[0]]), len(analysis["contrasts"])
+        families = (f" Holm-Bonferroni is applied to the paired-t p-values over the {cells} cells of one family of "
+                    f"one contrast (p_holm) and over the {cells * contrasts} cells of that family across the "
+                    f"{contrasts} contrasts (p_holm_across_contrasts).")
+        gap = (f" It cannot isolate which of them causes the mean BF16 test gap of "
+               f"{analysis['iso_loss']['test_gap_muon_minus_adamw']['mean']:+.4f} nats (Muon minus AdamW).")
+        hw = analysis["hardware"]
+        hardware = (f" Rows with alpha = 0 are copies of their unscaled twin rows, not new measurements: "
+                    f"{hw['w4a4_inherited_zero_alpha_rows']} of the {hw['w4a4_rows']} hardware W4A4 rows and "
+                    f"{hw['decode_inherited_zero_alpha_matrices']} of the {hw['decode_checked_matrices']} matrix "
+                    f"decode comparisons are inherited (analysis.hardware gives the unique and the inherited "
+                    f"counts).")
     notes = [
-        "Five paired seeds give 4 degrees of freedom. The Student-t p-values assume normal paired differences; "
-        "the exact sign-flip p-value cannot be below 0.0625 and therefore cannot pass a Holm correction over "
-        "several cells. Absence of significance is not evidence of equal PTQ sensitivity.",
+        f"Five paired seeds give 4 degrees of freedom. The seeds share one corpus, one calibration draw and one "
+        f"set of test documents; the intervals condition on these and on the val-selected methods, and they omit "
+        f"the variation of new documents, of a new calibration draw and of a repeated method selection. The "
+        f"Student-t p-values and 95% intervals assume normal paired differences (df = 4).{families} The exact "
+        f"two-sided sign-flip p-value cannot be below {SIGN_FLIP_MIN_P}, so it cannot pass a 0.05 threshold, with "
+        f"or without a correction. Absence of significance is not evidence of equal PTQ sensitivity. Inference is "
+        f"restricted to the {payload['preset']} preset in this training regime on {device}.",
         "AdamW is one run per seed, stopped on val.bin, and the stopped weights are evaluated without "
-        "retraining. The val match of Stage B is therefore the Stage A match by construction; test.bin is the "
-        "independent confirmation. Training is not bit-reproducible on this host: fresh AdamW runs of one "
-        "configuration differed by 0.06 to 0.07 nats on val.bin in the design pilot, so a retrain gives other "
-        "weights and another stopping step.",
-        "Iso-loss is not iso-compute and not iso-schedule: AdamW uses more training tokens than Muon "
+        "retraining. The val match of Stage B is therefore the Stage A match by construction. test.bin is held "
+        "out from the canonical selection rules: training, stopping, checkpoint selection, calibration, alpha "
+        "selection and method selection read train.bin and val.bin only. It is not a previously unseen "
+        "study-level holdout: seed-0 shakedown runs (timing_seed0.log and timing_seed0b.log; shakedown JSON "
+        "SHA-256 39f2d27e...) scored the same test.bin before the initial commit 05ea4ae and the amendment "
+        "0355d16, and the logs cannot show whether a person used those scores for a design decision. Training is "
+        "not bit-reproducible on this host: fresh AdamW runs of one configuration differed by 0.06 to 0.07 nats "
+        "on val.bin in the design pilot, so a retrain gives other weights and another stopping step.",
+        "Iso-loss is not iso-compute and not iso-schedule: AdamW draws more training tokens than Muon "
         "(adamw_over_muon_tokens per seed) and ends with a seed-dependent number of floor-LR steps "
-        "(adamw_floor_lr_steps), while Muon ends when its cosine reaches the floor.",
-        "The AdamW cosine length and the first measured step come from a seed-0 design pilot (val.bin only). "
-        "The AdamW step cap was raised from 1280 to 2560 after a first canonical attempt was stopped in Stage A "
-        "(val.bin only, before test.bin was opened): the AdamW run of seed 2 was 0.58 nats above Muon at step 400 "
-        "and unmatched at step 1280. In the pilot the PTQ loss of AdamW at LR 0.001 was about the same with and "
-        "without the floor-LR phase at equal val NLL; it is about three times the PTQ loss of the C4-01b AdamW "
-        "recipe (LR 0.0015), so the Muon-versus-AdamW ratio depends on the AdamW recipe.",
-        "Both cooldown arms branch from snapshots of the seed's Muon run, so their first 256 / 272 steps are that "
-        "run's steps. Their BF16 baselines differ from Muon; bf16_nll_diff and nll_diff report the net effect.",
+        "(adamw_floor_lr_steps), while Muon ends when its cosine reaches the floor. Validation stopping, the "
+        "additional token exposure, the floor-LR phase and the fresh restart are coupled in this recipe, and the "
+        f"experiment has no fixed-step or fixed-exposure control.{gap} The selection conditions the val gap on "
+        "its target. The result is for this recipe; it supports no optimizer-wide PTQ ratio claim.",
+        "The AdamW cosine length and the first measured step come from a seed-0 design pilot. The AdamW step cap "
+        "was raised from 1280 to 2560 after the first canonical attempt (commit 05ea4ae) was stopped in Stage A: "
+        "seed 1 had matched at step 640, and the AdamW run of seed 2 was 0.58 nats above Muon at step 400 and "
+        "still 0.0925 nats above it at step 1280, where its log ends. That attempt has no Stage B scores; its "
+        "startup verification read test.bin (hashes and document boundaries) and scored no model. The canonical "
+        "run of the amended commit 0355d16 trained fresh trajectories, and every one stopped below step 1280. "
+        "The pilot floor-LR probe is a sensitivity check at different losses, not an equal-loss proof: "
+        "identity-GPTQ val NLL increase 0.0010 (NVFP4) / 0.0096 (INT2 g16) at val NLL 5.414 of a run stopped at "
+        "848 steps, against 0.0010 / 0.0106 at 5.298 and 0.0008 / 0.0106 at 5.235 for fresh cosine runs of 544 "
+        "and 608 steps (val NLL 5.235-5.414). The PTQ loss of AdamW at LR 0.001 is about three times that of the "
+        "C4-01b AdamW recipe (LR 0.0015); seeds, stopping, duration and LR changed together, so the difference is "
+        "not attributed to the LR.",
+        "Both cooldown arms branch from snapshots of the seed's Muon run, so their first "
+        f"{protocol['adamw_cooldown']['muon_steps']} / {protocol['qat_cooldown']['muon_steps']} steps are that "
+        "run's steps. Their BF16 baselines differ from Muon; bf16_nll_diff and nll_diff report the net effect. "
+        f"The QAT cooldown targets identity-coordinate {protocol['qat_cooldown']['format']} round-to-nearest "
+        "only; GPTQ and the rotations change the rounded values or the coordinates, so the arm is a test of that "
+        "one target, not of QAT in general. The AdamW cooldown is an optimizer switch. No explicit spectral "
+        "penalty was tested; stable rank and alignment are measured, not varied independently.",
         "The alpha of the activation-aware scaling is selected per checkpoint, format and rotation on val.bin "
-        "with weight-only fake quantization; the hardware W4A4 rows reuse that alpha.",
-        "One 50m model family, short training (less than one epoch of a 26M-token set), one calibration draw. "
-        "PTQ sensitivity of longer-trained or larger models can differ.",
+        "with weight-only fake quantization; the hardware W4A4 rows reuse that alpha. The weight-only selection "
+        "is a proxy: only the selected alpha and the unscaled row are scored on hardware, so the selection can "
+        "miss the alpha that is best under hardware W4A4. The AWQ results hold for this selection rule; they do "
+        "not show that a W4A4-tuned scaling is ineffective.",
+        exposure_caveat(payload),
         "Hessians come from one forward pass of the full-precision model (parallel GPTQ). Static activation "
         "scales are calibrated on the BF16 model. Dynamic W4A4 scales are per forward batch (16 x 512 tokens).",
-        "Layer-geometry p-values are descriptive and not corrected for multiplicity.",
+        f"Layer-geometry p-values are descriptive and not corrected for multiplicity.{hardware}",
     ]
     if analysis is None:
         notes.insert(0, f"No paired analysis: it needs exactly {N_SEEDS} seeds, this run has "
@@ -1398,6 +1726,42 @@ def _require(condition, message: str) -> None:
 
 def _is_number(x) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def _nonneg(x) -> bool:
+    """A finite, nonnegative JSON number (a loss or a duration)."""
+    return _is_number(x) and x >= 0
+
+
+def _is_int(x, low: int = 0) -> bool:
+    """A JSON integer of at least ``low``: ``True`` and ``1.0`` are not integers."""
+    return type(x) is int and x >= low
+
+
+def _optional_str(x) -> bool:
+    return x is None or isinstance(x, str)
+
+
+def _same(found, expected) -> bool:
+    """Deep equality with identical JSON types: ``True`` is not ``1``, and ``1`` is not ``1.0``."""
+    if type(found) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return found.keys() == expected.keys() and all(_same(found[k], v) for k, v in expected.items())
+    if isinstance(expected, list):
+        return len(found) == len(expected) and all(_same(x, y) for x, y in zip(found, expected))
+    return found == expected
+
+
+def _same_types(found, template) -> bool:
+    """``found`` has the keys and the JSON types of ``template``; list lengths are free."""
+    if type(found) is not type(template):
+        return False
+    if isinstance(template, dict):
+        return found.keys() == template.keys() and all(_same_types(found[k], v) for k, v in template.items())
+    if isinstance(template, list):
+        return not template or all(_same_types(x, template[0]) for x in found)
+    return True
 
 
 def _assert_close(found, expected, path: str, tol: float = TOL) -> None:
@@ -1438,30 +1802,79 @@ def _has_nul(obj) -> bool:
     return isinstance(obj, list) and any(_has_nul(x) for x in obj)
 
 
-def _require_git_commit(sha: str, label: str) -> None:
-    kind = subprocess.run(["git", "-C", str(ROOT), "cat-file", "-t", sha], capture_output=True, text=True)
-    if kind.returncode != 0 or kind.stdout.strip() != "commit":
-        raise ValueError(f"{label} {sha} is not a commit object")
-
-
-@functools.cache
-def _code_sha256_at_commit(git_sha: str, modules: tuple[str, ...]) -> str:
-    _require_git_commit(git_sha, "git_sha")
-    digest = hashlib.sha256()
-    for module in modules:
-        blob = subprocess.run(["git", "-C", str(ROOT), "show", f"{git_sha}:{'/'.join(module.split('.'))}.py"],
-                              capture_output=True)
-        if blob.returncode != 0:
-            raise ValueError(f"cannot read {module} at git_sha {git_sha}")
-        digest.update(module.encode() + b"\0" + blob.stdout)
-    return digest.hexdigest()
-
-
 def _timestamp(text, field: str) -> datetime:
     try:
         return datetime.strptime(text, "%Y-%m-%dT%H:%M:%S%z")
     except (ValueError, TypeError) as exc:
-        raise ValueError(f"meta.{field}: invalid ISO timestamp {text!r}") from exc
+        raise ValueError(f"{field}: invalid ISO timestamp {text!r}") from exc
+
+
+def _parsed_command(command, label: str) -> argparse.Namespace:
+    """``command`` as a runnable invocation of this script, parsed by its own CLI."""
+    _require(isinstance(command, list) and len(command) >= 2 and all(isinstance(x, str) and x for x in command)
+             and "python" in Path(command[0]).name.lower(), f"{label} must be a Python invocation")
+    _require(command[1].endswith(SCRIPT_NAME), f"{label} is not an invocation of {SCRIPT_NAME}")
+    try:
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            return parse_args(command[2:])
+    except SystemExit as exc:
+        raise ValueError(f"{label} is not a valid runnable invocation") from exc
+
+
+def expected_coverage(split_tokens: int, seq_len: int, max_windows: int | None) -> dict:
+    """Windows, scored targets and token span of ``q.evaluate_split`` on a split of ``split_tokens`` tokens."""
+    windows = (split_tokens - 1) // seq_len
+    if max_windows is not None:
+        windows = min(windows, max_windows)
+    return {"tokens": windows * seq_len, "windows": windows, "span": [0, windows * seq_len + 1],
+            "split_tokens": split_tokens}
+
+
+def _validate_protocol(protocol, *, canonical: bool) -> None:
+    free = "max_eval_windows"  # None (complete splits) or a window limit
+    _require(isinstance(protocol, dict) and free in protocol
+             and _same_types({k: v for k, v in protocol.items() if k != free},
+                             {k: v for k, v in CANONICAL.items() if k != free})
+             and (protocol[free] is None or _is_int(protocol[free], 1)),
+             "protocol keys or value types differ from the schema")
+    seeds = protocol["seeds"]
+    _require(seeds and all(type(s) is int for s in seeds) and len(set(seeds)) == len(seeds),
+             "protocol.seeds must be distinct integers")
+    if canonical:
+        _require(_same(protocol, CANONICAL), "protocol differs from the canonical C5-02 protocol")
+
+
+DATA_KEYS = {"source", "encoding", "splits", "directory", "sha256_verified", "expected_sha256", "roles"}
+
+
+def _validate_data(data, *, canonical: bool) -> None:
+    _require(isinstance(data, dict) and set(data) == DATA_KEYS, "data keys differ from the schema")
+    _require(_same(data["roles"], ROLES),
+             "split roles differ: train for training and calibration, val for selection, test for evaluation")
+    splits = data["splits"]
+    _require(isinstance(splits, dict) and set(splits) == {"train", "val", "test"},
+             "data.splits must hold train, val and test")
+    for name, entry in splits.items():
+        _require(isinstance(entry, dict) and set(entry) == {"tokens", "sha256"} and _is_int(entry["tokens"], 1)
+                 and isinstance(entry["sha256"], str) and entry["sha256"],
+                 f"data.splits.{name} must hold a token count and a SHA-256")
+    source = data["source"]
+    _require(isinstance(source, dict) and source
+             and all(v is None or type(v) in (str, bool, int) for v in source.values()),
+             "data.source must be a flat description of the corpus")
+    _require(isinstance(data["encoding"], str) and data["encoding"], "data.encoding must name the tokenizer")
+    _require(isinstance(data["directory"], str) and data["directory"], "data.directory invalid")
+    _require(type(data["sha256_verified"]) is bool, "data.sha256_verified must be a bool")
+    found, expected = {k: v["sha256"] for k, v in splits.items()}, data["expected_sha256"]
+    _require(_same(expected, found) if data["sha256_verified"] else expected is None,
+             "data.expected_sha256 must be the verified shard hashes (None without verification)")
+    if canonical:
+        _require(data["sha256_verified"] is True and _same(found, dict(q.EXPECTED_SHA256)),
+                 "shard SHA-256 values differ from the pinned train/val/test hashes")
+        _require(_same(source, CANONICAL_DATA["source"]) and data["encoding"] == CANONICAL_DATA["encoding"],
+                 "data.source or data.encoding differs from the canonical FineWeb-Edu GPT-2 shards")
+        _require(_same({k: v["tokens"] for k, v in splits.items()}, CANONICAL_DATA["tokens"]),
+                 "split token counts differ from the pinned canonical shards")
 
 
 META_KEYS = {"git_sha", "git_dirty", "command", "environment", "numerics", "code_sha256", "code_modules",
@@ -1470,73 +1883,107 @@ META_KEYS = {"git_sha", "git_dirty", "command", "environment", "numerics", "code
 NUMERICS = {"allow_tf32": False, "cudnn_allow_tf32": False, "allow_fp16_reduced_precision_reduction": False,
             "allow_bf16_reduced_precision_reduction": False,
             "autocast": "bfloat16 forward on CUDA (harness_tier2_real._loss)"}
+ENVIRONMENT_KEYS = {"python", "platform", "torch", "cuda", "cudnn", "host_cpus", "numpy", "env", "triton"}
+ENVIRONMENT_CUDA_KEYS = {"device", "capability", "driver"}
+ENVIRONMENT_VARIABLES = {"CUDA_VISIBLE_DEVICES", "PYTHONPATH", "OMP_NUM_THREADS"}
+TELEMETRY_KEYS = {"time", "clocks.sm", "clocks.mem", "temperature.gpu", "power.draw", "utilization.gpu", "pstate",
+                  "memory.used", "clocks_event_reasons.active"}
 
 
-def _validate_meta(payload: dict, *, canonical: bool) -> None:
+def _validate_environment(env, *, canonical: bool) -> None:
+    """``q.environment``: the runtime, and the device fields exactly when the run was on CUDA."""
+    _require(isinstance(env, dict) and set(env) in (ENVIRONMENT_KEYS, ENVIRONMENT_KEYS | ENVIRONMENT_CUDA_KEYS),
+             "meta.environment keys differ from the schema")
+    _require(all(isinstance(env[k], str) and env[k] for k in ("python", "platform", "torch", "numpy"))
+             and all(_optional_str(env[k]) for k in ("cuda", "triton"))
+             and all(env[k] is None or _is_int(env[k]) for k in ("cudnn", "host_cpus"))
+             and isinstance(env["env"], dict) and set(env["env"]) == ENVIRONMENT_VARIABLES
+             and all(_optional_str(v) for v in env["env"].values()), "meta.environment invalid")
+    if "device" in env:
+        capability = env["capability"]
+        _require(isinstance(env["device"], str) and env["device"] and _optional_str(env["driver"])
+                 and isinstance(capability, list) and len(capability) == 2 and all(_is_int(x) for x in capability),
+                 "meta.environment device fields invalid")
+    if canonical:
+        _require(all(env.get(k) is not None for k in ENV_KEYS) and env["capability"] >= [12, 0],
+                 "a canonical result needs an sm_120+ CUDA device and a recorded runtime")
+
+
+def _validate_telemetry(sample, where: str, *, cuda: bool, canonical: bool) -> None:
+    """One ``h.gpu_telemetry`` sample: None on the CPU, a recorded error, or the nvidia-smi fields."""
+    if sample is None:
+        _require(not cuda and not canonical, f"{where}: a CUDA run records a sample or its error")
+        return
+    _require(cuda and isinstance(sample, dict) and sample, f"{where} invalid")
+    if "error" in sample:
+        _require(set(sample) == {"error"} and isinstance(sample["error"], str), f"{where} invalid")
+    else:
+        _require(set(sample) == TELEMETRY_KEYS and _is_number(sample["time"])
+                 and all(_is_number(v) or isinstance(v, str) for v in sample.values())
+                 and (not canonical or _is_number(sample["memory.used"])), f"{where} invalid")
+
+
+def _validate_meta(payload: dict, *, canonical: bool, schema: str) -> None:
+    """``schema`` is the schema version of the measuring run: the hashes in ``meta`` were made under it."""
     meta = payload["meta"]
     _require(isinstance(meta, dict) and set(meta) == META_KEYS, "meta keys differ from the schema")
-    _require(not _has_nul(meta), "meta strings must not contain NUL bytes")
     _require(meta["git_sha"] is None or _is_hex(meta["git_sha"], 40), "meta.git_sha must be 40-hex or None")
-    _require(meta["git_dirty"] is None or isinstance(meta["git_dirty"], bool), "meta.git_dirty must be a bool")
+    _require(meta["git_dirty"] is None or type(meta["git_dirty"]) is bool, "meta.git_dirty must be a bool")
     command = meta["command"]
     _require(isinstance(command, list) and len(command) >= 2 and all(isinstance(x, str) and x for x in command)
              and "python" in Path(command[0]).name.lower(), "meta.command must be a Python invocation")
     env = meta["environment"]
-    _require(isinstance(env, dict) and isinstance(env.get("torch"), str) and isinstance(env.get("python"), str),
-             "meta.environment invalid")
-    _require(meta["numerics"] == NUMERICS, "full-precision numerics are required")
+    _validate_environment(env, canonical=canonical)
+    _require(_same(meta["numerics"], NUMERICS), "full-precision numerics are required")
     modules = meta["code_modules"]
     _require(isinstance(modules, list) and all(isinstance(m, str) and m.startswith("research.") for m in modules)
-             and len(set(modules)) == len(modules)
-             and "research.quant_ptq.bench_c5_02_isoloss_ptq_mitigation" in modules,
+             and len(set(modules)) == len(modules) and DRIVER_MODULE in modules,
              "meta.code_modules must list the driver and its research.* imports")
     _require(_is_hex(meta["code_sha256"], 64) and _is_hex(meta["unit_config_hash"], 16), "meta hashes invalid")
     data_sha = {k: v["sha256"] for k, v in payload["data"]["splits"].items()}
     _require(meta["unit_config_hash"] == unit_config_hash(payload["protocol"], payload["config"], meta["code_sha256"],
-                                                          env, data_sha), "meta.unit_config_hash differs")
+                                                          env, data_sha, schema), "meta.unit_config_hash differs")
     stages = meta["stage_seconds"]
     _require(isinstance(stages, dict) and set(stages) == {"stage_a", "stage_b"}
-             and all(_is_number(v) and v >= 0 for v in stages.values()), "meta.stage_seconds invalid")
-    _require(_is_number(meta["total_seconds"]) and meta["total_seconds"] >= sum(stages.values()) - 1e-6,
+             and all(_nonneg(v) for v in stages.values()), "meta.stage_seconds invalid")
+    _require(_nonneg(meta["total_seconds"]) and meta["total_seconds"] >= sum(stages.values()) - 1e-6,
              "meta.total_seconds is below the sum of the stage times")
-    start = _timestamp(meta["timestamp_start"], "timestamp_start")
-    end = _timestamp(meta["timestamp_end"], "timestamp_end")
+    start = _timestamp(meta["timestamp_start"], "meta.timestamp_start")
+    end = _timestamp(meta["timestamp_end"], "meta.timestamp_end")
     _require(start.timestamp() >= 1_700_000_000 and end >= start
              and abs((end - start).total_seconds() - meta["total_seconds"]) <= 5.0,
              "meta timestamps are inconsistent with meta.total_seconds")
     for field in ("loadavg_start", "loadavg_end"):
         _require(isinstance(meta[field], list) and len(meta[field]) == 3
-                 and all(_is_number(x) and x >= 0 for x in meta[field]), f"meta.{field} invalid")
-    _require(isinstance(meta["gpu_telemetry"], dict)
-             and set(meta["gpu_telemetry"]) == {"start", "after_stage_a", "end"}, "meta.gpu_telemetry keys differ")
+                 and all(_nonneg(x) for x in meta[field]), f"meta.{field} invalid")
+    telemetry = meta["gpu_telemetry"]
+    _require(isinstance(telemetry, dict) and set(telemetry) == {"start", "after_stage_a", "end"},
+             "meta.gpu_telemetry keys differ")
+    for side, sample in telemetry.items():  # one nvidia-smi sample each, or its recorded error
+        _validate_telemetry(sample, f"meta.gpu_telemetry.{side}", cuda="device" in env, canonical=canonical)
     log = meta["unit_log"]
     _require(isinstance(log, dict) and set(log) == {"resume", "units_loaded", "units_run"}
-             and isinstance(log["resume"], bool) and all(type(log[k]) is int and log[k] >= 0
-                                                         for k in ("units_loaded", "units_run"))
-             and log["units_loaded"] + log["units_run"] == len(payload["protocol"]["seeds"]) * (1 + len(ARMS)),
-             "meta.unit_log must account for one Stage A unit per seed and one Stage B unit per checkpoint")
-    _require(meta["splits_opened"] == ["train", "val", "test"], "splits must be opened in the order train, val, test")
+             and type(log["resume"]) is bool and all(_is_int(log[k]) for k in ("units_loaded", "units_run"))
+             and log["units_loaded"] + log["units_run"] == len(payload["protocol"]["seeds"]) * (1 + len(ARMS))
+             and (log["resume"] or log["units_loaded"] == 0),
+             "meta.unit_log must account for one Stage A unit per seed and one Stage B unit per checkpoint, and a "
+             "run without --resume loads no unit")
+    _require(meta["splits_opened"] == ["train", "val", "test"],
+             "Shards.open must map the splits in the order train, val, test (test.bin for the Stage B scoring)")
     _require(isinstance(meta["checkpoint_dir"], str) and meta["checkpoint_dir"], "meta.checkpoint_dir invalid")
     if canonical:
         _require(_is_hex(meta["git_sha"], 40) and meta["git_dirty"] is False,
                  "a canonical result needs a 40-hex git_sha and a clean tree")
-        _require(all(env.get(k) is not None for k in ENV_KEYS) and env["capability"] >= [12, 0],
-                 "a canonical result needs an sm_120+ CUDA device and a recorded runtime")
         _require(command[1].endswith(SCRIPT_NAME) and "--quick" not in command,
                  "meta.command is not the canonical invocation")
-        try:
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                parsed = parse_args(command[2:])
-        except SystemExit as exc:
-            raise ValueError("meta.command is not a valid runnable invocation") from exc
-        _require(parsed.canonical is True, "meta.command does not select the canonical protocol")
+        parsed = _parsed_command(command, "meta.command")
+        _require(parsed.canonical is True and parsed.postprocess_from_git is None,
+                 "meta.command does not select the canonical protocol")
+    if payload["postprocess"] is None:  # a measuring run: the producer is this code
         _require(modules == list(code_modules()), "meta.code_modules differ from the static import closure")
-        _require(meta["code_sha256"] == _code_sha256_at_commit(meta["git_sha"], tuple(modules)),
-                 "meta.code_sha256 differs from the committed git blobs")
-        for side in ("start", "after_stage_a", "end"):  # one nvidia-smi sample each, or its recorded error
-            sample = meta["gpu_telemetry"][side]
-            _require(isinstance(sample, dict) and ("error" in sample or _is_number(sample.get("memory.used"))),
-                     f"meta.gpu_telemetry.{side} invalid")
+        if canonical:
+            _require(meta["code_sha256"] == _code_sha256_at_commit(meta["git_sha"], tuple(modules)),
+                     "meta.code_sha256 differs from the committed git blobs")
 
 
 TRAINING_KEYS = {"arm", "seed", "steps", "warmup_steps", "lr", "auxiliary_lr", "weight_decay", "min_lr_ratio",
@@ -1545,48 +1992,67 @@ TRAINING_KEYS = {"arm", "seed", "steps", "warmup_steps", "lr", "auxiliary_lr", "
                  "val_nll", "val_ppl", "val_tokens", "evaluated_splits"}
 
 
-def _validate_training(row: dict, path: str, config: dict, protocol: dict, train_tokens: int) -> None:
+def _validate_training(row, path: str, config: dict, protocol: dict, *, seed: int, train_tokens: int,
+                       val_tokens: int) -> None:
     extra = {MUON: {"snapshots"}, ADAMW: {"cosine_steps", "trained_steps", "eval_seconds", "evaluations"},
              COOL_ADAMW: {"branch", "cooldown"}, COOL_QAT: {"branch", "cooldown"}}
-    _require(row.get("arm") in ARMS and set(row) == TRAINING_KEYS | extra[row["arm"]], f"{path}: keys differ")
+    _require(isinstance(row, dict) and row.get("arm") in ARMS and set(row) == TRAINING_KEYS | extra[row["arm"]],
+             f"{path}: keys differ")
+    _require(_same(row["seed"], seed), f"{path}: wrong seed")
     arm, muon, total = row["arm"], protocol["muon"], protocol["muon"]["steps"]
     schedule_steps = protocol["adamw"]["cosine_steps"] if arm == ADAMW else total
-    _require(type(row["steps"]) is int and row["warmup_steps"] == c4.warmup_for(schedule_steps)
-             and row["weight_decay"] == WEIGHT_DECAY and row["min_lr_ratio"] == MIN_LR_RATIO,
+    _require(_is_int(row["steps"], 1) and _same(row["warmup_steps"], c4.warmup_for(schedule_steps))
+             and _same(row["weight_decay"], WEIGHT_DECAY) and _same(row["min_lr_ratio"], MIN_LR_RATIO),
              f"{path}: schedule differs from warmup max(20, T // 10), weight decay 0.01, min LR ratio 0.1")
     step_tokens = config["micro_batch"] * config["grad_accum"] * config["sequence_length"]
-    _require(row["tokens"] == row["steps"] * step_tokens, f"{path}: token count differs from steps * {step_tokens}")
+    _require(_same(row["tokens"], row["steps"] * step_tokens),
+             f"{path}: token count differs from steps * {step_tokens}")
     _assert_close(row["train_epochs"], row["tokens"] / train_tokens, f"{path}.train_epochs")
     if arm == ADAMW:
         spec = protocol["adamw"]
-        _require(row["lr"] == spec["lr"] and row["auxiliary_lr"] is None
-                 and row["cosine_steps"] == spec["cosine_steps"], f"{path}: AdamW run differs from the protocol")
+        _require(_same(row["lr"], spec["lr"]) and row["auxiliary_lr"] is None
+                 and _same(row["cosine_steps"], spec["cosine_steps"]) and _is_int(row["trained_steps"], 1)
+                 and _nonneg(row["eval_seconds"]), f"{path}: AdamW run differs from the protocol")
+        _require(row["orthogonalizer"] == ADAMW_ORTHOGONALIZER, f"{path}: the AdamW arm must record fused AdamW")
     else:
-        _require(row["steps"] == total and row["lr"] == muon["lr"] and row["auxiliary_lr"] == muon["auxiliary_lr"],
+        _require(row["steps"] == total and _same(row["lr"], muon["lr"])
+                 and _same(row["auxiliary_lr"], muon["auxiliary_lr"]),
                  f"{path}: Muon-based arm differs from the protocol")
+        _require(isinstance(row["orthogonalizer"], str) and row["orthogonalizer"]
+                 and row["orthogonalizer"] != ADAMW_ORTHOGONALIZER,
+                 f"{path}: a Muon-based arm must record its orthogonalizer")
     _require(_is_hex(row["checkpoint_sha256"], 64) and _is_hex(row["init_fingerprint"], 16)
              and _is_hex(row["stream_fingerprint"], 16), f"{path}: missing hashes")
-    _require(row["evaluated_splits"] == ["val"] and _is_number(row["val_nll"]), f"{path}: Stage A rows read val only")
+    _require(row["evaluated_splits"] == ["val"] and _nonneg(row["val_nll"]), f"{path}: Stage A rows read val only")
+    _require(_same(row["val_tokens"], val_tokens), f"{path}: val.bin is not covered completely")
     _assert_close(row["val_ppl"], math.exp(row["val_nll"]), f"{path}.val_ppl")
+    _require(_nonneg(row["train_loss"]) and _nonneg(row["last_train_loss"]) and _nonneg(row["train_seconds"])
+             and row["train_loss_note"] == TRAIN_LOSS_NOTE,
+             f"{path}: training losses and times must be finite and nonnegative, with the declared loss note")
     curve = row["train_curve"]
-    first = 0 if arm in (MUON, ADAMW) else row["branch"]["from_step"]
+    cooldown = {COOL_ADAMW: "adamw_cooldown", COOL_QAT: "qat_cooldown"}
+    first = protocol[cooldown[arm]]["muon_steps"] if arm in cooldown else 0  # a cooldown arm logs its own phase
     count = row["steps"] - first
-    _require(isinstance(curve, list) and [p[0] for p in curve] == [first + i + 1 for i in range(count)
-                                                                  if i == 0 or (i + 1) % 10 == 0]
-             and all(_is_number(p[1]) for p in curve), f"{path}: train curve differs from the schedule")
+    _require(isinstance(curve, list) and all(isinstance(p, list) and len(p) == 2 and _nonneg(p[1]) for p in curve)
+             and _same([p[0] for p in curve], [first + i + 1 for i in range(count) if i == 0 or (i + 1) % 10 == 0]),
+             f"{path}: train curve differs from the schedule")
+    if curve and curve[-1][0] == row["steps"]:  # the last optimizer step is a curve point
+        _assert_close(row["last_train_loss"], curve[-1][1], f"{path}.last_train_loss")
 
 
 def _validate_adamw_run(row: dict, muon: dict, path: str, spec: dict) -> None:
     """Replay the predeclared val grid and stop rule of the AdamW run from its stored measurements."""
     evaluations = row["evaluations"]
     _require(isinstance(evaluations, list) and evaluations, f"{path}: the AdamW run has no measured step")
+    for e in evaluations:
+        _require(isinstance(e, dict)
+                 and set(e) == {"step", "lr_multiplier", "val_nll", "val_tokens", "val_gap", "checkpoint_sha256"}
+                 and _nonneg(e["val_nll"]) and _is_hex(e["checkpoint_sha256"], 64)
+                 and _same(e["val_tokens"], muon["val_tokens"]), f"{path}: AdamW measurement fields differ")
     grid = adamw_eval_steps(spec)
-    _require([e["step"] for e in evaluations] == grid[:len(evaluations)],
+    _require(_same([e["step"] for e in evaluations], grid[:len(evaluations)]),
              f"{path}: measured AdamW steps differ from the predeclared val grid")
     for e in evaluations:
-        _require(set(e) == {"step", "lr_multiplier", "val_nll", "val_tokens", "val_gap", "checkpoint_sha256"}
-                 and _is_number(e["val_nll"]) and _is_hex(e["checkpoint_sha256"], 64)
-                 and e["val_tokens"] == muon["val_tokens"], f"{path}: AdamW measurement fields differ")
         _assert_close(e["val_gap"], e["val_nll"] - muon["val_nll"], f"{path}.evaluations[{e['step']}].val_gap")
         _assert_close(e["lr_multiplier"], adamw_multiplier(e["step"] - 1, spec),
                       f"{path}.evaluations[{e['step']}].lr_multiplier")
@@ -1596,48 +2062,57 @@ def _validate_adamw_run(row: dict, muon: dict, path: str, spec: dict) -> None:
     _require(adamw_stops(gaps[-1]) or evaluations[-1]["step"] == grid[-1],
              f"{path}: the AdamW run stopped before it reached Muon or the step cap")
     chosen = min(zip(evaluations, gaps), key=lambda pair: (abs(pair[1]), pair[0]["step"]))[0]
-    _require(row["trained_steps"] == evaluations[-1]["step"]
-             and (row["steps"], row["val_nll"], row["val_tokens"], row["checkpoint_sha256"])
-             == (chosen["step"], chosen["val_nll"], chosen["val_tokens"], chosen["checkpoint_sha256"]),
+    _require(_same([row["trained_steps"], row["steps"], row["val_nll"], row["val_tokens"], row["checkpoint_sha256"]],
+                   [evaluations[-1]["step"], chosen["step"], chosen["val_nll"], chosen["val_tokens"],
+                    chosen["checkpoint_sha256"]]),
              f"{path}: the AdamW record is not the measured step nearest to Muon")
 
 
 def _validate_stage_a(payload: dict, *, canonical: bool) -> dict:
     stage, protocol, config = payload["stage_a"], payload["protocol"], payload["config"]
-    seeds, tolerance = protocol["seeds"], protocol["tolerance_nats"]
-    train_tokens = payload["data"]["splits"]["train"]["tokens"]
-    _require(set(stage) == {"split_view", "splits_opened_at_end", "seeds", "seconds"}, "stage_a keys differ")
+    seeds, tolerance, splits = protocol["seeds"], protocol["tolerance_nats"], payload["data"]["splits"]
+    val_tokens = expected_coverage(splits["val"]["tokens"], config["sequence_length"],
+                                   protocol["max_eval_windows"])["tokens"]
+    _require(isinstance(stage, dict) and set(stage) == {"split_view", "splits_opened_at_end", "seeds", "seconds"},
+             "stage_a keys differ")
     _require(stage["split_view"] == ["train", "val"] and stage["splits_opened_at_end"] == ["train", "val"],
-             "Stage A must run on a train + val mapping before test.bin is opened")
-    _require([s["seed"] for s in stage["seeds"]] == seeds, "Stage A needs one unit per seed, in order")
+             "Stage A must run on a train + val mapping, before Shards.open maps test.bin for the Stage B scoring")
+    _require(_nonneg(stage["seconds"]), "stage_a.seconds must be a finite, nonnegative duration")
+    _require(isinstance(stage["seeds"], list) and all(isinstance(u, dict) for u in stage["seeds"])
+             and _same([u.get("seed") for u in stage["seeds"]], seeds), "Stage A needs one unit per seed, in order")
     _require(not any("test" in key for key in _keys(stage)), "Stage A holds a test.bin field")
     cool = {COOL_ADAMW: protocol["adamw_cooldown"], COOL_QAT: protocol["qat_cooldown"]}
-    by_seed = {}
+    by_seed, orthogonalizers = {}, set()
     for unit in stage["seeds"]:
-        seed, rows = unit["seed"], unit["rows"]
+        seed, rows = unit["seed"], unit.get("rows")
         path = f"stage_a[{seed}]"
         _require(set(unit) == {"seed", "split_view", "rows", "selection", "checkpoints", "seconds",
                                "resumed_from_unit_log"}, f"{path}: keys differ")
+        _require(_nonneg(unit["seconds"]), f"{path}.seconds must be a finite, nonnegative duration")
+        _require(type(unit["resumed_from_unit_log"]) is bool, f"{path}.resumed_from_unit_log must be a bool")
         _require(unit["split_view"] == ["train", "val"], f"{path}: Stage A must not see test.bin")
-        _require([r["arm"] for r in rows] == [MUON, COOL_ADAMW, COOL_QAT, ADAMW],
+        _require(isinstance(rows, list) and [isinstance(r, dict) and r.get("arm") for r in rows]
+                 == [MUON, COOL_ADAMW, COOL_QAT, ADAMW],
                  f"{path}: rows must be Muon, the two cooldowns and the AdamW run")
         for i, r in enumerate(rows):
-            _validate_training(r, f"{path}.rows[{i}]", config, protocol, train_tokens)
-            _require(r["seed"] == seed, f"{path}.rows[{i}]: wrong seed")
-            if canonical:
-                _require(r["val_tokens"] == VAL_TOKENS, f"{path}.rows[{i}]: val.bin is not covered completely")
+            _validate_training(r, f"{path}.rows[{i}]", config, protocol, seed=seed,
+                               train_tokens=splits["train"]["tokens"], val_tokens=val_tokens)
         _require(len({(r["init_fingerprint"], r["stream_fingerprint"]) for r in rows}) == 1,
                  f"{path}: the arms of a seed must share the initial state and the batch stream")
         muon = rows[0]
-        _require(sorted(muon["snapshots"]) == sorted({str(c["muon_steps"]) for c in cool.values()})
+        _require(isinstance(muon["snapshots"], dict)
+                 and sorted(muon["snapshots"]) == sorted({str(c["muon_steps"]) for c in cool.values()})
                  and all(_is_hex(v, 64) for v in muon["snapshots"].values()), f"{path}: Muon snapshots differ")
+        orthogonalizers |= {r["orthogonalizer"] for r in rows[:3]}
         for r in rows[1:3]:
             spec = cool[r["arm"]]
-            _require(r["branch"] == {"from_arm": MUON, "from_step": spec["muon_steps"],
-                                     "snapshot_sha256": muon["snapshots"][str(spec["muon_steps"])],
-                                     "cooldown_steps": spec["cooldown_steps"]}
+            _require(_same(r["branch"], {"from_arm": MUON, "from_step": spec["muon_steps"],
+                                         "snapshot_sha256": muon["snapshots"][str(spec["muon_steps"])],
+                                         "cooldown_steps": spec["cooldown_steps"]})
                      and spec["muon_steps"] + spec["cooldown_steps"] == protocol["muon"]["steps"],
                      f"{path}: {r['arm']} does not branch from the Muon snapshot of the protocol")
+            _require(_same(r["cooldown"], cooldown_recipe(r["arm"], protocol)),
+                     f"{path}: the cooldown record of {r['arm']} differs from the locked recipe of the protocol")
         _validate_adamw_run(rows[3], muon, path, protocol["adamw"])
         _assert_close(unit["selection"], select_adamw(rows, tolerance), f"{path}.selection")
         final = {r["arm"]: r for r in rows}
@@ -1646,87 +2121,156 @@ def _validate_stage_a(payload: dict, *, canonical: bool) -> dict:
                                                   "val_nll": final[arm]["val_nll"]} for arm in ARMS},
                       f"{path}.checkpoints")
         by_seed[seed] = final
+    _require(len(orthogonalizers) == 1 and (not canonical or orthogonalizers == {CANONICAL_ORTHOGONALIZER}),
+             "Muon and both cooldown arms must record one orthogonalizer (the SS3_54 Triton kernel when canonical)")
     return by_seed
 
 
 GRID_KEYS = {"format", "method", "mode", "rotation", "rounding", "activation_aware_scaling", "seconds",
              *(f"{s}_{k}" for s in SPLITS for k in ("nll", "ppl", "tokens", "delta_nll", "relative_delta_ppl_pct"))}
 FAKEQUANT_KEYS = {"quantize_seconds", "gptq_damping_max", "geometry", *(f"{k}_mean" for k in GEOMETRY)}
+CALIBRATION_KEYS = {"split", "seed", "sequences", "seq_len", "tokens", "starts"}
+BASELINE_KEYS = {"nll", "ppl", "tokens", "windows", "span", "split_tokens"}
+BUTTERFLY_FIT_KEYS = {"steps", "lr", "layers", "layers_improved", "weight_sq_error_hadamard_start",
+                      "weight_sq_error_fitted", "relative_error_reduction"}
+COPY_LABELS = ("method", "activation_aware_scaling", "awq_alpha")  # the fields that an alpha = 0 copy changes
+
+
+def _validate_calibration(cal, protocol: dict, seq_len: int, train_tokens: int) -> None:
+    """The record of ``q.calibration_windows``: the exact seeded draw of distinct, aligned train.bin windows."""
+    _require(isinstance(cal, dict) and set(cal) == CALIBRATION_KEYS, "Calibration record keys differ from the schema")
+    sequences, available = protocol["calibration_sequences"], train_tokens // seq_len
+    _require(cal["split"] == "train" and _same(cal["sequences"], sequences)
+             and _same(cal["seed"], protocol["calibration_seed"]) and _same(cal["seq_len"], seq_len)
+             and _same(cal["tokens"], sequences * seq_len) and 0 < sequences <= available and cal["seed"] >= 0,
+             "Calibration windows differ from the protocol (train.bin, seeded, aligned, distinct)")
+    draw = np.sort(np.random.default_rng(cal["seed"]).choice(available, size=sequences, replace=False)) * seq_len
+    _require(_same(cal["starts"], [int(s) for s in draw]),
+             "Calibration starts differ from the seeded train.bin draw of the protocol")
+
+
+def _validate_butterfly_fits(c: dict, path: str, protocol: dict, layers: int, selected: dict) -> None:
+    """One fit record per projection kind for every fitted butterfly candidate that was evaluated."""
+    expected = set()
+    for fmt in protocol["weight_formats"]:
+        for method in methods_of(c["arm"], protocol):
+            family, _, awq = parse_method(method)
+            if family.startswith("adaptive_butterfly_b") and (
+                    not awq or selected[(fmt, method)]["selected_alpha"] != 0):  # alpha = 0 reuses the plain fit
+                expected.add(f"{fmt}/{method}")
+    fits = c["butterfly_fits"]
+    _require(isinstance(fits, dict) and set(fits) == expected,
+             f"{path}: butterfly_fits must hold exactly the fitted butterfly candidates of the grid")
+    for key, kinds in fits.items():
+        _require(isinstance(kinds, dict) and list(kinds) == list(q.LINEAR_KINDS),
+                 f"{path}.butterfly_fits[{key}]: one fit per projection kind is required")
+        for kind, fit in kinds.items():
+            where = f"{path}.butterfly_fits[{key}].{kind}"
+            _require(isinstance(fit, dict) and set(fit) == BUTTERFLY_FIT_KEYS, f"{where}: keys differ")
+            start, fitted = fit["weight_sq_error_hadamard_start"], fit["weight_sq_error_fitted"]
+            _require(_same(fit["steps"], protocol["butterfly_steps"]) and _same(fit["lr"], BUTTERFLY_LR)
+                     and _same(fit["layers"], layers) and _is_int(fit["layers_improved"])
+                     and fit["layers_improved"] <= layers, f"{where}: steps, LR or layer counts differ")
+            _require(_nonneg(start) and _nonneg(fitted) and fitted <= start + 1e-9
+                     and (fitted < start) == (fit["layers_improved"] > 0),
+                     f"{where}: the fitted error must not exceed the Hadamard start, and must be below it "
+                     "exactly when a layer improved")
+            _assert_close(fit["relative_error_reduction"], 1.0 - fitted / max(start, 1e-30),
+                          f"{where}.relative_error_reduction")
 
 
 def _validate_stage_b(payload: dict, final: dict, *, canonical: bool) -> None:
     stage, protocol, config = payload["stage_b"], payload["protocol"], payload["config"]
     seeds, layers, seq_len = protocol["seeds"], config["layers"], config["sequence_length"]
-    matrices, names = layers * len(q.LINEAR_KINDS), layer_names(layers)
-    train_tokens = payload["data"]["splits"]["train"]["tokens"]
-    _require(set(stage) == {"calibration", "checkpoints", "seconds"}, "stage_b keys differ")
-    cal, starts = stage["calibration"], stage["calibration"].get("starts")
-    _require(cal.get("split") == "train" and cal.get("sequences") == protocol["calibration_sequences"]
-             and cal.get("seed") == protocol["calibration_seed"] and cal.get("seq_len") == seq_len
-             and cal.get("tokens") == protocol["calibration_sequences"] * seq_len
-             and isinstance(starts, list) and len(starts) == protocol["calibration_sequences"]
-             and len(set(starts)) == len(starts)
-             and all(type(s) is int and 0 <= s <= train_tokens - seq_len and s % seq_len == 0 for s in starts),
-             "Calibration windows differ from the protocol (train.bin, aligned, distinct)")
-    _require([(c["seed"], c["arm"]) for c in stage["checkpoints"]] == [(s, a) for s in seeds for a in ARMS],
+    matrices, names, splits = layers * len(q.LINEAR_KINDS), layer_names(layers), payload["data"]["splits"]
+    _require(isinstance(stage, dict) and set(stage) == {"calibration", "checkpoints", "seconds"},
+             "stage_b keys differ")
+    _require(_nonneg(stage["seconds"]), "stage_b.seconds must be a finite, nonnegative duration")
+    _validate_calibration(stage["calibration"], protocol, seq_len, splits["train"]["tokens"])
+    _require(isinstance(stage["checkpoints"], list) and all(isinstance(c, dict) for c in stage["checkpoints"])
+             and _same([[c.get("seed"), c.get("arm")] for c in stage["checkpoints"]],
+                       [[s, a] for s in seeds for a in ARMS]),
              "Stage B needs one checkpoint per (seed, arm), in order")
-    alphas = protocol["awq"]["alphas"]
+    alphas, damping = protocol["awq"]["alphas"], [protocol["gptq_damp"] * 10 ** k for k in range(GPTQ_DAMP_TRIES)]
+    coverage = {split: expected_coverage(splits[split]["tokens"], seq_len, protocol["max_eval_windows"])
+                for split in SPLITS}
+    available = set()
     for c in stage["checkpoints"]:
         seed, arm = c["seed"], c["arm"]
         path = f"stage_b[{seed}, {arm}]"
         _require(set(c) == {"seed", "arm", "checkpoint_file", "checkpoint_sha256", "checkpoint_sha256_after_ptq",
                             "baseline_val", "baseline_test", "diagnostics", "butterfly_fits", "grid", "awq_selection",
                             "best", "hardware_w4a4", "seconds", "resumed_from_unit_log"}, f"{path}: keys differ")
+        _require(_nonneg(c["seconds"]), f"{path}.seconds must be a finite, nonnegative duration")
+        _require(type(c["resumed_from_unit_log"]) is bool, f"{path}.resumed_from_unit_log must be a bool")
         trained = final[seed][arm]
         _require(c["checkpoint_sha256"] == c["checkpoint_sha256_after_ptq"] == trained["checkpoint_sha256"]
                  and c["checkpoint_file"] == checkpoint_name(seed, arm),
                  f"{path}: Stage B must evaluate the saved Stage A checkpoint and restore it")
         base = {split: c[f"baseline_{split}"] for split in SPLITS}
+        for split in SPLITS:  # complete coverage of both splits, recomputed from the split length
+            cover = coverage[split]
+            _require(isinstance(base[split], dict) and set(base[split]) == BASELINE_KEYS,
+                     f"{path}.baseline_{split}: keys differ")
+            _require(_same({k: base[split][k] for k in cover}, cover),
+                     f"{path}: baseline does not cover the full {split}.bin ({cover['windows']} windows of "
+                     f"{seq_len} tokens, span {cover['span']}, {cover['split_tokens']} split tokens)")
+            _require(_nonneg(base[split]["nll"]), f"{path}.baseline_{split}.nll must be finite and nonnegative")
+            _assert_close(base[split]["ppl"], math.exp(base[split]["nll"]), f"{path}.baseline_{split}.ppl")
         _require(abs(base["val"]["nll"] - trained["val_nll"]) <= 1e-9
                  and base["val"]["tokens"] == trained["val_tokens"],
                  f"{path}: the val NLL of the saved checkpoint differs from its Stage A value")
-        if canonical:
-            _require((base["val"]["tokens"], base["test"]["tokens"]) == (VAL_TOKENS, TEST_TOKENS),
-                     f"{path}: baseline does not cover the full val.bin and test.bin")
-        for split in SPLITS:
-            _assert_close(base[split]["ppl"], math.exp(base[split]["nll"]), f"{path}.baseline_{split}.ppl")
         hw = c["hardware_w4a4"]
-        _require(set(hw) == {"available", "fp4_gemms_per_forward_bf16_baseline", "note"}
-                 and isinstance(hw["available"], bool), f"{path}: hardware_w4a4 keys differ")
+        _require(isinstance(hw, dict) and set(hw) == {"available", "fp4_gemms_per_forward_bf16_baseline", "note"}
+                 and type(hw["available"]) is bool, f"{path}: hardware_w4a4 keys differ")
         hardware = hw["available"]
+        available.add(hardware)
         _require(hardware or not canonical, f"{path}: a canonical result needs hardware W4A4")
-        _require(hw["fp4_gemms_per_forward_bf16_baseline"] == (0 if hardware else None),
+        _require(_same(hw["fp4_gemms_per_forward_bf16_baseline"], 0 if hardware else None),
                  f"{path}: the BF16 baseline must not run FP4 GEMMs")
+        _require(_same(hw["note"], None if hardware else HARDWARE_SKIP_NOTE),
+                 f"{path}: hardware_w4a4.note must be None with hardware W4A4 and the skip reason without it")
         diagnostics = c["diagnostics"]
+        _require(isinstance(diagnostics, dict) and set(diagnostics) == {"layer_names", "per_layer", "summary"}
+                 and isinstance(diagnostics["per_layer"], list), f"{path}: diagnostics keys differ")
         per_layer = diagnostics["per_layer"]
-        _require(diagnostics["layer_names"] == names and [r["name"] for r in per_layer] == names
-                 and all(r["kind"] == r["name"].rsplit(".", 1)[1] and set(r) == {"name", "kind", *LAYER_METRICS}
-                         for r in per_layer), f"{path}: diagnostics must cover the {matrices} projections in order")
-        _require(all(1.0 - 1e-9 <= r["weight_stable_rank"] and r["weight_fro_norm"] > 0 and r["signal_alignment"] > 0
-                     for r in per_layer), f"{path}: layer geometry out of range")
+        _require(diagnostics["layer_names"] == names
+                 and all(isinstance(r, dict) and set(r) == {"name", "kind", *LAYER_METRICS} for r in per_layer)
+                 and [r["name"] for r in per_layer] == names
+                 and all(r["kind"] == r["name"].rsplit(".", 1)[1] for r in per_layer),
+                 f"{path}: diagnostics must cover the {matrices} projections in order")
+        _require(all(_is_number(r[m]) for r in per_layer for m in LAYER_METRICS)
+                 and all(1.0 - 1e-9 <= r["weight_stable_rank"] and r["weight_fro_norm"] > 0
+                         and r["signal_alignment"] > 0 for r in per_layer), f"{path}: layer geometry out of range")
         _assert_close(diagnostics["summary"], summarize_layers(per_layer), f"{path}.diagnostics.summary")
-        combos = [(r["format"], r["method"], r["mode"]) for r in c["grid"]]
-        _require(combos == expected_combos(arm, protocol, hardware), f"{path}: PTQ grid differs from the protocol")
+        _require(isinstance(c["grid"], list) and all(isinstance(r, dict) for r in c["grid"])
+                 and [(r.get("format"), r.get("method"), r.get("mode")) for r in c["grid"]]
+                 == expected_combos(arm, protocol, hardware), f"{path}: PTQ grid differs from the protocol")
         selected = {}
-        _require([(s["format"], s["method"]) for s in c["awq_selection"]]
+        _require(isinstance(c["awq_selection"], list) and all(isinstance(s, dict) for s in c["awq_selection"])
+                 and [(s.get("format"), s.get("method")) for s in c["awq_selection"]]
                  == [(f, m) for f in protocol["weight_formats"] for m in methods_of(arm, protocol)
                      if m.startswith("awq_")], f"{path}: AWQ selection table differs from the protocol")
         for s in c["awq_selection"]:
             where = f"{path}.awq_selection[{s['format']}/{s['method']}]"
             _require(set(s) == {"format", "method", "rotation", "alphas", "val_nll", "val_tokens",
                                 "selected_alpha", "selected_on", "seconds"}, f"{where}: keys differ")
-            _require(s["alphas"] == alphas and len(s["val_nll"]) == len(alphas)
-                     and all(_is_number(v) for v in s["val_nll"]) and s["selected_on"] == "val"
+            _require(_same(s["alphas"], alphas) and isinstance(s["val_nll"], list) and len(s["val_nll"]) == len(alphas)
+                     and all(_nonneg(v) for v in s["val_nll"]) and s["selected_on"] == "val"
                      and s["rotation"] == parse_method(s["method"])[0]
-                     and s["selected_alpha"] == select_alpha(alphas, s["val_nll"]),
+                     and _same(s["selected_alpha"], select_alpha(alphas, s["val_nll"])),
                      f"{where}: alpha is not the val.bin minimum of the protocol grid")
-            _require(s["val_tokens"] == base["val"]["tokens"], f"{where}: alpha selection must cover the val windows")
+            _require(_same(s["val_tokens"], base["val"]["tokens"]),
+                     f"{where}: alpha selection must cover the val windows")
+            _require(_nonneg(s["seconds"]), f"{where}.seconds must be a finite, nonnegative duration")
             selected[(s["format"], s["method"])] = s
+        _validate_butterfly_fits(c, path, protocol, layers, selected)
         plain = {(r["format"], r["method"], r["mode"]): r for r in c["grid"]}
         for (fmt, method), s in selected.items():
             twin = plain[(fmt, method.removeprefix("awq_"), fakequant_mode(fmt))]
             _require(0.0 not in alphas or s["val_nll"][alphas.index(0.0)] == twin["val_nll"],
                      f"{path}.awq_selection[{fmt}/{method}]: alpha = 0 must be the unscaled row")
+        signal = {row["name"]: row["signal_alignment"] for row in per_layer}
         for r in c["grid"]:
             where = f"{path}.{r['format']}/{r['method']}/{r['mode']}"
             family, rounding, awq = parse_method(r["method"])
@@ -1743,10 +2287,12 @@ def _validate_stage_b(payload: dict, final: dict, *, canonical: bool) -> None:
             if r["mode"] == "w4a4_hw_static":
                 keys |= {"static_scale_calibration", "static_global_scale_range"}
             _require(set(r) == keys, f"{where}: keys differ from the schema")
-            _require((r["rotation"], r["rounding"], r["activation_aware_scaling"]) == (family, rounding, awq),
+            _require(_same([r["rotation"], r["rounding"], r["activation_aware_scaling"]], [family, rounding, awq]),
                      f"{where}: method fields differ")
+            _require(_nonneg(r["seconds"]), f"{where}.seconds must be a finite, nonnegative duration")
             for split in SPLITS:
-                _require(r[f"{split}_tokens"] == base[split]["tokens"], f"{where}: {split} token count differs")
+                _require(_same(r[f"{split}_tokens"], base[split]["tokens"]), f"{where}: {split} token count differs")
+                _require(_nonneg(r[f"{split}_nll"]), f"{where}.{split}_nll must be finite and nonnegative")
                 _assert_close(r[f"{split}_ppl"], math.exp(r[f"{split}_nll"]), f"{where}.{split}_ppl")
                 _assert_close(r[f"{split}_delta_nll"], r[f"{split}_nll"] - base[split]["nll"],
                               f"{where}.{split}_delta_nll")
@@ -1755,22 +2301,30 @@ def _validate_stage_b(payload: dict, final: dict, *, canonical: bool) -> None:
                               f"{where}.{split}_relative_delta_ppl_pct")
             if "awq_alpha" in r:
                 table = selected[(r["format"], r["method"])]
-                _require(r["awq_alpha"] == table["selected_alpha"], f"{where}: alpha differs from the val selection")
+                _require(_same(r["awq_alpha"], table["selected_alpha"]),
+                         f"{where}: alpha differs from the val selection")
                 _require(not fake or r["val_nll"] == table["val_nll"][alphas.index(r["awq_alpha"])],
                          f"{where}: the row is not the candidate that the val selection measured")
-                if r["awq_alpha"] == 0:  # alpha = 0 is the plain rotation + GPTQ row
+                if r["awq_alpha"] == 0:  # a copy of the plain rotation + GPTQ row: every measured field is the twin's
                     twin = plain[(r["format"], r["method"].removeprefix("awq_"), r["mode"])]
-                    _require(all(r[f"{s}_nll"] == twin[f"{s}_nll"] for s in SPLITS),
-                             f"{where}: alpha = 0 must be the unscaled row")
+                    _require(_same({k: v for k, v in r.items() if k not in COPY_LABELS},
+                                   {k: v for k, v in twin.items() if k not in COPY_LABELS}),
+                             f"{where}: alpha = 0 must be the unscaled row in every measured field")
             if fake:
+                _require(_nonneg(r["quantize_seconds"]),
+                         f"{where}.quantize_seconds must be a finite, nonnegative duration")
+                lam = r["gptq_damping_max"]
+                _require(lam is None if rounding == "rtn" else _is_number(lam) and any(
+                    abs(lam - d) <= 1e-12 * d for d in damping),
+                    f"{where}: gptq_damping_max must be None for round-to-nearest and gptq_damp * 10^k "
+                    f"(k < {GPTQ_DAMP_TRIES}) for GPTQ")
                 geometry = r["geometry"]
-                _require(set(geometry) == set(GEOMETRY) and all(
+                _require(isinstance(geometry, dict) and set(geometry) == set(GEOMETRY) and all(
                     isinstance(geometry[k], list) and len(geometry[k]) == matrices
-                    and all(_is_number(v) and v >= 0 for v in geometry[k]) for k in GEOMETRY),
+                    and all(_nonneg(v) for v in geometry[k]) for k in GEOMETRY),
                     f"{where}: geometry must hold one value per layer")
                 for k in GEOMETRY:
                     _assert_close(r[f"{k}_mean"], math.fsum(geometry[k]) / matrices, f"{where}.{k}_mean")
-                signal = {row["name"]: row["signal_alignment"] for row in per_layer}
                 for i, name in enumerate(names):
                     predicted = geometry["weight_rel_error"][i] * geometry["error_alignment"][i] / signal[name]
                     _require(abs(geometry["output_rel_error"][i] - predicted)
@@ -1778,79 +2332,207 @@ def _validate_stage_b(payload: dict, final: dict, *, canonical: bool) -> None:
                              f"{where}: output error of {name} is not weight error x error / signal alignment")
                 if r["format"] == HW_FORMAT:
                     _require(r["hw_weights_decode_to_fakequant_weights"] is True
-                             and r["hw_weights_checked_matrices"] == matrices,
+                             and _same(r["hw_weights_checked_matrices"], matrices),
                              f"{where}: hardware weights must decode to the fake-quant weights in all "
                              f"{matrices} matrices")
             else:
-                _require(r["fp4_gemms_per_forward"] == (matrices if hw_mode else 0),
+                _require(_same(r["fp4_gemms_per_forward"], matrices if hw_mode else 0),
                          f"{where}: expected {matrices if hw_mode else 0} FP4 GEMMs per forward pass")
             if r["mode"] == "w4a4_hw_static":
                 _require(r["static_scale_calibration"] == STATIC_CALIBRATION,
                          f"{where}: static activation scales must come from the train.bin calibration windows")
+                scales = r["static_global_scale_range"]
+                _require(isinstance(scales, list) and len(scales) == 2 and all(_is_number(v) for v in scales)
+                         and 0 < scales[0] <= scales[1],
+                         f"{where}: static_global_scale_range must be [lo, hi] with finite 0 < lo <= hi")
         _assert_close(c["best"], best_methods(c["grid"], protocol["base_methods"]), f"{path}.best")
+    _require(len(available) == 1, "hardware W4A4 must be available for every checkpoint of a run, or for none")
 
 
-def validate_results(payload: dict, *, canonical: bool | None = None) -> None:
-    """Offline consistency, provenance and promotion-gate validator.
+def _validate_counts(payload: dict) -> None:
+    """Duplicated stage times, resume counts and the unique / inherited hardware counts, recounted from the rows."""
+    meta, stage_a, stage_b = payload["meta"], payload["stage_a"], payload["stage_b"]
+    for name, stage in (("stage_a", stage_a), ("stage_b", stage_b)):
+        _assert_close(stage["seconds"], meta["stage_seconds"][name], f"{name}.seconds (meta.stage_seconds.{name})")
+    resumed = sum(u["resumed_from_unit_log"] for u in stage_a["seeds"] + stage_b["checkpoints"])
+    _require(resumed == meta["unit_log"]["units_loaded"],
+             f"{resumed} units are marked as resumed, but meta.unit_log.units_loaded is "
+             f"{meta['unit_log']['units_loaded']}")
+    if payload["analysis"] is None:
+        return
+    matrices = payload["config"]["layers"] * len(q.LINEAR_KINDS)
+    rows = [r for c in stage_b["checkpoints"] for r in c["grid"]]
+    profiled = [r for r in rows if r["mode"] in HW_MODES]
+    decoded = [r for r in rows if r["format"] == HW_FORMAT and r["mode"] == fakequant_mode(r["format"])]
+    copies = lambda group: sum(r["activation_aware_scaling"] and r["awq_alpha"] == 0 for r in group)  # noqa: E731
+    expected = {"w4a4_rows": len(profiled), "w4a4_unique_profiled_rows": len(profiled) - copies(profiled),
+                "w4a4_inherited_zero_alpha_rows": copies(profiled),
+                "decode_checked_rows": len(decoded), "decode_unique_checked_rows": len(decoded) - copies(decoded),
+                "decode_inherited_zero_alpha_rows": copies(decoded),
+                "decode_checked_matrices": matrices * len(decoded),
+                "decode_unique_checked_matrices": matrices * (len(decoded) - copies(decoded)),
+                "decode_inherited_zero_alpha_matrices": matrices * copies(decoded)}
+    for section in ("analysis", "derived"):
+        for key, value in expected.items():
+            _require(_same(payload[section]["hardware"].get(key), value),
+                     f"{section}.hardware.{key} differs from the recount of unique and inherited rows ({value})")
+
+
+def _validate_postprocess_record(payload: dict) -> None:
+    """Shape of ``postprocess``. The git checks are in ``_validate_postprocess_provenance``."""
+    post = payload["postprocess"]
+    _require(isinstance(post, dict) and set(post) == set(POSTPROCESS_KEYS), "postprocess keys differ from the schema")
+    _require(post["source_schema_version"] == SOURCE_SCHEMA_VERSION,
+             f"postprocess.source_schema_version must be {SOURCE_SCHEMA_VERSION}")
+    _require(all(_is_hex(post[k], 40) for k in ("source_result_git_sha", "postprocess_git_sha")),
+             "postprocess commits must be 40-hex")
+    _require(all(_is_hex(post[k], 64) for k in ("source_artifact_sha256", "source_raw_measurements_sha256",
+                                                "postprocess_code_sha256")), "postprocess digests must be 64-hex")
+    _require(type(post["postprocess_git_dirty"]) is bool, "postprocess.postprocess_git_dirty must be a bool")
+    modules = post["postprocess_code_modules"]
+    _require(isinstance(modules, list) and all(isinstance(m, str) for m in modules),
+             "postprocess.postprocess_code_modules must be a list of modules")
+    evidence = post["retained_evidence_sha256"]
+    _require(isinstance(evidence, dict) and set(evidence) == set(RETAINED_EVIDENCE_SHA256)
+             and all(_is_hex(v, 64) for v in evidence.values()),
+             "postprocess.retained_evidence_sha256 must hold the 64-hex digests of the four retained audit files")
+    _require(post["reason"] == POSTPROCESS_REASON, "postprocess.reason differs from the declared reason")
+    _timestamp(post["postprocess_timestamp"], "postprocess.postprocess_timestamp")
+
+
+def _validate_postprocess_provenance(payload: dict, *, canonical: bool) -> None:
+    """Source and code provenance of a postprocessed result, against the local git repository."""
+    post, meta = payload["postprocess"], payload["meta"]
+    source_sha, post_sha = post["source_result_git_sha"], post["postprocess_git_sha"]
+    _require(_is_hex(meta["git_sha"], 40), "a postprocessed result needs the 40-hex git_sha of its producer")
+    for label, sha in (("postprocess.source_result_git_sha", source_sha),
+                       ("postprocess.postprocess_git_sha", post_sha), ("meta.git_sha", meta["git_sha"])):
+        _require_git_commit(sha, label)
+    blob = _git_blob(source_sha, RESULT_REPO_PATH)
+    _require(hashlib.sha256(blob).hexdigest() == post["source_artifact_sha256"],
+             "postprocess.source_artifact_sha256 differs from the committed bytes of the source artifact")
+    source = json.loads(blob)
+    _require(isinstance(source, dict) and source.get("schema_version") == post["source_schema_version"]
+             and source.get("task") == TASK, "the source artifact has another schema version or task")
+    for key in RAW_MEASUREMENT_KEYS:  # the raw measurements are the source's, value for value and type for type
+        _require(key in source and _same(payload[key], source[key]),
+                 f"{key} differs from the source artifact: a postprocess must not change a raw measurement")
+    _require(post["source_raw_measurements_sha256"] == raw_measurements_sha256(payload),
+             "postprocess.source_raw_measurements_sha256 differs from the raw measurements")
+    # Producer code: the import closure and the blobs of the commit that measured.
+    _require(meta["code_modules"] == list(_code_modules_at_commit(meta["git_sha"])),
+             "meta.code_modules differ from the static import closure at meta.git_sha")
+    _require(meta["code_sha256"] == _code_sha256_at_commit(meta["git_sha"], tuple(meta["code_modules"])),
+             "meta.code_sha256 differs from the git blobs at meta.git_sha")
+    # Postprocessing code: this code, as committed at postprocess_git_sha.
+    _require(post["postprocess_code_modules"] == list(code_modules()),
+             "postprocess.postprocess_code_modules differ from the static import closure")
+    _require(post["postprocess_code_sha256"] == _code_sha256_at_commit(post_sha, tuple(code_modules())),
+             "postprocess.postprocess_code_sha256 differs from the git blobs at postprocess_git_sha")
+    parsed = _parsed_command(post["postprocess_command"], "postprocess.postprocess_command")
+    _require(parsed.postprocess_from_git == source_sha,
+             "postprocess.postprocess_command must pass --postprocess-from-git with the source result commit")
+    _require(_timestamp(post["postprocess_timestamp"], "postprocess.postprocess_timestamp")
+             >= _timestamp(meta["timestamp_end"], "meta.timestamp_end"),
+             "postprocess.postprocess_timestamp is before the end of the measuring run")
+    if canonical:
+        _require(post["postprocess_git_dirty"] is False, "a canonical postprocess needs a clean tree")
+        _require(CANONICAL_SOURCE_ARTIFACTS.get(source_sha) == post["source_artifact_sha256"],
+                 "the source of a canonical postprocess must be the pinned committed C5-02 result")
+        _require(_same(post["retained_evidence_sha256"], RETAINED_EVIDENCE_SHA256),
+                 "postprocess.retained_evidence_sha256 differs from the pinned digests of the retained audit files")
+
+
+def validate_results(payload: dict, *, canonical: bool | None = None) -> dict:
+    """Offline consistency, provenance and promotion-gate validator. Returns what it certified.
+
+    Call-site certification. ``payload["canonical"]`` selects the checks. A caller that passes
+    ``canonical`` states what it expects: ``True`` to promote a result, ``False`` for an exploratory
+    one. A disagreement with the payload raises, so a payload labeled canonical is never validated
+    with relaxed checks. The return value is ``{"mode": "canonical" | "noncanonical",
+    "certified_canonical": bool, "postprocessed": bool}``.
 
     What it establishes from the JSON and the local git repository alone:
 
-    * schema, strict JSON (no NaN / infinity) and the exact protocol (``canonical``: the locked C5-02
-      protocol, pinned shard hashes, complete val/test coverage, sm_120+ device, clean tree);
-    * provenance: ``git_sha`` is a commit object (``git cat-file -t``), ``code_sha256`` equals the
-      transitive ``research.*`` blobs at that commit, and ``run_config_hash`` / ``unit_config_hash``
-      are the recomputed digests;
-    * Stage A isolation as recorded: a train + val mapping, test.bin opened only afterwards, no
-      test field in any Stage A record, and the AdamW search of every seed replayed with
-      ``adamw_eval_steps`` / ``adamw_stops`` / ``select_adamw`` from the stored val NLLs;
-    * Stage B identity: every evaluated checkpoint has the SHA-256 and the val NLL of its Stage A
-      record; complete grids; per-row arithmetic; alpha = val.bin minimum; 60/60 FP4 GEMMs and
-      int32 decode checks as recorded; per-layer error identity;
-    * ``analysis``, ``derived`` and ``caveats`` equal their recomputation from the stored rows (1e-12);
+    * schema, strict JSON (no NaN / infinity, no NUL byte in any string), JSON integers and booleans
+      with their exact types, and the exact protocol (canonical: the locked C5-02 protocol, the
+      FineWeb-Edu GPT-2 shards with pinned hashes and token counts, sm_120+ device, clean tree);
+    * provenance of a measuring run (``postprocess`` is None): ``git_sha`` is a commit object,
+      ``code_sha256`` equals the transitive ``research.*`` blobs at that commit, and
+      ``run_config_hash`` / ``unit_config_hash`` are the recomputed digests;
+    * provenance of a postprocessed result: the source artifact is the committed file of
+      ``source_result_git_sha`` (byte digest), every ``RAW_MEASUREMENT_KEYS`` value equals the source,
+      the producer code is the import closure and the blobs at ``meta.git_sha`` (hashes under the
+      source schema), and the postprocessing code is this code at ``postprocess_git_sha``;
+    * split access as recorded by ``Shards.open``: Stage A on a train + val mapping, test.bin mapped
+      afterwards for the Stage B scoring, no test field in any Stage A record. This is not a record of
+      every file read: the startup verification reads all three shard files and scores no model;
+    * Stage A: the locked recipes of every arm (optimizer, LR, cooldown record), finite nonnegative
+      losses, and the AdamW search of every seed replayed with ``adamw_eval_steps`` /
+      ``adamw_stops`` / ``select_adamw`` from the stored val NLLs;
+    * Stage B: every evaluated checkpoint has the SHA-256 and the val NLL of its Stage A record; the
+      seeded calibration draw and the complete val / test coverage are recomputed from the seed and
+      the split lengths; complete grids; per-row arithmetic; fit records, damping and static-scale
+      domains; alpha = val.bin minimum, and alpha = 0 rows equal to their unscaled twins; 60/60 FP4
+      GEMMs and int32 decode checks as recorded; per-layer error identity;
+    * durations are finite and nonnegative, duplicated stage times agree, and the resume markers
+      add up to ``meta.unit_log``;
+    * ``analysis``, ``derived`` and ``caveats`` equal their recomputation from the stored rows (1e-12),
+      and the unique / inherited hardware counts equal an independent recount;
     * canonical gate: hardware-versus-FP32-emulation parity within 1e-3 nats.
 
     Threat model. This is an offline consistency check, not an attestation. It cannot prove that a
     leaf measurement (an NLL, a checkpoint hash, a GEMM count, a timing) was produced by the
     recorded code on the recorded GPU: a party that rewrites leaves and recomputes every dependent
-    summary passes. The saved checkpoints are not in git, so their bytes are not checked here.
-    Independent evidence needs a live replay on an RTX 5080 from the retained checkpoints or from
-    training (training is not bit-reproducible on this host). Scientific outcomes (matched seeds,
-    significance, sign of an effect) are reported, never required.
+    summary passes. The saved checkpoints are not in git, so their bytes are not checked here
+    (``--resume`` checks their tensor digests before it reuses a unit). The retained audit files are
+    not in git either: their digests are pinned, their bytes are not read. Independent evidence
+    needs a live replay on an RTX 5080 from the retained checkpoints or from training (training is
+    not bit-reproducible on this host). Scientific outcomes (matched seeds, significance, sign of
+    an effect) are reported, never required.
     """
+    try:
+        return _validate_payload(payload, canonical)
+    except (KeyError, TypeError, IndexError, AttributeError) as exc:  # a record of the wrong shape or type
+        raise ValueError(f"malformed payload: {type(exc).__name__}: {exc}") from exc
+
+
+def _validate_payload(payload: dict, canonical: bool | None) -> dict:
     json.dumps(payload, allow_nan=False)
     top = {"schema_version", "task", "quick", "canonical", "meta", "run_config_hash", "preset", "config",
-           "protocol", "data", "stage_a", "stage_b", "analysis", "derived", "caveats"}
+           "protocol", "data", "stage_a", "stage_b", "postprocess", "analysis", "derived", "caveats"}
     _require(isinstance(payload, dict) and set(payload) == top, "top-level keys differ from the schema")
+    _require(not _has_nul(payload), "the payload must not contain a NUL byte in any string")
     _require(payload["schema_version"] == SCHEMA_VERSION and payload["task"] == TASK, "schema or task differs")
-    _require(isinstance(payload["quick"], bool) and isinstance(payload["canonical"], bool),
+    _require(type(payload["quick"]) is bool and type(payload["canonical"]) is bool,
              "quick / canonical flags must be bool")
-    canonical = payload["canonical"] if canonical is None else canonical
+    effective = payload["canonical"]
+    _require(canonical is None or type(canonical) is bool, "the requested canonical mode must be a bool or None")
+    if canonical is False and effective:
+        raise ValueError("the payload is labeled canonical: it cannot be validated with the noncanonical checks")
+    if canonical is True and not effective:
+        raise ValueError("canonical certification was requested, but the payload is not labeled canonical")
+    post = payload["postprocess"]
+    if post is not None:
+        _validate_postprocess_record(payload)
+    schema = SCHEMA_VERSION if post is None else post["source_schema_version"]
     protocol, config, data, meta = payload["protocol"], payload["config"], payload["data"], payload["meta"]
-    if canonical:
-        _require(payload["canonical"] is True and payload["quick"] is False, "a canonical result cannot be --quick")
-        _require(protocol == CANONICAL, "protocol differs from the canonical C5-02 protocol")
-    _require(payload["preset"] == protocol["preset"] and config == asdict(h.PRESETS[protocol["preset"]]),
+    _validate_protocol(protocol, canonical=effective)
+    if effective:
+        _require(payload["quick"] is False, "a canonical result cannot be --quick")
+    _require(isinstance(payload["preset"], str) and payload["preset"] == protocol["preset"]
+             and payload["preset"] in h.PRESETS and _same(config, asdict(h.PRESETS[protocol["preset"]])),
              "model config differs from the preset")
     seeds = protocol["seeds"]
-    _require(isinstance(seeds, list) and seeds and all(type(s) is int for s in seeds) and len(set(seeds)) == len(seeds),
-             "protocol.seeds must be distinct integers")
-
-    # Data hygiene.
-    _require(data.get("roles") == {"training": "train", "calibration": "train", "static_scales": "train",
-                                   "matching": "val", "method_and_alpha_selection": "val", "evaluation": "test"},
-             "split roles differ: train for training and calibration, val for selection, test for evaluation")
-    _require(set(data["splits"]) == {"train", "val", "test"}, "data.splits must hold train, val and test")
-    if canonical:
-        found = {k: v["sha256"] for k, v in data["splits"].items()}
-        _require(data["sha256_verified"] is True and data["expected_sha256"] == q.EXPECTED_SHA256
-                 and found == q.EXPECTED_SHA256, "shard SHA-256 values differ from the pinned train/val/test hashes")
-    _validate_meta(payload, canonical=bool(canonical))
+    _validate_data(data, canonical=effective)
+    _validate_meta(payload, canonical=effective, schema=schema)
     _require(payload["run_config_hash"] == run_config_hash(
         payload["quick"], protocol, config, meta["code_sha256"], meta["git_sha"], meta["environment"],
-        {k: v["sha256"] for k, v in data["splits"].items()}), "run_config_hash differs from the recomputed digest")
+        {k: v["sha256"] for k, v in data["splits"].items()}, schema),
+        "run_config_hash differs from the recomputed digest")
 
-    final = _validate_stage_a(payload, canonical=bool(canonical))
-    _validate_stage_b(payload, final, canonical=bool(canonical))
+    final = _validate_stage_a(payload, canonical=effective)
+    _validate_stage_b(payload, final, canonical=effective)
 
     # Analysis, derived numbers and caveats are pure functions of the rows above.
     if len(seeds) == N_SEEDS:
@@ -1863,11 +2545,16 @@ def validate_results(payload: dict, *, canonical: bool | None = None) -> None:
         _require(payload["analysis"] is None, f"the paired analysis needs exactly {N_SEEDS} seeds")
     _assert_close(payload["derived"], json.loads(json.dumps(derive(payload))), "derived")
     _assert_close(payload["caveats"], caveats(payload), "caveats")
-    if canonical:
+    _validate_counts(payload)
+    if effective:
         _require(payload["analysis"] is not None, "a canonical result needs the paired analysis")
         _require(payload["analysis"]["hardware_vs_emulation"]["passed"] is True
                  and len(payload["analysis"]["hardware_vs_emulation"]["rows"]) == len(seeds) * len(ARMS),
                  "hardware W4A4 differs from its FP32 emulation by more than the parity threshold")
+    if post is not None:
+        _validate_postprocess_provenance(payload, canonical=effective)
+    return {"mode": "canonical" if effective else "noncanonical", "certified_canonical": bool(effective),
+            "postprocessed": post is not None}
 
 
 # ======================================================================================
@@ -1891,6 +2578,8 @@ def run(args) -> dict:
     started, timestamp_start = time.perf_counter(), time.strftime("%Y-%m-%dT%H:%M:%S%z")
     protocol = copy.deepcopy(args.protocol)
     config = h.PRESETS[protocol["preset"]]
+    # With verification this reads train.bin, val.bin and test.bin twice each (hashes, then token range and
+    # document boundaries). No model is scored. ``shards.opened`` records the later ``open`` calls only.
     shards = Shards(args.data_dir, verify=not args.no_verify, expected=None if args.no_verify else q.EXPECTED_SHA256)
     data_sha = {k: v["sha256"] for k, v in shards.summary()["splits"].items()}
     env = q.environment(device)
@@ -1910,16 +2599,18 @@ def run(args) -> dict:
                "meta": meta, "run_config_hash": cfg_hash, "preset": protocol["preset"], "config": asdict(config),
                "protocol": protocol,
                "data": {**shards.summary(), "directory": str(args.data_dir), "sha256_verified": not args.no_verify,
-                        "expected_sha256": None if args.no_verify else q.EXPECTED_SHA256,
-                        "roles": {"training": "train", "calibration": "train", "static_scales": "train",
-                                  "matching": "val", "method_and_alpha_selection": "val", "evaluation": "test"}}}
+                        "expected_sha256": None if args.no_verify else dict(q.EXPECTED_SHA256),
+                        "roles": dict(ROLES)}}
 
-    # Stage A: every seed, on a mapping without test.bin. test.bin is not opened before this loop ends.
+    # Stage A: every seed, on a mapping of train.bin and val.bin only. ``Shards.open`` does not map test.bin
+    # before this loop ends, so no Stage A code can score or select on it. (The startup verification above
+    # has already read the test.bin file; the pre-commit seed-0 shakedowns scored it. See the module docstring.)
     began = time.perf_counter()
     view_a = shards.open("train", "val")
     stage_a_units = []
     for seed in protocol["seeds"]:
-        unit = units.get(("stage_a", seed), lambda value: checkpoints_present(value, checkpoint_dir))
+        # A cached unit is reused only when every retained checkpoint still has its recorded tensor digest.
+        unit = units.get(("stage_a", seed), lambda value: checkpoints_verified(value, checkpoint_dir))
         if unit is None:
             unit = units.put(("stage_a", seed),
                              stage_a_seed(config, view_a, device, protocol, seed, checkpoint_dir, log))
@@ -1933,7 +2624,8 @@ def run(args) -> dict:
     meta["stage_seconds"]["stage_a"] = payload["stage_a"]["seconds"]
     meta["gpu_telemetry"]["after_stage_a"] = h.gpu_telemetry(device)
 
-    # Stage B: the saved checkpoints on val.bin and test.bin.
+    # Stage B: the saved checkpoints on val.bin and test.bin. This is the first ``Shards.open`` of test.bin
+    # and the first time that this run scores a model on it.
     began = time.perf_counter()
     view_b = {**view_a, **shards.open("test")}
     calibration = q.calibration_windows(SimpleNamespace(splits=view_a), protocol["calibration_sequences"],
@@ -1942,7 +2634,10 @@ def run(args) -> dict:
     for unit in stage_a_units:
         for arm in ARMS:
             seed, entry = unit["seed"], unit["checkpoints"][arm]
-            record = units.get(("stage_b", seed, arm), lambda value: value["checkpoint_sha256"] == entry["sha256"])
+            # A cached Stage B unit is trusted only while the retained checkpoint file has the recorded digest.
+            # Otherwise the unit is computed again, and ``load_checkpoint`` raises for an unusable file.
+            record = units.get(("stage_b", seed, arm),
+                               lambda value: stage_b_unit_verified(value, entry, checkpoint_dir))
             if record is None:
                 model = load_checkpoint(config, device, checkpoint_dir / entry["file"], entry["sha256"])
                 record = units.put(("stage_b", seed, arm), {
@@ -1963,12 +2658,8 @@ def run(args) -> dict:
     meta["loadavg_end"] = list(os.getloadavg())
     meta["timestamp_end"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     meta["total_seconds"] = time.perf_counter() - started
-    payload = json.loads(json.dumps(payload, allow_nan=False))
-    payload["analysis"] = (analyze(payload["stage_a"], payload["stage_b"], protocol)
-                           if len(protocol["seeds"]) == N_SEEDS else None)
-    payload["derived"] = derive(payload)
-    payload["caveats"] = caveats(payload)
-    payload = json.loads(json.dumps(payload, allow_nan=False))
+    payload["postprocess"] = None  # this run measured; ``postprocess_from_git`` fills it for a v1 source
+    payload = _with_summaries(json.loads(json.dumps(payload, allow_nan=False)))
     try:
         validate_results(payload, canonical=args.canonical)
     except Exception:
@@ -1978,8 +2669,52 @@ def run(args) -> dict:
     return payload
 
 
+def _with_summaries(payload: dict) -> dict:
+    """``analysis``, ``derived`` and ``caveats`` of the raw measurements, as plain JSON types."""
+    protocol = payload["protocol"]
+    payload["analysis"] = (analyze(payload["stage_a"], payload["stage_b"], protocol)
+                           if len(protocol["seeds"]) == N_SEEDS else None)
+    payload["derived"] = derive(payload)
+    payload["caveats"] = caveats(payload)
+    return json.loads(json.dumps(payload, allow_nan=False))
+
+
 def rejected_path(output: Path) -> Path:
     return output.with_name(output.name + ".rejected")
+
+
+def postprocess_from_git(commit: str, command: list[str]) -> dict:
+    """The v2 payload of the committed v1 result of ``commit``. Deterministic apart from its timestamp.
+
+    The raw measurements (``RAW_MEASUREMENT_KEYS``) are the parsed bytes of ``git show`` and are not
+    changed. Only ``analysis``, ``derived`` and ``caveats`` are recomputed. ``postprocess`` records the
+    source, the postprocessing code and the digests of the retained audit files.
+    """
+    _require_git_commit(commit, "--postprocess-from-git")
+    blob = _git_blob(commit, RESULT_REPO_PATH)
+    source = json.loads(blob)
+    if not isinstance(source, dict) or source.get("schema_version") != SOURCE_SCHEMA_VERSION \
+            or source.get("task") != TASK or any(key not in source for key in RAW_MEASUREMENT_KEYS):
+        raise ValueError(f"{RESULT_REPO_PATH} at {commit} is not a {SOURCE_SCHEMA_VERSION} result of this task")
+    git = h.git_info()
+    payload = {"schema_version": SCHEMA_VERSION, "task": TASK, **{key: source[key] for key in RAW_MEASUREMENT_KEYS}}
+    payload["postprocess"] = {
+        "source_schema_version": source["schema_version"], "source_result_git_sha": commit,
+        "source_artifact_sha256": hashlib.sha256(blob).hexdigest(),
+        "source_raw_measurements_sha256": raw_measurements_sha256(source),
+        "postprocess_git_sha": git["git_sha"], "postprocess_git_dirty": git["git_dirty"],
+        "postprocess_code_sha256": code_sha256(), "postprocess_code_modules": list(code_modules()),
+        "postprocess_command": list(command), "postprocess_timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "retained_evidence_sha256": dict(RETAINED_EVIDENCE_SHA256), "reason": POSTPROCESS_REASON}
+    return _with_summaries(payload)
+
+
+def postprocess(args) -> dict:
+    """``--postprocess-from-git``: no GPU, no training. A reserved output needs a clean, committed tree."""
+    require_clean_tree(h.git_info(), args.output)  # before any work
+    payload = postprocess_from_git(args.postprocess_from_git, [sys.executable, *sys.argv])
+    validate_results(payload, canonical=payload["canonical"])
+    return payload
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2000,12 +2735,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", action="store_true", help="reuse finished units of an interrupted run")
     parser.add_argument("--silent", action="store_true")
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--postprocess-from-git", metavar="COMMIT", default=None,
+                        help=f"no GPU work: read the committed {SOURCE_SCHEMA_VERSION} result of COMMIT (full 40-hex "
+                             "SHA) with git show, keep its raw measurements unchanged and recompute analysis, "
+                             "derived and caveats")
     return parser
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.postprocess_from_git is not None:
+        measuring = [flag for flag, used in (
+            ("--quick", args.quick), ("--seeds", args.seeds is not None), ("--device", args.device is not None),
+            ("--max-eval-windows", args.max_eval_windows is not None), ("--data-dir", args.data_dir is not None),
+            ("--no-verify", args.no_verify), ("--checkpoint-dir", args.checkpoint_dir is not None),
+            ("--resume", args.resume)) if used]
+        if measuring:
+            parser.error(f"--postprocess-from-git measures nothing: remove {' '.join(measuring)}")
+        if not _is_hex(args.postprocess_from_git, 40):
+            parser.error("--postprocess-from-git needs the full 40-hex SHA of the result commit")
+        args.output = CANONICAL_OUTPUT if args.output is None else args.output
+        if reserved(args.output) and (args.output.is_symlink()
+                                      or args.output.resolve() != CANONICAL_OUTPUT.resolve()):
+            parser.error(f"A postprocess writes {CANONICAL_OUTPUT} of this checkout (no symlink, no other "
+                         f"checkout) or a path outside {RESERVED_PATTERN}")
+        args.protocol, args.canonical = None, False  # not a measuring run: it selects no protocol
+        return args
     protocol = copy.deepcopy(QUICK if args.quick else CANONICAL)
     if args.seeds is not None:
         if len(set(args.seeds)) != len(args.seeds):
@@ -2040,8 +2796,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> dict:
     args = parse_args(argv)
-    payload = c4.write_json_atomic(args.output, run(args))
-    unit_log_path(args.output).unlink(missing_ok=True)
+    if args.postprocess_from_git is not None:
+        payload = c4.write_json_atomic(args.output, postprocess(args))
+    else:
+        payload = c4.write_json_atomic(args.output, run(args))
+        unit_log_path(args.output).unlink(missing_ok=True)
     if not args.silent:
         print(json.dumps(payload["derived"].get("iso_loss", payload["derived"]["stage_a"]), indent=1))
         print(f"Wrote {args.output}")
