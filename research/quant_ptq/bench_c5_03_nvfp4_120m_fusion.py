@@ -28,12 +28,22 @@ wall clock that includes launch overhead. TF32 and reduced-precision reductions 
 ``cycle5_c5_03*.json`` is reserved: only the canonical protocol, on an sm_120+ device, from a clean
 committed tree, in this checkout and without a symlink, may write it.
 
+Schema ``cycle5_c5_03.v2`` adds the top-level ``postprocess`` field. It is ``None`` for a run that
+measures. ``--postprocess-from-git <commit>`` reads the committed ``cycle5_c5_03.v1`` result of that
+commit with ``git show``, keeps every raw measurement unchanged (``RAW_MEASUREMENT_KEYS``; ``part_c``
+without its ``analysis``), recomputes only ``part_c.analysis``, ``summary`` and ``caveats``, and records
+the provenance of the source and of the postprocessing code in ``postprocess``. It needs no GPU,
+trains nothing and scores no split.
+
 Run (canonical, alone on the GPU, from a clean commit; about one hour on an RTX 5080):
     PYTHONPATH=. .venv/bin/python research/quant_ptq/bench_c5_03_nvfp4_120m_fusion.py \\
         --data-dir artifacts/real_text
 Smoke run:
     PYTHONPATH=. .venv/bin/python research/quant_ptq/bench_c5_03_nvfp4_120m_fusion.py --quick \\
         --output /tmp/c5_03.json
+Postprocess the committed v1 measurements (clean tree, no GPU):
+    PYTHONPATH=. .venv/bin/python research/quant_ptq/bench_c5_03_nvfp4_120m_fusion.py \\
+        --postprocess-from-git 726b20c9590aba911361e300e7d2079c7bb55cfa
 """
 
 from __future__ import annotations
@@ -50,6 +60,7 @@ import math
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from collections import defaultdict
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
@@ -76,19 +87,59 @@ from research.quant_ptq import nvfp4_inference_blackwell as nb
 from research.quant_ptq.nvfp4_inference_blackwell import ROTATIONS, NVFP4Activation, scale_layout
 
 ROOT = Path(__file__).resolve().parents[2]
-SCHEMA_VERSION = "cycle5_c5_03.v1"
+SCHEMA_VERSION = "cycle5_c5_03.v2"
+SOURCE_SCHEMA_VERSION = "cycle5_c5_03.v1"  # the schema that ``--postprocess-from-git`` reads
 TASK = ("Cycle 5 C5-03: 120m real-checkpoint hardware NVFP4 W4A4 perplexity and small-shape dynamic activation "
         "quantizer fusion on Blackwell")
 SCRIPT_NAME = "bench_c5_03_nvfp4_120m_fusion.py"
 RESULT_REPO_PATH = "results/cycle5_c5_03_nvfp4_120m_fusion.json"
 CANONICAL_OUTPUT = ROOT / RESULT_REPO_PATH
 DRIVER_MODULE = "research.quant_ptq.bench_c5_03_nvfp4_120m_fusion"
+# The modules that compute ``part_c.analysis``, ``summary``, ``caveats`` and the validator. The credited
+# commit (``meta.git_sha`` of a measuring run, ``postprocess_git_sha`` of a postprocess) must hold these bytes.
+SUMMARY_MODULES = (
+    DRIVER_MODULE,
+    "research.quant_ptq.nvfp4_inference_blackwell",
+    "research.quant_ptq.bench_c5_02_isoloss_ptq_mitigation",
+    "research.quant_ptq.bench_isoloss_ptq",
+    "research.quant_ptq.bench_nvfp4_e2e",
+    "research.quant_ptq.micro_rotated_ptq",
+    "research.polar_opt.harness_tier2_real",
+)
 QUICK_OUTPUT = ROOT / "results" / "c5_03_quick.json"
 CANONICAL_CHECKPOINT_DIR = ROOT / "artifacts" / "c5_03_checkpoints"
 RESERVED_PATTERN = "cycle5_c5_03*.json"
 LEGACY_GIT_SHA = "08fc1d082495fabd3946769abc81dbc0a14ba7f0"  # the C4-02 quantizer embedded below is from here
 LEGACY_REPO_PATH = "research/quant_ptq/nvfp4_inference_blackwell.py"
 TOL = 1e-12
+
+# Raw measurements of a result (``part_c`` without ``analysis``). ``--postprocess-from-git`` copies them unchanged.
+RAW_MEASUREMENT_KEYS = ("quick", "canonical", "meta", "run_config_hash", "protocol", "data", "kernel_parity",
+                        "part_a", "part_b", "part_c")
+DERIVED_PART_C_KEYS = ("analysis",)
+POSTPROCESS_KEYS = ("source_schema_version", "source_result_git_sha", "source_artifact_sha256",
+                    "source_raw_measurements_sha256", "postprocess_git_sha", "postprocess_git_dirty",
+                    "postprocess_code_sha256", "postprocess_code_modules", "postprocess_command",
+                    "postprocess_timestamp", "retained_evidence_sha256", "reason")
+# The committed v1 result that the canonical postprocess reads: result commit -> SHA-256 of the file
+# (726b20c holds the canonical run of the clean producer commit 38cef48).
+CANONICAL_SOURCE_ARTIFACTS = {
+    "726b20c9590aba911361e300e7d2079c7bb55cfa": "9ed6c9fd3879566f78e943f5aa54657b1f0e1c27e543e3e93f11103413da14ce"}
+# Study history retained outside git (artifacts/c5_03_run_evidence/): the canonical log of 38cef48 and the
+# log and result of the superseded run at 4736807, which scored the same test.bin first.
+RETAINED_EVIDENCE_SHA256 = {
+    "canonical_38cef48.log": "d6ebd7f655fe300df39764447a17fceee6262df52a7cd1087a8937fd4e210408",
+    "superseded_canonical_4736807.log": "807781a3d86bd47e413075186cde26b55645d9dd07cb9d60b002875ac993724e",
+    "superseded_result_4736807.json": "aafd8ebe571bb512ac02e5c20403ac900e930cd11e4a74c5c5152a3e3b2f9c5a",
+}
+POSTPROCESS_REASON = (
+    "Remediation of the C5-03 audit (audits/AUDIT_cycle5_c5_03_gpt62_astra.md, findings 1-5): the raw "
+    "measurements of the canonical result 726b20c (measured by the clean commit 38cef48) are preserved "
+    "unchanged, so test.bin is not scored a third time. part_c.analysis, summary and caveats are recomputed "
+    "(the caveats now state the superseded 4736807 run and the measurement limits), and the result is checked "
+    "by the hardened validator (calibration draw, linear parameter counts, kernel profiles, cooperative launch "
+    "record, AWQ fields). The public launcher contract and the integer-view bitwise checks are verified live "
+    "by the test suite and the audit replay. Nothing was retrained or re-measured.")
 
 VARIANTS = ("none", "had_b16", "bfly_b16", "had_b16_static_gs")
 VARIANT_ROTATION = {"none": "none", "had_b16": "hadamard_b16", "bfly_b16": "adaptive_butterfly_b16",
@@ -632,6 +683,17 @@ def _layers_for(W: Tensor, angles: Tensor, static_gs: Tensor) -> dict:
             "had_b16_static_gs": nb.NVFP4Linear.from_weight(W, "hadamard_b16", act_global_scale=static_gs)}
 
 
+_INT_VIEW = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+
+def _bitwise_equal(a: Tensor, b: Tensor) -> bool:
+    """Same shape, dtype and bytes: compares integer views, so -0.0 differs from +0.0 and NaN payloads count."""
+    if a.shape != b.shape or a.dtype != b.dtype:
+        return False
+    view = _INT_VIEW[a.element_size()]
+    return bool(torch.equal(a.contiguous().view(view), b.contiguous().view(view)))
+
+
 def _same_operands(a: NVFP4Activation, b: NVFP4Activation) -> bool:
     return (torch.equal(a.packed.view(torch.uint8), b.packed.view(torch.uint8))
             and torch.equal(a.scale.view(torch.uint8), b.scale.view(torch.uint8))
@@ -661,7 +723,7 @@ def part_a_shape(device, M: int, N: int, K: int, timing: dict, flush: Tensor, se
         checks[f"{v}_c5_03_operands_equal_reference"] = _same_operands(layer.quantize_input(x), ref)
         checks[f"{v}_c4_02_operands_equal_reference"] = _same_operands(
             c4_02_quantize_activation(x, rot, layer.tables(), layer.act_global_scale), ref)
-        checks[f"{v}_c5_03_output_equals_c4_02_bitwise"] = bool(torch.equal(layer(x), legacy[v](x)))
+        checks[f"{v}_c5_03_output_equals_c4_02_bitwise"] = _bitwise_equal(layer(x), legacy[v](x))
     eager, eager_orders = e2e.williams_timing(methods, squares=timing["squares_a"], iters=timing["iters"],
                                               flush=flush, wall_iters=timing["wall_iters_a"])
     graphs = {name: e2e.capture(fn) for name, fn in methods.items()}
@@ -693,10 +755,10 @@ def ablation_shape(device, M: int, N: int, K: int, timing: dict, flush: Tensor, 
         legacy = C4_02Linear(layer)
         want = layer(x)
         with options(native_cvt=False):
-            checks[f"{v}_ladder_cvt_equals_c5_03"] = bool(torch.equal(layer(x), want))
+            checks[f"{v}_ladder_cvt_equals_c5_03"] = _bitwise_equal(layer(x), want)
         with options(pdl=False):
-            checks[f"{v}_no_pdl_equals_c5_03"] = bool(torch.equal(layer(x), want))
-        checks[f"{v}_coop_equals_c5_03"] = bool(torch.equal(coop(x), want))
+            checks[f"{v}_no_pdl_equals_c5_03"] = _bitwise_equal(layer(x), want)
+        checks[f"{v}_coop_equals_c5_03"] = _bitwise_equal(coop(x), want)
         graphs[f"c5_03_{v}"] = e2e.capture(lambda m=layer: m(x))
         graphs[f"c5_03_no_pdl_{v}"] = capture_under(lambda m=layer: m(x), pdl=False)
         graphs[f"c5_03_ladder_cvt_{v}"] = capture_under(lambda m=layer: m(x), native_cvt=False)
@@ -717,7 +779,7 @@ def ablation_shape(device, M: int, N: int, K: int, timing: dict, flush: Tensor, 
     for i in range(replays):
         x_static.copy_(torch.randn(M, K, generator=gen, device=device) * (0.01 + 10.0 * (i % 7)))
         replay()
-        exact += bool(torch.equal(out["y"], layer(x_static)))
+        exact += _bitwise_equal(out["y"], layer(x_static))
     sync_state = _COOP[("sync", x.device)].tolist()
     grid = coop_grid(x, "hadamard_b16")
     table = _timing_table(timed, "bf16_cublas")
@@ -823,7 +885,7 @@ def part_b(device, protocol: dict, flush: Tensor, log) -> dict:
             reference = model(tokens).float()
             for v in VARIANTS:
                 a, b = variants[v]["c5_03"](tokens), variants[v]["c4_02"](tokens)
-                checks[f"{v}_c5_03_logits_equal_c4_02_bitwise"] = bool(torch.equal(a, b))
+                checks[f"{v}_c5_03_logits_equal_c4_02_bitwise"] = _bitwise_equal(a, b)
                 checks[f"{v}_logits_rel_diff_vs_bf16"] = e2e._rel(a, reference)
         del reference
         for v in VARIANTS:
@@ -1505,7 +1567,17 @@ def caveats(payload: dict) -> list[str]:
         "The cooperative single-launch quantizer (ablation) is bit-exact and survives repeated graph replays but is "
         "slower than the two-pass PDL quantizer, so it is not enabled; a single-program fused quantizer was measured "
         "during development at 10-25x slower and dropped.",
+        "Static-scale (had_b16_static_gs) differences against C4-02 are near parity: their sign changes between "
+        "shapes and between sessions, so no static-scale speedup is claimed. Eager full-forward (Part B) times vary "
+        "more between sessions than the CUDA-graph ratios do; the graph ratios are the reproducible latency result.",
     ]
+    if payload.get("canonical"):
+        notes.append(
+            "Study history: a superseded canonical run at commit 4736807 scored the same test.bin before host "
+            "launch-plan caching was added at 38cef48; this result is the complete rerun at 38cef48. Both runs "
+            "(logs and the superseded JSON) are retained in artifacts/c5_03_run_evidence/ with pinned SHA-256 "
+            "values, and test.bin was also scored by earlier cycles, so the test scores here are not a first look "
+            "at an unseen holdout.")
     rows = payload.get("part_a", {}).get("shapes", []) if payload.get("part_a") else []
     trailing = [f"{v} at ({r['m']},{r['n']},{r['k']}) {r['summary']['cuda_graph']['variants'][v]['c5_03_ms']:.4f} ms "
                 f"vs bf16 {r['summary']['cuda_graph']['methods']['bf16_cublas']['ms']:.4f} ms"
@@ -1548,6 +1620,13 @@ def require_canonical_host(device, git: dict, output: Path, canonical: bool) -> 
         raise RuntimeError(f"{Path(output).name} requires a Blackwell (sm_120+) CUDA device")
     if git.get("git_dirty") is not False or not _is_hex(git.get("git_sha"), 40):
         raise RuntimeError("A canonical run needs a clean, committed git tree (git_dirty must be False)")
+
+
+def require_clean_tree(git: dict, output: Path) -> None:
+    """A postprocess that writes a reserved filename needs a clean, committed tree (no GPU)."""
+    if reserved(output) and (git.get("git_dirty") is not False or not _is_hex(git.get("git_sha"), 40)):
+        raise RuntimeError(f"Postprocessing into {Path(output).name} needs a clean, committed git tree "
+                           "(git_dirty must be False)")
 
 
 def _module_path(name: str) -> Path:
@@ -1624,6 +1703,35 @@ def _code_sha256_at_commit(git_sha: str, modules: tuple[str, ...]) -> str:
     return digest.hexdigest()
 
 
+@functools.cache
+def _driver_capabilities_at_commit(git_sha: str) -> tuple[str | None, bool]:
+    """``(declared SCHEMA_VERSION, supports --postprocess-from-git)`` of the driver committed at ``git_sha``."""
+    _require_git_commit(git_sha, "git_sha")
+    try:
+        tree = ast.parse(_git_blob(git_sha, _module_repo_path(DRIVER_MODULE)).decode())
+    except (SyntaxError, UnicodeDecodeError) as exc:
+        raise ValueError(f"cannot parse {DRIVER_MODULE} at git_sha {git_sha}") from exc
+    schema_version, has_fn, has_cli = None, False, False
+    for node in tree.body:
+        target = node.targets[0] if isinstance(node, ast.Assign) and len(node.targets) == 1 else \
+            node.target if isinstance(node, ast.AnnAssign) else None
+        if isinstance(target, ast.Name) and target.id == "SCHEMA_VERSION" and isinstance(node.value, ast.Constant) \
+                and isinstance(node.value.value, str):
+            schema_version = node.value.value
+        elif isinstance(node, ast.FunctionDef) and node.name == "postprocess_from_git":
+            has_fn = True
+        elif isinstance(node, ast.FunctionDef) and node.name == "build_parser":
+            has_cli = any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute) and c.func.attr == "add_argument"
+                          and c.args and isinstance(c.args[0], ast.Constant)
+                          and c.args[0].value == "--postprocess-from-git" for c in ast.walk(node))
+    return schema_version, has_fn and has_cli
+
+
+def _matches_current_summary_code(git_sha: str) -> bool:
+    """True iff the committed ``SUMMARY_MODULES`` at ``git_sha`` have the bytes of the validating checkout."""
+    return all(_git_blob(git_sha, _module_repo_path(m)) == _module_path(m).read_bytes() for m in SUMMARY_MODULES)
+
+
 def _digest(obj) -> str:
     return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()[:16]
 
@@ -1631,9 +1739,98 @@ def _digest(obj) -> str:
 ENV_KEYS = ("torch", "triton", "cuda", "driver", "device", "capability")
 
 
-def run_config_hash(quick: bool, protocol: dict, code: str, git_sha, env: dict, data_sha256: dict) -> str:
-    return _digest({"schema": SCHEMA_VERSION, "quick": quick, "protocol": protocol, "code_sha256": code,
+def run_config_hash(quick: bool, protocol: dict, code: str, git_sha, env: dict, data_sha256: dict,
+                    schema: str = SCHEMA_VERSION) -> str:
+    """``schema`` is the schema version of the run that measured (the source schema after a postprocess)."""
+    return _digest({"schema": schema, "quick": quick, "protocol": protocol, "code_sha256": code,
                     "git_sha": git_sha, "env": {k: env.get(k) for k in ENV_KEYS}, "data_sha256": data_sha256})
+
+
+def raw_measurements(payload: dict) -> dict:
+    """The raw measurements: ``RAW_MEASUREMENT_KEYS``, with ``part_c`` stripped of its derived ``analysis``."""
+    raw = {key: payload[key] for key in RAW_MEASUREMENT_KEYS}
+    if isinstance(raw["part_c"], dict):
+        raw["part_c"] = {k: v for k, v in raw["part_c"].items() if k not in DERIVED_PART_C_KEYS}
+    return raw
+
+
+def raw_measurements_sha256(payload: dict) -> str:
+    """SHA-256 of the raw measurements in one canonical JSON form (sorted keys, no whitespace)."""
+    text = json.dumps(raw_measurements(payload), sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _require_no_symlink_chain(path: Path) -> None:
+    """``path`` lies under ``ROOT`` and neither it nor a directory between ``ROOT`` and it is a symlink."""
+    absolute = Path(os.path.abspath(path))
+    try:
+        relative = absolute.relative_to(ROOT)
+    except ValueError:
+        raise ValueError(f"{path} is a reserved result path outside {ROOT}") from None
+    node = ROOT
+    for part in relative.parts:
+        node = node / part
+        if node.is_symlink():
+            raise ValueError(f"Refusing to write {path}: {node} is a symlink")
+
+
+def _write_json_atomic(path: Path, payload: dict, *, canonical_dest: bool = False) -> dict:
+    """Lossless atomic write through an exclusively created same-directory temp file. Returns the reloaded JSON.
+
+    A canonical or reserved destination must be under ``ROOT`` with no symlink at the path or its parents
+    below ``ROOT``; ``canonical_dest`` also binds it to ``CANONICAL_OUTPUT`` of this checkout.
+    """
+    path = Path(path)
+    guarded = canonical_dest or reserved(path)
+    if canonical_dest and Path(os.path.abspath(path)) != CANONICAL_OUTPUT:
+        raise ValueError(f"The canonical result goes to {CANONICAL_OUTPUT}, not {path}")
+    if guarded:
+        _require_no_symlink_chain(path)
+    text = e2e._dumps_json(payload) + "\n"
+    expected = json.loads(json.dumps(payload, allow_nan=False))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if guarded:
+        _require_no_symlink_chain(path)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
+                                         delete=False) as handle:  # O_CREAT | O_EXCL, mode 0600
+            tmp = Path(handle.name)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        reloaded = json.loads(tmp.read_text())
+        if reloaded != expected:
+            raise ValueError("JSON round trip is not lossless")
+        if guarded:
+            _require_no_symlink_chain(path)
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+    return reloaded
+
+
+SCRIPT_REPO_PARTS = ("research", "quant_ptq", SCRIPT_NAME)
+
+
+def _is_driver_script(arg: str) -> bool:
+    parts = Path(arg).parts
+    return parts == (SCRIPT_NAME,) or (len(parts) >= len(SCRIPT_REPO_PARTS)
+                                       and parts[-len(SCRIPT_REPO_PARTS):] == SCRIPT_REPO_PARTS)
+
+
+def _parsed_command(command, label: str) -> argparse.Namespace:
+    """``command`` as a runnable invocation of this script, parsed by its own CLI (no abbreviations)."""
+    _require(isinstance(command, list) and len(command) >= 2 and all(isinstance(x, str) and x for x in command)
+             and c502._is_python_executable(command[0]), f"{label} must be a Python invocation")
+    _require(_is_driver_script(command[1]), f"{label} is not an invocation of {SCRIPT_NAME}")
+    try:
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            return parse_args(command[2:])
+    except SystemExit as exc:
+        raise ValueError(f"{label} is not a valid runnable invocation") from exc
 
 
 NUMERICS = {"allow_tf32": False, "cudnn_allow_tf32": False, "allow_fp16_reduced_precision_reduction": False,
@@ -1680,7 +1877,7 @@ def run(args) -> dict:
     data_sha = {k: v["sha256"] for k, v in data["splits"].items()} if data else {}
     cfg_hash = run_config_hash(args.quick, protocol, code, git["git_sha"], env, data_sha)
     # The effective invocation (equal to sys.argv when the script runs from the command line).
-    meta = {**git, "command": [sys.executable, str(Path(__file__).relative_to(ROOT)), *args.argv],
+    meta = {**git, "command": _invocation(args.argv),
             "argv": list(args.argv), "environment": env,
             "numerics": numerics, "code_sha256": code, "code_modules": list(code_modules()),
             "timestamp_start": timestamp_start, "loadavg_start": list(os.getloadavg()),
@@ -1718,6 +1915,7 @@ def run(args) -> dict:
         meta["splits_opened"] = list(shards.opened)
     else:
         meta["splits_opened"] = []
+    payload["postprocess"] = None  # this run measured; ``postprocess_from_git`` fills it for a v1 source
     payload["summary"] = summarize(payload)
     payload["caveats"] = caveats(payload)
     meta["gpu_telemetry"]["end"] = h.gpu_telemetry(device)
@@ -1728,8 +1926,73 @@ def run(args) -> dict:
     try:
         validate_results(payload, canonical=args.canonical)
     except Exception:
-        c4.write_json_atomic(args.output.with_name(args.output.name + ".rejected"), payload)
+        # Keep the measurements of a long run: the rejected payload goes next to the output, never to it.
+        _write_json_atomic(rejected_path(args.output), payload)
         raise
+    return payload
+
+
+def _invocation(argv: list[str]) -> list[str]:
+    """The effective command line (equal to sys.argv when the script runs from the command line)."""
+    return [sys.executable, str(Path(__file__).resolve().relative_to(ROOT)), *argv]
+
+
+def rejected_path(output: Path) -> Path:
+    return Path(output).with_name(Path(output).name + ".rejected")
+
+
+def _with_summaries(payload: dict) -> dict:
+    """``part_c.analysis``, ``summary`` and ``caveats`` of the raw measurements, as plain JSON types."""
+    if payload.get("part_c") is not None:
+        payload["part_c"]["analysis"] = analyze(payload["part_c"])
+    payload["summary"] = summarize(payload)
+    payload["caveats"] = caveats(payload)
+    return json.loads(json.dumps(payload, allow_nan=False))
+
+
+def postprocess_from_git(commit: str, command: list[str]) -> dict:
+    """The v2 payload of the committed v1 result of ``commit``. Deterministic apart from its timestamp.
+
+    The raw measurements (``raw_measurements``) are the parsed bytes of ``git show`` and are not changed.
+    Only ``part_c.analysis``, ``summary`` and ``caveats`` are recomputed. ``postprocess`` records the
+    source, the postprocessing code and the pinned digests of the retained run evidence.
+    """
+    _require_git_commit(commit, "--postprocess-from-git")
+    blob = _git_blob(commit, RESULT_REPO_PATH)
+    source = json.loads(blob)
+    if not isinstance(source, dict) or source.get("schema_version") != SOURCE_SCHEMA_VERSION \
+            or source.get("task") != TASK or any(key not in source for key in RAW_MEASUREMENT_KEYS):
+        raise ValueError(f"{RESULT_REPO_PATH} at {commit} is not a {SOURCE_SCHEMA_VERSION} result of this task")
+    git = h.git_info()
+    payload = {"schema_version": SCHEMA_VERSION, "task": TASK,
+               **copy.deepcopy({key: source[key] for key in RAW_MEASUREMENT_KEYS})}
+    payload["postprocess"] = {
+        "source_schema_version": source["schema_version"], "source_result_git_sha": commit,
+        "source_artifact_sha256": hashlib.sha256(blob).hexdigest(),
+        "source_raw_measurements_sha256": raw_measurements_sha256(source),
+        "postprocess_git_sha": git["git_sha"], "postprocess_git_dirty": git["git_dirty"],
+        "postprocess_code_sha256": code_sha256(), "postprocess_code_modules": list(code_modules()),
+        "postprocess_command": list(command), "postprocess_timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "retained_evidence_sha256": dict(RETAINED_EVIDENCE_SHA256), "reason": POSTPROCESS_REASON}
+    return _with_summaries(payload)
+
+
+def postprocess(args) -> dict:
+    """``--postprocess-from-git``: no GPU, no training, no scoring.
+
+    A reserved output needs a clean tree and the pinned canonical source, both checked before any work,
+    and the payload must then certify as canonical.
+    """
+    if reserved(args.output):
+        require_clean_tree(h.git_info(), args.output)
+        if args.postprocess_from_git not in CANONICAL_SOURCE_ARTIFACTS:
+            raise ValueError(f"{args.output.name} is postprocessed only from the pinned source "
+                             f"{', '.join(CANONICAL_SOURCE_ARTIFACTS)}")
+    payload = postprocess_from_git(args.postprocess_from_git, _invocation(args.argv))
+    want_canonical = True if reserved(args.output) else payload["canonical"]
+    cert = validate_results(payload, canonical=want_canonical)
+    if reserved(args.output) and not cert["certified_canonical"]:
+        raise ValueError(f"Refusing to write noncanonical postprocessed result to reserved {args.output.name}")
     return payload
 
 
@@ -1740,7 +2003,7 @@ _require, _same, _assert_close = c502._require, c502._same, c502._assert_close
 _is_number, _nonneg, _is_int = c502._is_number, c502._nonneg, c502._is_int
 
 TOP_KEYS = {"schema_version", "task", "quick", "canonical", "meta", "run_config_hash", "protocol", "data",
-            "kernel_parity", "part_a", "part_b", "part_c", "summary", "caveats"}
+            "kernel_parity", "part_a", "part_b", "part_c", "postprocess", "summary", "caveats"}
 META_KEYS = {"git_sha", "git_dirty", "command", "argv", "environment", "numerics", "code_sha256", "code_modules",
              "timestamp_start", "timestamp_end", "loadavg_start", "loadavg_end", "gpu_telemetry", "part_seconds",
              "total_seconds", "splits_opened"}
@@ -1777,7 +2040,8 @@ def _validate_protocol(protocol) -> None:
              "Part B models invalid")
 
 
-def _validate_meta(payload: dict, canonical: bool) -> None:
+def _validate_meta(payload: dict, canonical: bool, schema: str) -> None:
+    """``schema`` is the schema version of the measuring run: ``run_config_hash`` was made under it."""
     meta = payload["meta"]
     _require(isinstance(meta, dict) and set(meta) == META_KEYS, "meta keys differ from the schema")
     _require(meta["git_sha"] is None or _is_hex(meta["git_sha"], 40), "meta.git_sha must be 40-hex or None")
@@ -1786,21 +2050,19 @@ def _validate_meta(payload: dict, canonical: bool) -> None:
     _require(meta["git_dirty"] is None or type(meta["git_dirty"]) is bool, "meta.git_dirty must be a bool")
     _require(_same(meta["numerics"], NUMERICS), "full-precision numerics are required")
     command, argv = meta["command"], meta["argv"]
-    _require(isinstance(command, list) and len(command) >= 2 and all(isinstance(x, str) and x for x in command)
-             and c502._is_python_executable(command[0]), "meta.command must be a Python invocation")
-    _require(Path(command[1]).name == SCRIPT_NAME or command[1].endswith(DRIVER_MODULE.split(".")[-1]),
-             f"meta.command is not an invocation of {SCRIPT_NAME}")
-    _require(isinstance(argv, list) and argv == command[2:], "meta.argv must be the arguments of meta.command")
-    try:
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            parsed = parse_args(argv)
-    except SystemExit as exc:
-        raise ValueError("meta.argv is not a valid invocation") from exc
+    _require(isinstance(argv, list) and isinstance(command, list) and argv == command[2:],
+             "meta.argv must be the arguments of meta.command")
+    parsed = _parsed_command(command, "meta.command")
+    _require(parsed.postprocess_from_git is None, "meta.command must be a measuring invocation")
     _require(parsed.canonical == payload["canonical"] and _same(parsed.protocol, payload["protocol"]),
              "meta.argv does not select the recorded protocol and canonical flag")
     modules = meta["code_modules"]
-    _require(isinstance(modules, list) and DRIVER_MODULE in modules and modules == list(code_modules()),
-             "meta.code_modules differ from the static import closure of this driver")
+    _require(isinstance(modules, list) and all(isinstance(m, str) and m.startswith("research.") for m in modules)
+             and len(set(modules)) == len(modules) and DRIVER_MODULE in modules,
+             "meta.code_modules must list the driver and its research.* imports")
+    measuring = payload["postprocess"] is None
+    if measuring:
+        _require(modules == list(code_modules()), "meta.code_modules differ from the static import closure of this driver")
     _require(_is_hex(meta["code_sha256"], 64), "meta.code_sha256 must be 64-hex")
     env = meta["environment"]
     _require(isinstance(env, dict) and all(k in env for k in ENV_KEYS), "meta.environment incomplete")
@@ -1821,17 +2083,24 @@ def _validate_meta(payload: dict, canonical: bool) -> None:
         _require(not {a.split("=", 1)[0] for a in argv} & set(RAW_NONCANONICAL_FLAGS),
                  "meta.argv carries a non-canonical flag")
         _require(tuple(env["capability"]) >= (12, 0), "a canonical result needs an sm_120+ device")
+    if canonical or not measuring:  # the producer code: the import closure and blobs at meta.git_sha
+        _require(_is_hex(meta["git_sha"], 40), "the producer needs a 40-hex meta.git_sha")
         _require(modules == list(_code_modules_at_commit(meta["git_sha"])),
                  "meta.code_modules differ from the import closure at meta.git_sha")
         _require(meta["code_sha256"] == _code_sha256_at_commit(meta["git_sha"], tuple(modules)),
                  "meta.code_sha256 differs from the committed git blobs")
-        _require(_git_blob(meta["git_sha"], _module_repo_path(DRIVER_MODULE)) == _module_path(DRIVER_MODULE).read_bytes(),
-                 "the driver at meta.git_sha differs from the validating checkout")
-    else:
-        _require(meta["code_sha256"] == code_sha256(), "meta.code_sha256 differs from this checkout")
+        commit_schema, _ = _driver_capabilities_at_commit(meta["git_sha"])
+        _require(commit_schema == schema, f"meta.git_sha declares schema {commit_schema!r}, not {schema!r}")
+    if measuring:
+        if canonical:  # the credited commit computed summary and caveats: its summary code is this checkout's
+            _require(_matches_current_summary_code(meta["git_sha"]),
+                     "meta.git_sha summary code differs from the validating checkout")
+        else:
+            _require(meta["code_sha256"] == code_sha256(), "meta.code_sha256 differs from this checkout")
     data_sha = {k: v["sha256"] for k, v in payload["data"]["splits"].items()} if payload["data"] else {}
     _require(payload["run_config_hash"] == run_config_hash(payload["quick"], payload["protocol"], meta["code_sha256"],
-                                                           meta["git_sha"], env, data_sha), "run_config_hash differs")
+                                                           meta["git_sha"], env, data_sha, schema),
+             "run_config_hash differs")
 
 
 def _validate_dist(dist: dict, rounds: int, per_round: int | None) -> None:
@@ -1863,6 +2132,35 @@ def _validate_timing(timing: dict, orders, methods, squares: int, iters: int, wa
         _validate_dist(t["wall"], wall_iters * len(orders), None)
 
 
+COOP_KEYS = {"grid", "graph_replays", "graph_replays_bitwise_exact", "sync_counter_after_replays",
+             "launch_cooperative_grid", "enabled_in_nvfp4_inference_blackwell"}
+COOP_GRID_KEYS = {"programs", "max_active_blocks_per_sm", "sms", "resident_capacity"}
+GEMM_KERNEL_MARKERS = ("gemm", "cutlass", "nvjet")
+
+
+def _validate_kernel_profile(method: str, kernels, where: str) -> None:
+    """CUPTI kernels of one graph replay: finite nonnegative durations, an FP4 GEMM and the quantizer roles.
+
+    nvfp4_gemm_only runs no quantizer; a C4-02 method runs the embedded ``_c4_02_*`` kernels, a C5-03 method
+    the module's; a dynamic variant runs one amax and one quant kernel, a static one a single quant kernel.
+    """
+    _require(isinstance(kernels, dict) and kernels and all(isinstance(k, str) and k and _nonneg(us)
+                                                           for k, us in kernels.items()),
+             f"{where}: kernel durations must be finite nonnegative microseconds per named kernel")
+    _require(any(m in k.lower() for k in kernels for m in GEMM_KERNEL_MARKERS), f"{where}: no FP4 GEMM kernel")
+    amax = [k for k in kernels if "_amax_kernel" in k]
+    quant = [k for k in kernels if "_quant_kernel" in k]
+    if method == "nvfp4_gemm_only":
+        _require(not amax and not quant, f"{where}: the GEMM ceiling runs no quantizer kernel")
+        return
+    impl = next(i for i in IMPLS if method.startswith(f"{i}_"))
+    static = method.endswith("static_gs")
+    own = (lambda k: "_c4_02_" in k) if impl == "c4_02" else (lambda k: "_c4_02_" not in k)
+    _require(len(amax) == (0 if static else 1) and len(quant) == 1 and all(own(k) for k in amax + quant),
+             f"{where}: a {'static' if static else 'dynamic'} {impl} graph runs {0 if static else 1} amax and 1 "
+             f"quant kernel of its own implementation, found {amax + quant}")
+
+
 def _validate_part_a(payload: dict) -> None:
     protocol, a = payload["protocol"], payload["part_a"]
     t = protocol["timing"]
@@ -1879,13 +2177,11 @@ def _validate_part_a(payload: dict) -> None:
         _assert_close(r["summary"], summarize_part_a_row(r), f"{where}.summary")
         _require(_same(r["c5_03_plan"], {v: nb.quantizer_plan(r["m"], r["k"], VARIANT_ROTATION[v], v.endswith("static_gs"))
                                          for v in VARIANTS}), f"{where}: c5_03_plan differs from the module")
-        _require(set(r["cuda_graph_kernel_profile_us"]) == set(PART_A_METHODS) - {"bf16_cublas"},
+        profile = r["cuda_graph_kernel_profile_us"]
+        _require(isinstance(profile, dict) and set(profile) == set(PART_A_METHODS) - {"bf16_cublas"},
                  f"{where}: kernel profile incomplete")
-        for v in VARIANTS:
-            names = r["cuda_graph_kernel_profile_us"][f"c5_03_{v}"]
-            want = 1 if v.endswith("static_gs") else 2
-            _require(sum("_quant_kernel" in n or "_amax_kernel" in n for n in names) == want,
-                     f"{where}: the C5-03 {v} graph must run {want} quantizer kernel(s)")
+        for method, kernels in profile.items():
+            _validate_kernel_profile(method, kernels, f"{where}.cuda_graph_kernel_profile_us.{method}")
     _require([[x["m"], x["n"], x["k"]] for x in a["ablation"]] == protocol["part_a"]["ablation_shapes"],
              "Part A ablation shapes differ")
     for x in a["ablation"]:
@@ -1896,10 +2192,17 @@ def _validate_part_a(payload: dict) -> None:
                          t["wall_iters_a"], where)
         _assert_close(x["summary"], _timing_table(x["timing"], "bf16_cublas"), f"{where}.summary")
         coop = x["coop"]
+        _require(isinstance(coop, dict) and set(coop) == COOP_KEYS, f"{where}: cooperative record keys differ")
+        _require(coop["launch_cooperative_grid"] is True, f"{where}: the cooperative kernel needs a cooperative launch")
+        grid = coop["grid"]
+        _require(isinstance(grid, dict) and set(grid) == COOP_GRID_KEYS and all(_is_int(v, 1) for v in grid.values())
+                 and grid["resident_capacity"] == grid["sms"] * grid["max_active_blocks_per_sm"]
+                 and 1 <= grid["programs"] <= grid["resident_capacity"],
+                 f"{where}: the cooperative grid must be positive and fit its resident capacity "
+                 "(sms x max_active_blocks_per_sm)")
         _require(coop["graph_replays"] == protocol["part_a"]["coop_replays"]
                  and coop["graph_replays_bitwise_exact"] == coop["graph_replays"]
-                 and coop["sync_counter_after_replays"] == 0 and coop["enabled_in_nvfp4_inference_blackwell"] is False
-                 and coop["grid"]["programs"] <= coop["grid"]["resident_capacity"],
+                 and coop["sync_counter_after_replays"] == 0 and coop["enabled_in_nvfp4_inference_blackwell"] is False,
                  f"{where}: cooperative replays must be exact, reset the barrier and stay disabled")
 
 
@@ -1912,6 +2215,11 @@ def _validate_part_b(payload: dict) -> None:
         _require(_same(m["config"], asdict(PART_B_CONFIGS[name])) and m["batch"] == protocol["part_b"]["models"][name]
                  and m["tokens_per_call"] == m["batch"] * m["config"]["sequence_length"], f"{where}: config differs")
         _require(m["nvfp4_layers"] == 5 * m["config"]["layers"], f"{where}: every block linear must be NVFP4")
+        cfg = m["config"]
+        linear = cfg["layers"] * (4 * cfg["width"] * cfg["width"] + 3 * cfg["width"] * cfg["hidden"])
+        _require(_is_int(m.get("linear_parameters"), 1) and m["linear_parameters"] == linear,
+                 f"{where}: linear_parameters must be the {linear} weights of the qkv, out, gate, up and down linears")
+        _require(_nonneg(m.get("compile_seconds")), f"{where}: compile_seconds invalid")
         for v in VARIANTS:
             _require(m["checks"][f"{v}_c5_03_logits_equal_c4_02_bitwise"] is True, f"{where}: {v} logits differ")
             _require(_nonneg(m["checks"][f"{v}_logits_rel_diff_vs_bf16"]), f"{where}: {v} rel diff invalid")
@@ -1929,6 +2237,23 @@ def _expected_grid() -> list[tuple[str, str]]:
     return out
 
 
+CALIBRATION_KEYS = {"split", "seed", "sequences", "seq_len", "tokens", "starts"}
+
+
+def _validate_calibration(cal, spec: dict, seq_len: int, train_tokens: int) -> None:
+    """The record of ``q.calibration_windows``: the exact seeded draw of distinct, aligned train.bin windows."""
+    _require(isinstance(cal, dict) and set(cal) == CALIBRATION_KEYS, "calibration record keys differ from the schema")
+    available = train_tokens // seq_len
+    _require(cal["split"] == "train" and _same(cal["sequences"], spec["calibration_sequences"])
+             and _same(cal["seed"], spec["calibration_seed"]) and _same(cal["seq_len"], seq_len)
+             and _is_int(cal["sequences"], 1) and cal["sequences"] <= available
+             and _same(cal["tokens"], cal["sequences"] * cal["seq_len"]),
+             "calibration must be the train.bin draw of the protocol (sequences x seq_len tokens)")
+    rng = np.random.default_rng(cal["seed"])
+    expected = [int(s) for s in np.sort(rng.choice(available, size=cal["sequences"], replace=False)) * seq_len]
+    _require(_same(cal["starts"], expected), "calibration starts differ from the seeded train.bin draw of the protocol")
+
+
 def _validate_part_c(payload: dict) -> None:
     protocol, c, data = payload["protocol"], payload["part_c"], payload["data"]
     spec, canonical = protocol["part_c"], payload["canonical"]
@@ -1943,13 +2268,10 @@ def _validate_part_c(payload: dict) -> None:
         _require({k: v["tokens"] for k, v in data["splits"].items()} == c502.CANONICAL_DATA["tokens"],
                  "canonical split token counts differ")
     _require(c["splits_opened_in_phase1"] == ["train", "val"], "Phase 1 must map only train.bin and val.bin")
-    cal = c["calibration"]
-    _require(cal["split"] == "train" and cal["sequences"] == spec["calibration_sequences"]
-             and cal["seed"] == spec["calibration_seed"] and cal["seq_len"] == config.sequence_length
-             and len(cal["starts"]) == cal["sequences"], "calibration must be the train.bin draw of the protocol")
+    split_tokens = {k: v["tokens"] for k, v in data["splits"].items()}
+    _validate_calibration(c["calibration"], spec, config.sequence_length, split_tokens["train"])
     seeds = c["seeds"]
     _require([s["seed"] for s in seeds] == spec["seeds"], "part_c seeds differ from the protocol")
-    split_tokens = {k: v["tokens"] for k, v in data["splits"].items()}
     coverage = {split: c502.expected_coverage(split_tokens[split], config.sequence_length, spec["max_eval_windows"])
                 for split in SPLITS}
     if canonical:
@@ -1983,6 +2305,13 @@ def _validate_part_c(payload: dict) -> None:
             _require(set(r) == ROW_KEYS, f"{rw}: row keys differ")
             family, rounding, awq = parse_method(r["method"])
             _require((r["rotation"], r["rounding"], r["awq"]) == (family, rounding, awq), f"{rw}: method fields")
+            if awq:
+                _require(r["awq_alpha"] in spec["awq_alphas"] and type(r["awq_alpha"]) is float,
+                         f"{rw}: awq_alpha must be one of the protocol alphas")
+            else:
+                _require(r["awq_alpha"] is None and r["inherited"] is False,
+                         f"{rw}: a row without AWQ has no awq_alpha and is not inherited")
+            _require(all(_nonneg(r[f"seconds_{split}"]) for split in SPLITS), f"{rw}: seconds_val / seconds_test invalid")
             for split in SPLITS:
                 base = s[f"baseline_{split}"]
                 _require(r[f"{split}_tokens"] == base["tokens"], f"{rw}: {split} tokens differ from the baseline")
@@ -2073,23 +2402,116 @@ def _validate_part_c(payload: dict) -> None:
         _require(c["analysis"] is None, "the paired analysis needs exactly three seeds")
 
 
+def _validate_postprocess_record(payload: dict) -> None:
+    """Shape of ``postprocess``. The git checks are in ``_validate_postprocess_provenance``."""
+    post = payload["postprocess"]
+    _require(isinstance(post, dict) and set(post) == set(POSTPROCESS_KEYS), "postprocess keys differ from the schema")
+    _require(post["source_schema_version"] == SOURCE_SCHEMA_VERSION,
+             f"postprocess.source_schema_version must be {SOURCE_SCHEMA_VERSION}")
+    _require(all(_is_hex(post[k], 40) for k in ("source_result_git_sha", "postprocess_git_sha")),
+             "postprocess commits must be 40-hex")
+    _require(all(_is_hex(post[k], 64) for k in ("source_artifact_sha256", "source_raw_measurements_sha256",
+                                                "postprocess_code_sha256")), "postprocess digests must be 64-hex")
+    _require(type(post["postprocess_git_dirty"]) is bool, "postprocess.postprocess_git_dirty must be a bool")
+    modules = post["postprocess_code_modules"]
+    _require(isinstance(modules, list) and all(isinstance(m, str) for m in modules),
+             "postprocess.postprocess_code_modules must be a list of modules")
+    evidence = post["retained_evidence_sha256"]
+    _require(isinstance(evidence, dict) and set(evidence) == set(RETAINED_EVIDENCE_SHA256)
+             and all(_is_hex(v, 64) for v in evidence.values()),
+             "postprocess.retained_evidence_sha256 must hold the 64-hex digests of the three retained run files")
+    _require(post["reason"] == POSTPROCESS_REASON, "postprocess.reason differs from the declared reason")
+    c502._timestamp(post["postprocess_timestamp"], "postprocess.postprocess_timestamp")
+
+
+def _validate_postprocess_provenance(payload: dict, canonical: bool) -> None:
+    """Source and code provenance of a postprocessed result, against the local git repository."""
+    post, meta = payload["postprocess"], payload["meta"]
+    source_sha, post_sha = post["source_result_git_sha"], post["postprocess_git_sha"]
+    for label, sha in (("postprocess.source_result_git_sha", source_sha),
+                       ("postprocess.postprocess_git_sha", post_sha), ("meta.git_sha", meta["git_sha"])):
+        _require_git_commit(sha, label)
+    blob = _git_blob(source_sha, RESULT_REPO_PATH)
+    _require(hashlib.sha256(blob).hexdigest() == post["source_artifact_sha256"],
+             "postprocess.source_artifact_sha256 differs from the committed bytes of the source artifact")
+    source = json.loads(blob)
+    _require(isinstance(source, dict) and source.get("schema_version") == post["source_schema_version"]
+             and source.get("task") == TASK and all(k in source for k in RAW_MEASUREMENT_KEYS),
+             "the source artifact has another schema version or task")
+    ours, theirs = raw_measurements(payload), raw_measurements(source)
+    for key in RAW_MEASUREMENT_KEYS:  # value for value and type for type
+        _require(_same(ours[key], theirs[key]),
+                 f"{key} differs from the source artifact: a postprocess must not change a raw measurement")
+    _require(post["source_raw_measurements_sha256"] == raw_measurements_sha256(source) == raw_measurements_sha256(payload),
+             "postprocess.source_raw_measurements_sha256 differs from the raw measurements of the source")
+    # The postprocessing code: this code, as committed at postprocess_git_sha.
+    _require(post["postprocess_code_modules"] == list(code_modules())
+             and post["postprocess_code_modules"] == list(_code_modules_at_commit(post_sha)),
+             "postprocess.postprocess_code_modules differ from the static import closure")
+    _require(post["postprocess_code_sha256"] == _code_sha256_at_commit(post_sha, tuple(post["postprocess_code_modules"])),
+             "postprocess.postprocess_code_sha256 differs from the git blobs at postprocess_git_sha")
+    post_schema, has_post_cli = _driver_capabilities_at_commit(post_sha)
+    _require(post_schema == SCHEMA_VERSION and has_post_cli,
+             f"postprocess.postprocess_git_sha must commit {SCHEMA_VERSION} with --postprocess-from-git")
+    _require(post_sha != meta["git_sha"] and post_sha != source_sha,
+             "postprocess.postprocess_git_sha must differ from the producer and source commits")
+    _require(_matches_current_summary_code(post_sha),
+             "postprocess.postprocess_git_sha summary code differs from the validating checkout")
+    parsed = _parsed_command(post["postprocess_command"], "postprocess.postprocess_command")
+    _require(parsed.postprocess_from_git == source_sha,
+             "postprocess.postprocess_command must pass --postprocess-from-git with the source result commit")
+    _require(c502._timestamp(post["postprocess_timestamp"], "postprocess.postprocess_timestamp")
+             >= c502._timestamp(meta["timestamp_end"], "meta.timestamp_end"),
+             "postprocess.postprocess_timestamp is before the end of the measuring run")
+    if canonical:
+        _require(reserved(parsed.output) and Path(parsed.output).name == CANONICAL_OUTPUT.name,
+                 "postprocess.postprocess_command of a canonical result must target the canonical output path")
+        _require(post["postprocess_git_dirty"] is False, "a canonical postprocess needs a clean tree")
+        _require(CANONICAL_SOURCE_ARTIFACTS.get(source_sha) == post["source_artifact_sha256"],
+                 "the source of a canonical postprocess must be the pinned committed C5-03 result")
+        _require(_same(post["retained_evidence_sha256"], RETAINED_EVIDENCE_SHA256),
+                 "postprocess.retained_evidence_sha256 differs from the pinned digests of the retained run files")
+
+
 def validate_results(payload: dict, canonical: bool | None = None) -> dict:
     """Offline check of a C5-03 result. Recomputes every summary, statistic and selection from the raw rows.
 
-    It cannot re-measure: it trusts the recorded timings and NLLs, and it checks the canonical code
-    identity against the git blobs of ``meta.git_sha``.
+    ``canonical`` states what the caller expects (None: the payload's label); a disagreement raises.
+    A measuring result (``postprocess`` None) is bound to ``meta.git_sha``: in canonical mode its import
+    closure and blobs, its ``SCHEMA_VERSION`` and its ``SUMMARY_MODULES`` (which must equal this checkout).
+    A postprocessed result is bound to the committed source artifact (byte digest, raw measurements
+    value for value), to the producer at ``meta.git_sha`` (hashes under ``SOURCE_SCHEMA_VERSION``) and to
+    the postprocessing code at ``postprocess_git_sha`` (``SUMMARY_MODULES`` equal to this checkout).
+
+    It cannot re-measure: it trusts the recorded timings and NLLs that pass its consistency checks.
     """
+    try:
+        return _validate_payload(payload, canonical)
+    except (KeyError, TypeError, IndexError, AttributeError) as exc:  # a record of the wrong shape or type
+        raise ValueError(f"malformed payload: {type(exc).__name__}: {exc}") from exc
+
+
+def _validate_payload(payload: dict, canonical: bool | None) -> dict:
     json.dumps(payload, allow_nan=False)
     _require(isinstance(payload, dict) and set(payload) == TOP_KEYS, "top-level keys differ from the schema")
     _require(payload["schema_version"] == SCHEMA_VERSION and payload["task"] == TASK, "schema or task differs")
     _require(type(payload["quick"]) is bool and type(payload["canonical"]) is bool, "quick/canonical must be bools")
-    canonical = payload["canonical"] if canonical is None else canonical
+    _require(canonical is None or type(canonical) is bool, "the requested canonical mode must be a bool or None")
+    if canonical is True and not payload["canonical"]:
+        raise ValueError("canonical certification was requested, but the payload is not labeled canonical")
+    if canonical is False and payload["canonical"]:
+        raise ValueError("the payload is labeled canonical: it cannot be validated with the noncanonical checks")
+    canonical = payload["canonical"]
+    post = payload["postprocess"]
+    if post is not None:
+        _validate_postprocess_record(payload)
+    schema = SCHEMA_VERSION if post is None else post["source_schema_version"]
     protocol = payload["protocol"]
     _validate_protocol(protocol)
     if canonical:
-        _require(payload["canonical"] is True and payload["quick"] is False and _same(protocol, CANONICAL),
+        _require(payload["quick"] is False and _same(protocol, CANONICAL),
                  "the protocol differs from the canonical C5-03 protocol")
-    _validate_meta(payload, canonical)
+    _validate_meta(payload, canonical, schema)
     kp = payload["kernel_parity"]
     want_cases = (54 + 6 if payload["quick"] else 216 + 36) + 27
     _require(kp["passed"] is True and kp["bitwise_failures"] == [] and kp["cases"] == want_cases,
@@ -2103,7 +2525,9 @@ def validate_results(payload: dict, canonical: bool | None = None) -> dict:
             _require(payload[key] is None, f"{key} present but not in protocol.parts")
     _assert_close(payload["summary"], summarize(payload), "summary")
     _require(payload["caveats"] == caveats(payload), "caveats differ from the recomputed caveats")
-    return {"certified_canonical": bool(canonical), "parts": protocol["parts"]}
+    if post is not None:
+        _validate_postprocess_provenance(payload, canonical)
+    return {"certified_canonical": canonical, "parts": protocol["parts"], "postprocessed": post is not None}
 
 
 # ======================================================================================
@@ -2124,6 +2548,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "the canonical run, <output>.ckpt otherwise)")
     parser.add_argument("--silent", action="store_true")
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--postprocess-from-git", metavar="COMMIT", default=None,
+                        help=f"no GPU work: read the committed {SOURCE_SCHEMA_VERSION} result of COMMIT (full 40-hex "
+                             "SHA) with git show, keep its raw measurements unchanged and recompute part_c.analysis, "
+                             "summary and caveats")
     return parser
 
 
@@ -2135,6 +2563,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
     args.argv = argv
+    if args.postprocess_from_git is not None:
+        measuring = [flag for flag, used in (
+            ("--quick", args.quick), ("--parts", args.parts is not None), ("--device", args.device is not None),
+            ("--seeds", args.seeds is not None), ("--max-eval-windows", args.max_eval_windows is not None),
+            ("--data-dir", args.data_dir is not None), ("--no-verify", args.no_verify),
+            ("--checkpoint-dir", args.checkpoint_dir is not None)) if used]
+        if measuring:
+            parser.error(f"--postprocess-from-git measures nothing: remove {' '.join(measuring)}")
+        if not _is_hex(args.postprocess_from_git, 40):
+            parser.error("--postprocess-from-git needs the full 40-hex SHA of the result commit")
+        args.output = CANONICAL_OUTPUT if args.output is None else args.output
+        if reserved(args.output) and (args.output.is_symlink()
+                                      or args.output.resolve() != CANONICAL_OUTPUT.resolve()):
+            parser.error(f"A postprocess writes {CANONICAL_OUTPUT} of this checkout (no symlink, no other "
+                         f"checkout) or a path outside {RESERVED_PATTERN}")
+        args.protocol, args.canonical = None, False  # not a measuring run: it selects no protocol
+        args.explicit_data_dir = args.explicit_checkpoint_dir = None
+        return args
     protocol = copy.deepcopy(QUICK if args.quick else CANONICAL)
     if args.parts is not None:
         parts = "".join(sorted(set(args.parts.upper())))
@@ -2180,7 +2626,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> dict:
     args = parse_args(argv)
-    payload = c4.write_json_atomic(args.output, run(args))
+    if args.postprocess_from_git is not None:
+        payload = postprocess(args)
+        canonical_dest = reserved(args.output)
+    else:
+        payload = run(args)
+        canonical_dest = args.canonical
+    payload = _write_json_atomic(args.output, payload, canonical_dest=canonical_dest)
     if not args.silent:
         print(json.dumps(payload["summary"].get("part_a_trailing_bf16_cuda_graph"), indent=None))
         print(f"Wrote {args.output}")

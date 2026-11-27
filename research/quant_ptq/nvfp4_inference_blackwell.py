@@ -387,21 +387,71 @@ def _quant(x, M, K, packed_u8, scale, gs, workspace, n_part, rot, tables, pdl: b
             (M, K, K // 16, x.stride(0), x.stride(1), pc4, n_part), constants, warps, pdl)
 
 
+def _check_buffer(t, name: str, x: Tensor, dtypes: tuple, *, shape=None, numel=None, min_numel=None,
+                  flat: bool = False) -> None:
+    """A caller-owned buffer: a contiguous tensor on ``x.device`` with one of ``dtypes`` and the given size."""
+    if not isinstance(t, Tensor):
+        raise ValueError(f"{name} must be a tensor")
+    if t.device != x.device:
+        raise ValueError(f"{name} must be on {x.device}, not {t.device}")
+    if t.dtype not in dtypes:
+        raise ValueError(f"{name} must have dtype {' or '.join(str(d) for d in dtypes)}, not {t.dtype}")
+    if not t.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    if flat and t.ndim != 1:
+        raise ValueError(f"{name} must be 1-D, not {t.ndim}-D")
+    if shape is not None and tuple(t.shape) != tuple(shape):
+        raise ValueError(f"{name} must have shape {tuple(shape)}, not {tuple(t.shape)}")
+    if numel is not None and t.numel() != numel:
+        raise ValueError(f"{name} must have {numel} elements, not {t.numel()}")
+    if min_numel is not None and t.numel() < min_numel:
+        raise ValueError(f"{name} must have at least {min_numel} elements, not {t.numel()}")
+
+
 def launch_amax(x: Tensor, workspace: Tensor, rotation: str = "none", tables=None) -> int:
-    """Pass 1 into ``workspace`` (>= MAX_PARTIALS float32 is always enough). Returns the number of partials."""
+    """Pass 1 of the dynamic mode into ``workspace``. Returns the number of partials ``n``.
+
+    ``x``: CUDA (M, K) float32 / bfloat16 / float16, K a multiple of 16 (any strides).
+    ``workspace``: caller-owned 1-D contiguous ``torch.float32`` tensor on ``x.device`` with at least
+    ``n`` elements; ``n`` is at most ``PASS1_PROGRAMS``, so ``MAX_PARTIALS`` elements are always enough.
+    The kernel writes ``workspace[:n]`` only. Pass ``n`` to ``launch_quant(..., n_part=n)``.
+    """
     M, K, tables = _check(x, rotation, tables)
+    _check_buffer(workspace, "workspace", x, (torch.float32,), flat=True, min_numel=_n_partials(M, K, rotation))
     return _amax(x, M, K, workspace, rotation, tables)
 
 
 def launch_quant(x: Tensor, packed: Tensor, scale: Tensor, global_scale: Tensor, *, rotation: str = "none",
                  tables=None, workspace: Tensor | None = None, n_part: int = 0) -> None:
-    """Pass 2 or the static single pass, into ``packed`` (uint8 view) and ``scale`` (float8_e4m3fn).
+    """Pass 2 (dynamic) or the static single pass, into caller-owned ``packed``, ``scale`` and ``global_scale``.
 
-    With ``workspace`` (dynamic) the kernel reduces its first ``n_part`` partials and writes the
-    tensor scale to ``global_scale``; without it, ``global_scale`` is read (static). This public
-    entry point launches without PDL (the caller may write ``x`` between the two passes).
+    Buffers (all contiguous and on ``x.device``; ``(pr, pc) = scale_layout(M, K)``):
+    * ``packed``: shape (M, K // 2), ``torch.uint8`` or ``torch.float4_e2m1fn_x2``;
+    * ``scale``: ``pr * pc`` elements, ``torch.uint8`` or ``torch.float8_e4m3fn`` (swizzled, padding written);
+    * ``global_scale``: one ``torch.float32`` element.
+
+    Dynamic (``workspace`` given): ``workspace`` is the 1-D contiguous ``torch.float32`` tensor that
+    ``launch_amax`` filled, and ``n_part`` must be the count that ``launch_amax`` returned
+    (``1 <= n_part <= min(MAX_PARTIALS, workspace.numel())``); the kernel reduces ``workspace[:n_part]``
+    and writes the tensor scale to ``global_scale``. The default ``n_part = 0`` is refused here: it would
+    reduce no partial and silently give a global scale of 1.
+    Static (``workspace`` None): ``global_scale`` is read, and ``n_part`` must stay 0.
+    This public entry point launches without PDL (the caller may write ``x`` between the two passes).
     """
     M, K, tables = _check(x, rotation, tables)
+    pr, pc = scale_layout(M, K)
+    _check_buffer(packed, "packed", x, (torch.uint8, torch.float4_e2m1fn_x2), shape=(M, K // 2))
+    _check_buffer(scale, "scale", x, (torch.uint8, torch.float8_e4m3fn), numel=pr * pc)
+    _check_buffer(global_scale, "global_scale", x, (torch.float32,), numel=1)
+    if type(n_part) is not int:
+        raise ValueError(f"n_part must be an int, not {type(n_part).__name__}")
+    if workspace is not None:
+        _check_buffer(workspace, "workspace", x, (torch.float32,), flat=True)
+        if not 1 <= n_part <= min(MAX_PARTIALS, workspace.numel()):
+            raise ValueError(f"dynamic launch_quant needs n_part = the count returned by launch_amax "
+                             f"(1..{min(MAX_PARTIALS, workspace.numel())}), not {n_part}")
+    elif n_part != 0:
+        raise ValueError(f"static launch_quant (no workspace) takes n_part = 0, not {n_part}")
     _quant(x, M, K, packed.view(torch.uint8), scale.view(torch.float8_e4m3fn), global_scale, workspace, n_part,
            rotation, tables)
 
