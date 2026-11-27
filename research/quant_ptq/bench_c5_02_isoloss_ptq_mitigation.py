@@ -119,6 +119,12 @@ SCRIPT_NAME = "bench_c5_02_isoloss_ptq_mitigation.py"
 RESULT_REPO_PATH = "results/cycle5_c5_02_isoloss_ptq_mitigation.json"
 CANONICAL_OUTPUT = ROOT / RESULT_REPO_PATH
 DRIVER_MODULE = "research.quant_ptq.bench_c5_02_isoloss_ptq_mitigation"
+SUMMARY_MODULES = (
+    DRIVER_MODULE,
+    "research.quant_ptq.bench_isoloss_ptq",
+    "research.quant_ptq.micro_rotated_ptq",
+    "research.polar_opt.harness_tier2_real",
+)
 QUICK_OUTPUT = ROOT / "results" / "c5_02_quick.json"
 CANONICAL_CHECKPOINT_DIR = ROOT / "artifacts" / "c5_02_checkpoints"
 RESERVED_PATTERN = "cycle5_c5_02*.json"
@@ -414,6 +420,11 @@ def _driver_capabilities_at_commit(git_sha: str) -> tuple[str | None, bool]:
                         and child.args[0].value == "--postprocess-from-git":
                     has_postprocess_cli = True
     return schema_version, has_postprocess_fn and has_postprocess_cli
+
+
+def _matches_current_summary_code(git_sha: str) -> bool:
+    """True iff the committed summary-computing modules at ``git_sha`` match the validating checkout's bytes."""
+    return all(_git_blob(git_sha, _module_repo_path(m)) == _module_path(m).read_bytes() for m in SUMMARY_MODULES)
 
 
 def _digest(obj) -> str:
@@ -1861,10 +1872,6 @@ def _is_driver_script(arg: str) -> bool:
                                        and parts[-len(SCRIPT_REPO_PARTS):] == SCRIPT_REPO_PARTS)
 
 
-def _cli_option_present(argv: list[str], flag: str) -> bool:
-    return any(a == flag or a.startswith(flag + "=") for a in argv)
-
-
 def _parsed_command(command, label: str) -> argparse.Namespace:
     """``command`` as a runnable invocation of this script, parsed by its own CLI."""
     _require(isinstance(command, list) and len(command) >= 2 and all(isinstance(x, str) and x for x in command)
@@ -2038,14 +2045,14 @@ def _validate_meta(payload: dict, *, canonical: bool, schema: str) -> None:
         _require(parsed.canonical is True and parsed.postprocess_from_git is None,
                  "meta.command does not select the canonical protocol")
         _require(parsed.resume == log["resume"], "meta.command --resume flag differs from meta.unit_log.resume")
-        if _cli_option_present(command[2:], "--checkpoint-dir"):
-            _require(str(parsed.checkpoint_dir) == meta["checkpoint_dir"],
+        if parsed.explicit_checkpoint_dir is not None:
+            _require(str(parsed.explicit_checkpoint_dir) == meta["checkpoint_dir"],
                      "meta.command --checkpoint-dir differs from meta.checkpoint_dir")
         else:
             _require(Path(meta["checkpoint_dir"]).parts[-2:] == ("artifacts", "c5_02_checkpoints"),
                      "meta.checkpoint_dir differs from the canonical checkpoint directory")
-        if _cli_option_present(command[2:], "--data-dir"):
-            _require(str(parsed.data_dir) == payload["data"]["directory"],
+        if parsed.explicit_data_dir is not None:
+            _require(str(parsed.explicit_data_dir) == payload["data"]["directory"],
                      "meta.command --data-dir differs from data.directory")
     if payload["postprocess"] is None:  # a measuring run: the producer is this code
         _require(modules == list(code_modules()), "meta.code_modules differ from the static import closure")
@@ -2057,6 +2064,8 @@ def _validate_meta(payload: dict, *, canonical: bool, schema: str) -> None:
             commit_schema, _ = _driver_capabilities_at_commit(meta["git_sha"])
             _require(commit_schema == SCHEMA_VERSION,
                      f"meta.git_sha declares schema {commit_schema!r}, not {SCHEMA_VERSION!r}")
+            _require(_matches_current_summary_code(meta["git_sha"]),
+                     "meta.git_sha summary code differs from the validating checkout")
 
 
 TRAINING_KEYS = {"arm", "seed", "steps", "warmup_steps", "lr", "auxiliary_lr", "weight_decay", "min_lr_ratio",
@@ -2511,6 +2520,8 @@ def _validate_postprocess_provenance(payload: dict, *, canonical: bool) -> None:
              f"postprocess.postprocess_git_sha must commit {SCHEMA_VERSION} with --postprocess-from-git")
     _require(post_sha != meta["git_sha"] and post_sha != source_sha,
              "postprocess.postprocess_git_sha must differ from the producer and source commits")
+    _require(_matches_current_summary_code(post_sha),
+             "postprocess.postprocess_git_sha summary code differs from the validating checkout")
     parsed = _parsed_command(post["postprocess_command"], "postprocess.postprocess_command")
     _require(parsed.postprocess_from_git == source_sha,
              "postprocess.postprocess_command must pass --postprocess-from-git with the source result commit")
@@ -2546,12 +2557,16 @@ def validate_results(payload: dict, *, canonical: bool | None = None) -> dict:
       checked as a git commit object (``git cat-file -t``), ``run_config_hash`` / ``unit_config_hash`` are the
       recomputed digests, and ``meta.code_modules`` matches this driver's import closure. In canonical mode,
       ``meta.git_dirty`` must be False, ``meta.code_sha256`` must equal the transitive ``research.*`` blobs at
-      ``meta.git_sha``, and the committed driver at ``meta.git_sha`` must declare ``SCHEMA_VERSION`` (exploratory
-      runs may start from dirty working trees and are not checked against committed blobs);
+      ``meta.git_sha``, the committed driver at ``meta.git_sha`` must declare ``SCHEMA_VERSION``, and the
+      committed ``SUMMARY_MODULES`` at ``meta.git_sha`` must match the validating checkout's bytes, binding
+      ``analysis``, ``derived`` and ``caveats`` to the credited revision (exploratory runs may start from dirty
+      working trees and are not checked against committed blobs);
     * provenance of a postprocessed result: the source artifact is the committed file of
       ``source_result_git_sha`` (byte digest), every ``RAW_MEASUREMENT_KEYS`` value equals the source,
       the producer code is the import closure and the blobs at ``meta.git_sha`` (hashes under the
-      source schema), and the postprocessing code is this code at ``postprocess_git_sha``;
+      source schema), and the postprocessing code is this code at ``postprocess_git_sha`` with committed
+      ``SUMMARY_MODULES`` matching the validating checkout's bytes, binding ``analysis``, ``derived`` and
+      ``caveats`` to ``postprocess_git_sha``;
     * split access as recorded by ``Shards.open``: Stage A on a train + val mapping, test.bin mapped
       afterwards for the Stage B scoring, no test field in any Stage A record. This is not a record of
       every file read: the startup verification reads all three shard files and scores no model;
@@ -2810,7 +2825,8 @@ def postprocess(args) -> dict:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0],
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+                                     formatter_class=argparse.RawDescriptionHelpFormatter,
+                                     allow_abbrev=False)
     parser.add_argument("--quick", action="store_true",
                         help="tiny model, few steps, short evaluation (never canonical)")
     parser.add_argument("--seeds", type=int, nargs="+", default=None,
@@ -2852,6 +2868,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error(f"A postprocess writes {CANONICAL_OUTPUT} of this checkout (no symlink, no other "
                          f"checkout) or a path outside {RESERVED_PATTERN}")
         args.protocol, args.canonical = None, False  # not a measuring run: it selects no protocol
+        args.explicit_data_dir = args.explicit_checkpoint_dir = None
         return args
     protocol = copy.deepcopy(QUICK if args.quick else CANONICAL)
     if args.seeds is not None:
@@ -2877,6 +2894,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.canonical and (args.output.is_symlink() or args.output.resolve() != CANONICAL_OUTPUT.resolve()):
         parser.error(f"The canonical protocol writes {CANONICAL_OUTPUT} of this checkout (no symlink, no other "
                      "checkout); change the protocol or use --quick for other paths")
+    args.explicit_data_dir = args.data_dir
+    args.explicit_checkpoint_dir = args.checkpoint_dir
     if args.data_dir is None:
         args.data_dir = q.default_data_dir()
     if args.checkpoint_dir is None:

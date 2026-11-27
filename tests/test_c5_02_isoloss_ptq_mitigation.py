@@ -916,8 +916,9 @@ def _as_canonical(payload, monkeypatch):
     p = copy.deepcopy(payload)
     hashes = {k: v["sha256"] for k, v in p["data"]["splits"].items()}
     fake_sha = "a" * 40
-    orig_require, orig_modules, orig_code, orig_caps = (
-        b._require_git_commit, b._code_modules_at_commit, b._code_sha256_at_commit, b._driver_capabilities_at_commit)
+    orig_require, orig_modules, orig_code, orig_caps, orig_summary = (
+        b._require_git_commit, b._code_modules_at_commit, b._code_sha256_at_commit,
+        b._driver_capabilities_at_commit, b._matches_current_summary_code)
     monkeypatch.setattr(b, "CANONICAL", copy.deepcopy(p["protocol"]))
     monkeypatch.setattr(b, "CANONICAL_DATA", {"source": copy.deepcopy(p["data"]["source"]),
                                               "encoding": p["data"]["encoding"],
@@ -931,6 +932,8 @@ def _as_canonical(payload, monkeypatch):
                         lambda sha, modules: p["meta"]["code_sha256"] if sha == fake_sha else orig_code(sha, modules))
     monkeypatch.setattr(b, "_driver_capabilities_at_commit",
                         lambda sha: (b.SCHEMA_VERSION, True) if sha == fake_sha else orig_caps(sha))
+    monkeypatch.setattr(b, "_matches_current_summary_code",
+                        lambda sha: True if sha == fake_sha else orig_summary(sha))
     p["quick"], p["canonical"] = False, True
     p["data"].update(sha256_verified=True, expected_sha256=dict(hashes))
     p["meta"].update(git_sha=fake_sha, git_dirty=False,
@@ -984,20 +987,31 @@ def test_canonical_branches_of_the_validator_run_on_a_dressed_quick_payload(quic
              "--checkpoint-dir differs", canonical=True)
     _rejects(p, lambda x: _set(x, ["meta", "command"], [*x["meta"]["command"], "--data-dir", "elsewhere"]),
              "--data-dir differs", canonical=True)
+    _rejects(p, lambda x: _set(x, ["meta", "command"], [*x["meta"]["command"], "--checkpoint-d", "elsewhere"]),
+             "valid runnable invocation", canonical=True)
+    _rejects(p, lambda x: _set(x, ["meta", "command"], [*x["meta"]["command"], "--data-d", "elsewhere"]),
+             "valid runnable invocation", canonical=True)
     _rejects(p, lambda x: _set(x, ["meta", "checkpoint_dir"], "/tmp/elsewhere"),
              "canonical checkpoint directory", canonical=True)
-    # A v1 producer commit (0355d16) cannot be certified as the producer of a fresh v2 result.
+    # A v1 producer commit (0355d16) or an earlier v2 commit (9473f90) cannot be certified as a current fresh v2 producer.
     v1_sha = "0355d16f258133b5fb7aec8e90fd223f781595e9"
     v1_code = "424055b21b6f894ef850151501425839e5731e9919ac7399138d75788f7dc85b"
+    old_v2_sha = "9473f90b3eb340cb162cb5d6f96bc6ec3e4dff32"
+    old_v2_code = "12ded47a9e5dd26c0e893285aad190f3f40e9ecf36d4e2bc1a17438a1c98ba33"
 
-    def v1_fresh_claim(x):
-        hashes = {k: v["sha256"] for k, v in x["data"]["splits"].items()}
-        x["meta"].update(git_sha=v1_sha, code_sha256=v1_code)
-        x["meta"]["unit_config_hash"] = b.unit_config_hash(
-            x["protocol"], x["config"], v1_code, x["meta"]["environment"], hashes, b.SCHEMA_VERSION)
-        x["run_config_hash"] = b.run_config_hash(
-            False, x["protocol"], x["config"], v1_code, v1_sha, x["meta"]["environment"], hashes, b.SCHEMA_VERSION)
-    _rejects(p, v1_fresh_claim, "declares schema 'cycle5_c5_02.v1'", canonical=True)
+    def claim_commit_producer(git_sha, code_sha):
+        def edit(x):
+            hashes = {k: v["sha256"] for k, v in x["data"]["splits"].items()}
+            x["meta"].update(git_sha=git_sha, code_sha256=code_sha)
+            x["meta"]["unit_config_hash"] = b.unit_config_hash(
+                x["protocol"], x["config"], code_sha, x["meta"]["environment"], hashes, b.SCHEMA_VERSION)
+            x["run_config_hash"] = b.run_config_hash(
+                False, x["protocol"], x["config"], code_sha, git_sha, x["meta"]["environment"], hashes,
+                b.SCHEMA_VERSION)
+        return edit
+    _rejects(p, claim_commit_producer(v1_sha, v1_code), "declares schema 'cycle5_c5_02.v1'", canonical=True)
+    _rejects(p, claim_commit_producer(old_v2_sha, old_v2_code), "summary code differs from the validating checkout",
+             canonical=True)
 
 
 def test_a_rejected_payload_is_kept_next_to_the_output(quick, quick_dir, monkeypatch):
@@ -1767,6 +1781,34 @@ def test_committed_canonical_artifact_rejects_postprocess_provenance_tampering(c
             False, p["protocol"], p["config"], p["meta"]["code_sha256"], p["meta"]["git_sha"],
             p["meta"]["environment"], hashes, b.SCHEMA_VERSION)
     rejects(v1_as_fresh_v2, "declares schema 'cycle5_c5_02.v1'")
+    # Astra v3 signoff Blocking 1: earlier v2 commits (9473f90, a7c4be2) cannot be credited for current summaries.
+    for old_v2_sha, old_v2_code in (
+            ("9473f90b3eb340cb162cb5d6f96bc6ec3e4dff32",
+             "12ded47a9e5dd26c0e893285aad190f3f40e9ecf36d4e2bc1a17438a1c98ba33"),
+            ("a7c4be23646cee1c3e413b4bd4297984b6e95c9e",
+             "3cb1c6b8e6fb117186c9532c75b96e96b14a16d020ba4e244bc9c9e3806d40b4")):
+        rejects(lambda p, s=old_v2_sha, c=old_v2_code: _update(
+                    _get(p, post), postprocess_git_sha=s, postprocess_code_sha256=c),
+                "summary code differs from the validating checkout")
+
+        def old_v2_as_fresh(p, s=old_v2_sha, c=old_v2_code):
+            p["postprocess"] = None
+            hashes = {k: v["sha256"] for k, v in p["data"]["splits"].items()}
+            p["meta"].update(git_sha=s, code_sha256=c)
+            p["meta"]["unit_config_hash"] = b.unit_config_hash(
+                p["protocol"], p["config"], c, p["meta"]["environment"], hashes, b.SCHEMA_VERSION)
+            p["run_config_hash"] = b.run_config_hash(
+                False, p["protocol"], p["config"], c, s, p["meta"]["environment"], hashes, b.SCHEMA_VERSION)
+        rejects(old_v2_as_fresh, "summary code differs from the validating checkout")
+    # Exact hashes from Astra v3 signoff for 9473f90 on the unmodified v1 producer metadata.
+    def astra_exact_9473f90_fresh_repro(p):
+        p["postprocess"] = None
+        p["meta"].update(
+            git_sha="9473f90b3eb340cb162cb5d6f96bc6ec3e4dff32",
+            code_sha256="12ded47a9e5dd26c0e893285aad190f3f40e9ecf36d4e2bc1a17438a1c98ba33",
+            unit_config_hash="346808d5e324305a")
+        p["run_config_hash"] = "cc4be683cba148ee"
+    rejects(astra_exact_9473f90_fresh_repro, "summary code differs from the validating checkout")
     # Astra re-check Blocking 3a/3b on canonical artifact: 1-ULP increase fails, rounded FP32 tie with 1 improved passes.
     bf_key = "nvfp4_g16/adaptive_butterfly_b16_gptq"
     bf_path = ["stage_b", "checkpoints", 0, "butterfly_fits", bf_key, "qkv"]
@@ -1786,6 +1828,7 @@ def test_committed_canonical_artifact_rejects_postprocess_provenance_tampering(c
                        ([*command[:3], "0355d16f258133b5fb7aec8e90fd223f781595e9"], "source result commit"),
                        ([*command[:3], "da148c2"], "valid runnable invocation"),
                        ([*command, "--resume"], "valid runnable invocation"),
+                       ([command[0], command[1], "--postprocess-f", SOURCE_COMMIT], "valid runnable invocation"),
                        ([*command, "--output", "/tmp/copy.json"], "must target the canonical output path"),
                        (["bash", *command[1:]], "Python invocation"),
                        (["not-a-python-interpreter", *command[1:]], "Python invocation"),
@@ -1800,6 +1843,10 @@ def test_committed_canonical_artifact_rejects_postprocess_provenance_tampering(c
     rejects(lambda p: _set(p, ["meta", "command"],
                            [p["meta"]["command"][0], "tests/test_bench_c5_02_isoloss_ptq_mitigation.py"]),
             "canonical invocation")
+    rejects(lambda p: _set(p, ["meta", "command"], [*p["meta"]["command"], "--checkpoint-d", "elsewhere"]),
+            "valid runnable invocation")
+    rejects(lambda p: _set(p, ["meta", "command"], [*p["meta"]["command"], "--data-d", "elsewhere"]),
+            "valid runnable invocation")
     # Retained audit evidence.
     evidence = [*post, "retained_evidence_sha256"]
     rejects(lambda p: _set(p, [*evidence, "final_canonical_log"], "0" * 64), "pinned digests")
