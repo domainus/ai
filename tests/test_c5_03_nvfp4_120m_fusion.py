@@ -424,15 +424,51 @@ def test_caveats_bind_study_history_to_actual_source_and_producer():
         "postprocess": None,
         "meta": {"git_sha": "a" * 40, "environment": {"device": "NVIDIA GeForce RTX 5080", "capability": [12, 0]}},
         "protocol": b.CANONICAL,
-        "data": {"source": {"name": "fineweb-edu"}, "encoding": "gpt2"},
+        "data": {"source": {"name": "fineweb-edu"}, "encoding": "gpt2",
+                 "splits": {"test": {"sha256": q.EXPECTED_SHA256["test"]}}},
         "part_a": None,
         "part_b": None,
         "part_c": None,
     }
+    fresh_notes = "\n".join(b.caveats(fresh))
     history = next(n for n in b.caveats(fresh) if n.startswith("Study history:"))
     assert "aaaaaaa" in history
     assert "rerun committed at 726b20c" not in history
     assert "measured by 38cef48" not in history
+    assert "the same test.bin was scored by earlier cycles" in fresh_notes
+
+    synth_split = {
+        "canonical": False,
+        "postprocess": None,
+        "meta": {"git_sha": "a" * 40, "environment": {"device": "NVIDIA GeForce RTX 5080", "capability": [12, 0]}},
+        "protocol": b.QUICK,
+        "data": {"source": {"name": "synthetic"}, "encoding": "gpt2",
+                 "splits": {"test": {"sha256": "4b4c7490e3e3a53f0f236ce93a05b515a0ab20f0d793fa872b07dbdd14d18165"}}},
+        "part_a": None,
+        "part_b": None,
+        "part_c": {"analysis": {}},
+    }
+    synth_notes = "\n".join(b.caveats(synth_split))
+    assert "the same test.bin was scored by earlier cycles" not in synth_notes
+    assert "earlier-cycle FineWeb-Edu scoring does not apply to this test split" in synth_notes
+
+    six_seed_proto = copy.deepcopy(b.CANONICAL)
+    six_seed_proto["part_c"]["seeds"] = [1, 2, 3, 4, 5, 6]
+    six_seed = {
+        "canonical": False,
+        "postprocess": None,
+        "meta": {"git_sha": "a" * 40, "environment": {"device": "NVIDIA GeForce RTX 5080", "capability": [12, 0]}},
+        "protocol": six_seed_proto,
+        "data": {"source": {"name": "fineweb-edu"}, "encoding": "gpt2",
+                 "splits": {"test": {"sha256": q.EXPECTED_SHA256["test"]}}},
+        "part_a": None,
+        "part_b": None,
+        "part_c": {"analysis": None},
+    }
+    six_notes = "\n".join(b.caveats(six_seed))
+    assert "cannot fall below" not in six_notes
+    assert "no sign-flip result can be significant" not in six_notes
+    assert "Part C ran 6 seeds; paired contrast analysis is only computed for 3 seeds (part_c.analysis is None)." in six_notes
 
 
 @needs_fp4
@@ -824,9 +860,42 @@ def test_atomic_writer_rejects_parent_traversal_and_preserves_old_on_fs_errors(s
 
     out = b.CANONICAL_OUTPUT
     b._write_json_atomic(out, {"old": 1}, canonical_dest=True)
+
+    # In-tree and external directory symlink aliases must be rejected consistently across CLI, validator and writer.
+    in_tree_alias = sandbox / "alias_results"
+    in_tree_alias.symlink_to(sandbox / "results", target_is_directory=True)
+    ext_results = tmp_path / "ext_results"
+    ext_results.symlink_to(sandbox / "results", target_is_directory=True)
+    ext_root = tmp_path / "ext_root"
+    ext_root.symlink_to(sandbox, target_is_directory=True)
+    for alias_out in (
+        in_tree_alias / b.CANONICAL_OUTPUT.name,
+        ext_results / b.CANONICAL_OUTPUT.name,
+        ext_root / "results" / b.CANONICAL_OUTPUT.name,
+    ):
+        with pytest.raises(ValueError):
+            b._verify_canonical_output_path(alias_out)
+        with pytest.raises(ValueError):
+            b._write_json_atomic(alias_out, {"new": 0}, canonical_dest=True)
+        for argv in (["--output", str(alias_out)], ["--postprocess-from-git", SOURCE_COMMIT, "--output", str(alias_out)]):
+            with pytest.raises(SystemExit) as exc:
+                b.parse_args(argv)
+            assert exc.value.code == 2
+    assert json.loads(out.read_text()) == {"old": 1}
+
     with monkeypatch.context() as m:
-        m.setattr(b.os, "fsync", lambda fd: (_ for _ in ()).throw(OSError("fsync boom")))
-        with pytest.raises(OSError, match="fsync boom"):
+        calls = 0
+        real_fsync = b.os.fsync
+
+        def fail_first_fsync(fd):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("file fsync boom")
+            return real_fsync(fd)
+
+        m.setattr(b.os, "fsync", fail_first_fsync)
+        with pytest.raises(OSError, match="file fsync boom"):
             b._write_json_atomic(out, {"new": 2}, canonical_dest=True)
     assert json.loads(out.read_text()) == {"old": 1} and _leftovers(out.parent) == []
     with monkeypatch.context() as m:
@@ -834,6 +903,21 @@ def test_atomic_writer_rejects_parent_traversal_and_preserves_old_on_fs_errors(s
         with pytest.raises(OSError, match="replace boom"):
             b._write_json_atomic(out, {"new": 3}, canonical_dest=True)
     assert json.loads(out.read_text()) == {"old": 1} and _leftovers(out.parent) == []
+    with monkeypatch.context() as m:
+        calls = 0
+        real_fsync = b.os.fsync
+
+        def fail_dir_fsync(fd):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("dir fsync boom")
+            return real_fsync(fd)
+
+        m.setattr(b.os, "fsync", fail_dir_fsync)
+        with pytest.raises(OSError, match="dir fsync boom"):
+            b._write_json_atomic(out, {"new": 4}, canonical_dest=True)
+    assert json.loads(out.read_text()) == {"new": 4} and _leftovers(out.parent) == []
 
 
 # ------------------------------------------------------------------ CLI of --postprocess-from-git
@@ -861,9 +945,17 @@ def test_cli_postprocess_mode_measures_nothing(tmp_path, capsys):
     other = tmp_path / "other" / "results" / b.CANONICAL_OUTPUT.name
     alias = tmp_path / "alias_cycle5_c5_03.json"
     alias.symlink_to(b.CANONICAL_OUTPUT)
+    ext_results = tmp_path / "ext_results"
+    ext_results.symlink_to(ROOT / "results", target_is_directory=True)
+    ext_root = tmp_path / "ext_root"
+    ext_root.symlink_to(ROOT, target_is_directory=True)
     traversal = ROOT / "results" / ".." / "results" / b.CANONICAL_OUTPUT.name
-    for out in (other, alias, tmp_path / "cycle5_c5_03_copy.json", tmp_path / "copy.json", traversal):
+    for out in (other, alias, ext_results / b.CANONICAL_OUTPUT.name,
+                ext_root / "results" / b.CANONICAL_OUTPUT.name,
+                tmp_path / "cycle5_c5_03_copy.json", tmp_path / "copy.json", traversal):
         assert "A postprocess writes" in _error(capsys, ["--postprocess-from-git", SOURCE_COMMIT, "--output", str(out)])
+    for out in (ext_results / b.CANONICAL_OUTPUT.name, ext_root / "results" / b.CANONICAL_OUTPUT.name):
+        assert "canonical protocol writes" in _error(capsys, ["--output", str(out)])
 
 
 @needs_cuda
@@ -1061,7 +1153,7 @@ def test_canonical_validator_rejects_the_audit_evidence_cases(canonical):
     _rejects_canonical(canonical, lambda p: _set(p, [*grid0, awq, "awq_alpha"], 0.3), "protocol alphas")
 
 
-def test_canonical_validator_rejects_postprocess_provenance_tampering(canonical, monkeypatch):
+def test_canonical_validator_rejects_postprocess_provenance_tampering(canonical, monkeypatch, tmp_path):
     post = ["postprocess"]
 
     def update(d, **kw):
@@ -1130,6 +1222,10 @@ def test_canonical_validator_rejects_postprocess_provenance_tampering(canonical,
     _rejects_canonical(canonical, v1_hash_without_postprocess, "declares schema|run_config_hash")
     # Command.
     command = canonical["postprocess"]["postprocess_command"]
+    ext_results = tmp_path / "ext_results"
+    ext_results.symlink_to(ROOT / "results", target_is_directory=True)
+    ext_root = tmp_path / "ext_root"
+    ext_root.symlink_to(ROOT, target_is_directory=True)
     for bad, match in ((command[:2], "--postprocess-from-git with the source result commit"),
                        ([*command[:3], PRODUCER_COMMIT], "source result commit"),
                        ([*command[:3], "726b20c"], "valid runnable invocation"),
@@ -1137,6 +1233,10 @@ def test_canonical_validator_rejects_postprocess_provenance_tampering(canonical,
                        ([*command, "--data-dir", "/x"], "valid runnable invocation"),
                        ([command[0], command[1], "--postprocess-f", SOURCE_COMMIT], "valid runnable invocation"),
                        ([*command, "--output", "/tmp/copy.json"],
+                        "valid runnable invocation|must target the canonical output path"),
+                       ([*command, "--output", str(ext_results / b.CANONICAL_OUTPUT.name)],
+                        "valid runnable invocation|must target the canonical output path"),
+                       ([*command, "--output", str(ext_root / "results" / b.CANONICAL_OUTPUT.name)],
                         "valid runnable invocation|must target the canonical output path"),
                        ([command[0], b.SCRIPT_NAME, *command[2:]], "not an invocation"),
                        ([command[0], f"fake/{b.SCRIPT_REPO_PATH}", *command[2:]], "not an invocation"),

@@ -138,15 +138,15 @@ RETAINED_EVIDENCE_SHA256 = {
     "superseded_result_4736807.json": "aafd8ebe571bb512ac02e5c20403ac900e930cd11e4a74c5c5152a3e3b2f9c5a",
 }
 POSTPROCESS_REASON = (
-    "Remediation of the C5-03 audit and post-remediation re-check (audits/AUDIT_cycle5_c5_03_gpt62_astra.md, "
-    "findings 1-5 and v2 closures): the raw measurements of the canonical result 726b20c (measured by the clean "
+    "Remediation of the C5-03 audit and post-remediation re-checks (audits/AUDIT_cycle5_c5_03_gpt62_astra.md, "
+    "findings 1-5 and v2-v3 closures): the raw measurements of the canonical result 726b20c (measured by the clean "
     "commit 38cef48) are preserved unchanged, so test.bin is not scored a third time. part_c.analysis, summary "
-    "and caveats are recomputed (the caveats bind to the actual protocol/source and record the superseded 4736807 "
-    "run and measurement limits), and the result is checked by the hardened validator (calibration draw, linear "
-    "parameter counts, FP4-specific GEMM and exact quantizer kernel profiles, cooperative launch record, AWQ "
-    "fields, exact script path and commit chronology). The exact n_part public launcher contract, verified "
-    "dir_fd atomic writer, and integer-view bitwise checks are verified by the test suite and audit replay. "
-    "Nothing was retrained or re-measured.")
+    "and caveats are recomputed (the caveats bind to the actual protocol, test-split SHA-256, analysis availability "
+    "and source, recording the superseded 4736807 run and measurement limits), and the result is checked by the "
+    "hardened validator (calibration draw, linear parameter counts, FP4-specific GEMM and exact quantizer kernel "
+    "profiles, cooperative launch record, AWQ fields, exact script path, unified canonical path guard and commit "
+    "chronology). The exact n_part public launcher contract, verified dir_fd atomic writer, and integer-view "
+    "bitwise checks are verified by the test suite and audit replay. Nothing was retrained or re-measured.")
 
 VARIANTS = ("none", "had_b16", "bfly_b16", "had_b16_static_gs")
 VARIANT_ROTATION = {"none": "none", "had_b16": "hadamard_b16", "bfly_b16": "adaptive_butterfly_b16",
@@ -1564,15 +1564,19 @@ def caveats(payload: dict) -> list[str]:
     notes = []
     if "C" in parts:
         n_seeds = len(spec["seeds"])
-        if n_seeds >= 2:
-            min_p = 2 / (2 ** n_seeds)
+        part_c = payload.get("part_c")
+        has_analysis = (n_seeds == N_SEEDS) if part_c is None else (part_c.get("analysis") is not None)
+        if n_seeds == N_SEEDS and has_analysis:
             notes.append(
-                f"Part C statistics have df = {n_seeds - 1} ({n_seeds} paired seeds): the two-sided t-test has "
-                f"little power, and the exact sign-flip p-value cannot fall below {min_p:g} for any contrast, "
-                "so no sign-flip result can be significant."
+                f"Part C statistics have df = {N_SEEDS - 1} ({N_SEEDS} paired seeds): the two-sided t-test has "
+                f"little power, and the exact sign-flip p-value cannot fall below {SIGN_FLIP_MIN_P:g} for any "
+                "contrast, so no sign-flip result can be significant."
             )
         else:
-            notes.append("Part C ran 1 seed; paired statistics require multiple seeds.")
+            notes.append(
+                f"Part C ran {n_seeds} seed{'s' if n_seeds != 1 else ''}; paired contrast analysis is only "
+                f"computed for {N_SEEDS} seeds (part_c.analysis is None)."
+            )
         data_rec = payload.get("data") or {}
         src_info = data_rec.get("source") or {}
         enc = data_rec.get("encoding") or "unknown"
@@ -1593,11 +1597,19 @@ def caveats(payload: dict) -> list[str]:
             f"GPU training is seeded (initial state, batch stream) but not claimed to be bit-reproducible; "
             f"the {ckpt_phrase} retained outside git with their tensor and file SHA-256 values."
         )
-        notes.append(
-            "test.bin is held out from every selection rule of this run (Phase 2 maps it after the freeze), "
-            "but the same test.bin was scored by earlier cycles on other checkpoints; it is not a study-level "
-            "unseen holdout."
-        )
+        test_sha = ((data_rec.get("splits") or {}).get("test") or {}).get("sha256")
+        if test_sha == q.EXPECTED_SHA256["test"]:
+            notes.append(
+                "test.bin is held out from every selection rule of this run (Phase 2 maps it after the freeze), "
+                "but the same test.bin was scored by earlier cycles on other checkpoints; it is not a study-level "
+                "unseen holdout."
+            )
+        else:
+            notes.append(
+                "test.bin is held out from every selection rule of this run (Phase 2 maps it after the freeze); "
+                "its SHA-256 differs from the canonical FineWeb-Edu test split, so earlier-cycle FineWeb-Edu "
+                "scoring does not apply to this test split."
+            )
         notes.append(
             "AWQ alpha is chosen per seed on val.bin with live hardware W4A4 dynamic scoring; an alpha = 0 choice "
             "makes the AWQ rows copies of the plain rotation + GPTQ rows (counted as inherited, not as measurements)."
@@ -1849,7 +1861,7 @@ _NOFOLLOW_FLAGS = os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 
 
 def _relative_under_root(path: Path) -> Path:
-    """Path relative to ``ROOT`` without resolving components below ``ROOT``; rejects ``..`` traversal."""
+    """Path relative to ``ROOT`` without resolving symlinks; rejects ``..`` traversal."""
     if ".." in path.parts:
         raise ValueError(f"Refusing to write {path}: parent traversal ('..') is not allowed")
     root_resolved = ROOT.resolve()
@@ -1860,10 +1872,6 @@ def _relative_under_root(path: Path) -> Path:
             return path.relative_to(base)
         except ValueError:
             pass
-    root_str = str(root_resolved)
-    for ancestor in reversed((path, *path.parents)):
-        if os.path.realpath(ancestor) == root_str:
-            return path.relative_to(ancestor)
     raise ValueError(f"{path} is outside {ROOT}")
 
 
@@ -1938,6 +1946,20 @@ def _open_verified_parent_fd(path: Path, relative: Path, *, create: bool) -> tup
             os.close(dir_fd)
 
 
+def _verify_canonical_output_path(path: Path) -> Path:
+    """Single destination rule shared by CLI parsing, offline validation and the guarded writer.
+
+    Requires ``path`` to bind lexically to ``CANONICAL_OUTPUT`` under ``ROOT`` with no ``..`` traversal
+    and no symlink at any existing directory component or at the target file.
+    """
+    path = Path(path)
+    relative = _guarded_relative(path, canonical_dest=True)
+    pre = _open_verified_parent_fd(path, relative, create=False)
+    if pre is not None:
+        os.close(pre[0])
+    return relative
+
+
 def _create_temp_at(dir_fd: int, filename: str) -> tuple[int, str]:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW_FLAGS
     for _ in range(128):
@@ -1954,7 +1976,10 @@ def _write_json_atomic(path: Path, payload: dict, *, canonical_dest: bool = Fals
 
     A canonical or reserved destination must lie under ``ROOT`` without parent traversal (``..``) or any
     symlink along the path or its parents below ``ROOT``; ``canonical_dest`` also binds it to
-    ``CANONICAL_OUTPUT`` of this checkout.
+    ``CANONICAL_OUTPUT`` of this checkout. Failures before ``os.replace`` (JSON serialization, write,
+    file ``fsync``, round-trip check, or ``os.replace`` itself) leave the previous destination untouched
+    with zero staging files; a post-rename directory ``os.fsync(dir_fd)`` failure raises after the new
+    file is already visible (leaving crash durability uncertain), also with zero staging files.
     """
     path = Path(path)
     guarded = canonical_dest or reserved(path)
@@ -2264,6 +2289,7 @@ def _validate_meta(payload: dict, canonical: bool, schema: str) -> None:
     want_splits = ["train", "val", "test"] if "C" in payload["protocol"]["parts"] else []
     _require(meta["splits_opened"] == want_splits, "meta.splits_opened must be train, val, then test (Part C)")
     if canonical:
+        _verify_canonical_output_path(parsed.output)
         _require(_is_hex(meta["git_sha"], 40) and meta["git_dirty"] is False,
                  "a canonical result needs a 40-hex git_sha and a clean tree (git_dirty False)")
         _require(not {a.split("=", 1)[0] for a in argv} & set(RAW_NONCANONICAL_FLAGS),
@@ -2671,9 +2697,12 @@ def _validate_postprocess_provenance(payload: dict, canonical: bool) -> None:
     _require(post_ts >= source_commit_ts, "postprocess.postprocess_timestamp is before the source result commit")
     _require(post_ts >= post_commit_ts, "postprocess.postprocess_timestamp is before the postprocessing commit")
     if canonical:
-        _require(reserved(parsed.output) and ".." not in parsed.output.parts
-                 and parsed.output.resolve() == CANONICAL_OUTPUT.resolve(),
-                 "postprocess.postprocess_command of a canonical result must target the canonical output path")
+        try:
+            _verify_canonical_output_path(parsed.output)
+        except ValueError as exc:
+            raise ValueError(
+                f"postprocess.postprocess_command of a canonical result must target the canonical output path ({exc})"
+            ) from exc
         _require(post["postprocess_git_dirty"] is False, "a canonical postprocess needs a clean tree")
         _require(CANONICAL_SOURCE_ARTIFACTS.get(source_sha) == post["source_artifact_sha256"],
                  "the source of a canonical postprocess must be the pinned committed C5-03 result")
@@ -2783,14 +2812,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error("--postprocess-from-git needs the full 40-hex SHA of the result commit")
         args.output = CANONICAL_OUTPUT if args.output is None else args.output
         pinned = args.postprocess_from_git in CANONICAL_SOURCE_ARTIFACTS
-        if (pinned or reserved(args.output)) and (
-            ".." in args.output.parts or args.output.is_symlink()
-            or args.output.resolve() != CANONICAL_OUTPUT.resolve()
-        ):
-            parser.error(
-                f"A postprocess writes {CANONICAL_OUTPUT} of this checkout (no symlink, no parent traversal, "
-                f"no other checkout)" + ("" if pinned else f" or a path outside {RESERVED_PATTERN}")
-            )
+        if pinned or reserved(args.output):
+            try:
+                _verify_canonical_output_path(args.output)
+            except ValueError as exc:
+                parser.error(
+                    f"A postprocess writes {CANONICAL_OUTPUT} of this checkout ({exc})"
+                    + ("" if pinned else f", or a path outside {RESERVED_PATTERN}")
+                )
         args.protocol, args.canonical = None, False  # not a measuring run: it selects no protocol
         args.explicit_data_dir = args.explicit_checkpoint_dir = None
         return args
@@ -2825,11 +2854,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if reserved(args.output) and not args.canonical:
         parser.error(f"Refusing to write the reserved {args.output.name} from a --quick or non-canonical run; "
                      f"choose a path outside {RESERVED_PATTERN}")
-    if (args.canonical or reserved(args.output)) and ".." in args.output.parts:
-        parser.error(f"Refusing parent traversal ('..') in canonical/reserved output path {args.output}")
-    if args.canonical and (args.output.is_symlink() or args.output.resolve() != CANONICAL_OUTPUT.resolve()):
-        parser.error(f"The canonical protocol writes {CANONICAL_OUTPUT} of this checkout (no symlink, no other "
-                     "checkout); change the protocol or use --quick for other paths")
+    if args.canonical:
+        try:
+            _verify_canonical_output_path(args.output)
+        except ValueError as exc:
+            parser.error(
+                f"The canonical protocol writes {CANONICAL_OUTPUT} of this checkout ({exc}); "
+                "change the protocol or use --quick for other paths"
+            )
     args.explicit_data_dir, args.explicit_checkpoint_dir = args.data_dir, args.checkpoint_dir
     if args.data_dir is None:
         args.data_dir = q.default_data_dir()
