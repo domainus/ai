@@ -4,6 +4,8 @@ import copy
 import json
 import math
 import random
+import struct
+from fractions import Fraction
 
 import pytest
 import torch
@@ -71,6 +73,10 @@ def test_model_rules_on_targeted_cases():
     assert math.copysign(1.0, one([0.0], [0.0], -0.0)) == 1.0  # an exact zero is +0
     assert math.isnan(one([math.inf], [0.0], dtype="bf16")) and math.isnan(one([math.inf, math.inf], [1.0, -1.0]))
     assert one([-math.inf], [1.0], -2.0) == -math.inf
+    # alignment floor: with C = 0 and products below 2^-133, terms still align to 2^-158
+    assert one([2.0 ** -70, -2.0 ** -80], [2.0 ** -70, 2.0 ** -78], dtype="bf16") == 2.0 ** -140 - 2.0 ** -149
+    assert one([2.0 ** -70, -2.0 ** -80], [2.0 ** -70, 2.0 ** -79], dtype="bf16") == 2.0 ** -140
+    assert one([2.0 ** -70, -2.0 ** -80], [2.0 ** -70, 2.0 ** -79], 2.0 ** -149, dtype="bf16") == 2.0 ** -140 + 2.0 ** -149
 
 
 @pytest.mark.parametrize("dtype", ["fp16", "bf16"])
@@ -97,6 +103,108 @@ def test_vectorized_diagonal_predictor_equals_the_exact_chain(dtype):
         assert mm.sm120_predict_diag(row, dtype=dtype) == exact, (k, lo)
 
 
+
+# Raw words of the 16 NaN cases (8 per operand dtype): A lanes, B lanes, C word -> 0x7fffffff.
+_WORDS = {"fp16": {"inf": 0x7C00, "snan": 0x7C01, "qnan": 0x7E00, "one": 0x3C00, "minus_one": 0xBC00},
+          "bf16": {"inf": 0x7F80, "snan": 0x7F81, "qnan": 0x7FC0, "one": 0x3F80, "minus_one": 0xBF80}}
+
+
+def _nan_cases():
+    cases = []
+    for dtype, w in _WORDS.items():
+        cases += [(dtype, "inf_x_0", [w["inf"]], [0], 0), (dtype, "inf_minus_inf", [w["inf"], w["inf"]],
+                                                            [w["one"], w["minus_one"]], 0),
+                  (dtype, "snan_a", [w["snan"]], [w["one"]], 0), (dtype, "qnan_a", [w["qnan"]], [w["one"]], 0),
+                  (dtype, "snan_b", [w["one"]], [w["snan"]], 0), (dtype, "qnan_b", [w["one"]], [w["qnan"]], 0),
+                  (dtype, "snan_c", [w["one"]], [w["one"]], 0x7F800001),
+                  (dtype, "qnan_c", [w["one"]], [w["one"]], 0x7FC00000)]
+    return cases
+
+
+NAN_CASES = _nan_cases()
+# Astra's BF16 negative-underflow witness: (-2^-80) * (+2^-80) truncates to a zero magnitude -> +0.
+UNDERFLOW_WITNESS = ("bf16", "neg_underflow", [0x9780], [0x1780], 0)
+
+
+def _raw16(words) -> torch.Tensor:
+    """16 FP16/BF16 lane words (zero padded) as int16."""
+    return torch.tensor([w - (1 << 16) if w >= 1 << 15 else w for w in words] + [0] * (16 - len(words)),
+                        dtype=torch.int16)
+
+
+def _decode(words, dtype: str) -> torch.Tensor:
+    """FP16/BF16 words -> FP64 values of the 16 lanes."""
+    return _raw16(words).view(mm.DTYPES[dtype]).double()
+
+
+def _acc(word: int) -> torch.Tensor:
+    return torch.tensor([word - (1 << 32) if word >= 1 << 31 else word], dtype=torch.int32).view(torch.float32)
+
+
+def _word32(x) -> int:
+    return struct.unpack("<I", struct.pack("<f", x))[0]
+
+
+def _model_words(dtype, a_words, b_words, c_word, device) -> list[int]:
+    """Output words of the scalar (struct and torch encodings) and batched (CPU / CUDA) models."""
+    a, b, c = _decode(a_words, dtype), _decode(b_words, dtype), _acc(c_word)
+    scalar = mm.sm120_mma_accumulate(a.tolist(), b.tolist(), c.item(), dtype=dtype)
+    words = [_word32(scalar), int(mm._bits(torch.tensor([scalar], dtype=torch.float32))[0]) & 0xFFFFFFFF]
+    for dev in ("cpu", *([device] if device else [])):
+        vector = mm.sm120_mma_batched(a[None].to(dev), b[None].to(dev), c.double().to(dev), dtype=dtype)
+        words.append(int(mm._bits(vector)[0]) & 0xFFFFFFFF)
+    return words
+
+
+def _hardware_word(dtype, a_words, b_words, c_word) -> int:
+    """One live k16 instruction on raw words: A row 0, B column 0, C[0, 0] (the loads keep every bit)."""
+    A = torch.zeros(1, 16, 16, dtype=torch.int16)
+    B = torch.zeros(1, 16, 16, dtype=torch.int16)
+    C = torch.zeros(1, 16, 16, dtype=torch.int32)
+    A[0, 0], B[0, :, 0], C[0, 0, 0] = _raw16(a_words), _raw16(b_words), _acc(c_word).view(torch.int32)[0]
+    D, _ = mm.probe_tiles(A.view(mm.DTYPES[dtype]), B.view(mm.DTYPES[dtype]), C.view(torch.float32))
+    return int(D.view(torch.int32)[0, 0, 0]) & 0xFFFFFFFF
+
+
+@pytest.mark.parametrize("case", NAN_CASES, ids=[f"{c[0]}-{c[1]}" for c in NAN_CASES])
+def test_model_nan_word_is_exactly_the_mma_nan(case):
+    dtype, _, a_words, b_words, c_word = case
+    device = "cuda" if torch.cuda.is_available() else None
+    assert _model_words(dtype, a_words, b_words, c_word, device) == [mm.NAN_BITS] * (3 + (device is not None))
+
+
+def test_model_negative_underflow_is_plus_zero():
+    dtype, _, a_words, b_words, c_word = UNDERFLOW_WITNESS
+    device = "cuda" if torch.cuda.is_available() else None
+    assert _model_words(dtype, a_words, b_words, c_word, device) == [0] * (3 + (device is not None))
+
+
+def _underflow_batch(count: int, seed: int):
+    """BF16 dots whose products and accumulators straddle the FP32 subnormal floor 2^-149, both signs."""
+    gen = torch.Generator().manual_seed(seed)
+    a = mm.normal_mantissa((count, 16), gen, -80, -66).to(torch.bfloat16).double()
+    b = mm.normal_mantissa((count, 16), gen, -80, -66).to(torch.bfloat16).double()
+    lanes = torch.rand(count, 16, generator=gen)
+    a = torch.where(lanes < 0.5, 0.0, a)  # most rows hold a few products
+    a[:count // 4, 1:] = 0.0  # a single product (the witness form)
+    acc = torch.where(torch.rand(count, generator=gen) < 0.5, 0.0, mm.normal_mantissa((count,), gen, -150, -126))
+    return a, b, acc.float().double()
+
+
+@pytest.mark.parametrize("seed", [0, 1])
+def test_model_bf16_underflow_batches_scalar_equals_batched_on_cpu_and_cuda(seed):
+    a, b, acc = _underflow_batch(2048, seed)
+    scalar = torch.tensor([mm.sm120_mma_accumulate(a[i].tolist(), b[i].tolist(), acc[i].item(), dtype="bf16")
+                           for i in range(len(a))], dtype=torch.float32)
+    cpu = mm.sm120_mma_batched(a, b, acc, dtype="bf16")
+    assert torch.equal(mm._bits(scalar), mm._bits(cpu))
+    assert int((mm._bits(cpu) == 0).sum()) > 0 and bool((cpu < 0).any())  # +0 results and negative results occur
+    assert not bool((mm._bits(cpu) == -(1 << 31)).any())  # no -0 word (0x80000000)
+    if torch.cuda.is_available():
+        cuda = mm.sm120_mma_batched(a.cuda(), b.cuda(), acc.cuda(), dtype="bf16")
+        assert torch.equal(mm._bits(cuda), mm._bits(cpu))
+
+
 # ------------------------------------------------------------------ guards and provenance
 def test_reserved_outputs_and_cli_guards(tmp_path):
     other = tmp_path / "checkout" / "results" / c5.CANONICAL_OUTPUT.name
@@ -109,9 +217,15 @@ def test_reserved_outputs_and_cli_guards(tmp_path):
     assert args.canonical and args.output == c5.CANONICAL_OUTPUT and args.protocol == c5.CANONICAL
     assert args.protocol is not c5.CANONICAL
     assert not c5.parse_args(["--quick"]).canonical
+    assert c5.parse_args(["--output", str(c5.CANONICAL_OUTPUT)]).canonical
+    real_alias = tmp_path / "real_alias.json"
+    real_alias.symlink_to(c5.CANONICAL_OUTPUT)
     for argv in (["--quick", "--output", str(c5.CANONICAL_OUTPUT)], ["--quick", "--output", str(alias)],
                  ["--quick", "--output", str(novel)], ["--output", str(tmp_path / "custom.json")],
-                 ["--output", str(novel)]):
+                 ["--output", str(novel)],
+                 ["--output", str(other)],  # the canonical basename in another checkout
+                 ["--output", str(alias)],  # a symlink to it
+                 ["--output", str(real_alias)]):  # a symlink to this checkout's canonical file
         with pytest.raises(SystemExit):
             c5.parse_args(argv)
 
@@ -194,6 +308,163 @@ def test_chunked_syrk_is_symmetric_sync_free_and_rejects_overflowing_strides():
         kbw._syrk_chunked(big, torch.empty(1, 2, 2, device=device))
 
 
+# ------------------------------------------------------------------ single rounding FP64 -> FP16 / BF16 / FP32
+_FORMATS = {torch.float16: (10, -14, 15, 16), torch.bfloat16: (7, -126, 127, 16), torch.float32: (23, -126, 127, 32)}
+
+
+def _round_once(x: float, dtype: torch.dtype) -> int | None:
+    """Independent oracle: the IEEE-754 round-to-nearest-even word of ``x`` (None for NaN), with Fraction."""
+    p, emin, emax, width = _FORMATS[dtype]
+    sign = 1 << (width - 1) if math.copysign(1.0, x) < 0 else 0
+    inf = ((1 << (width - 1 - p)) - 1) << p
+    if math.isnan(x):
+        return None
+    if math.isinf(x):
+        return sign | inf
+    f = abs(Fraction(x))
+    if f == 0:
+        return sign
+    quantum = Fraction(2) ** (max(math.frexp(abs(x))[1] - 1, emin) - p)
+    value = round(f / quantum) * quantum  # Fraction.__round__ rounds half to even
+    if value == 0:
+        return sign
+    if value >= Fraction(2) ** (emax + 1):
+        return sign | inf
+    e = math.frexp(float(value))[1] - 1
+    if e < emin:
+        return sign | int(value / Fraction(2) ** (emin - p))
+    return sign | ((e + 1 - emin) << p) | (int(value / Fraction(2) ** (e - p)) - (1 << p))
+
+
+_SINGLE_ROUND_CASES = [
+    # Astra's K = 65,537 witnesses (FP16, BF16, FP32) and their negatives
+    1 + 2 ** -11 + 2 ** -26, 1 + 2 ** -8 + 2 ** -26, 1 + 2 ** -24 + 2 ** -48,
+    # exact ties: to even, both directions
+    1 + 2 ** -11, 1 + 3 * 2 ** -11, 1 + 2 ** -8, 1 + 3 * 2 ** -8, 1 + 2 ** -24, 1 + 3 * 2 ** -24,
+    # subnormal midpoints and their successors (FP16 2^-25, BF16 / FP32 2^-134, 2^-150)
+    2 ** -25, 2 ** -25 + 2 ** -60, 3 * 2 ** -25, 2 ** -134, 2 ** -134 + 2 ** -170, 3 * 2 ** -134, 2 ** -150,
+    2 ** -150 + 2 ** -200,
+    # largest subnormal + half a quantum: carry into the smallest normal
+    1023.5 * 2 ** -24, 127.5 * 2 ** -133, 1023.25 * 2 ** -24, 2 ** -14 * (1 - 2 ** -12),
+    # overflow boundaries
+    65504.0, 65519.99, 65520.0, 65536.0, (2 - 2 ** -7) * 2 ** 127, (2 - 2 ** -8) * 2 ** 127,
+    math.nextafter((2 - 2 ** -8) * 2 ** 127, 0), (2 - 2 ** -24) * 2 ** 127, 1e300, 5e-324,
+    0.0, math.inf, math.nan,
+]
+
+
+def _random_fp64(count: int, seed: int) -> list[float]:
+    """Random FP64 words over every destination range, plus values one FP64 ulp around destination midpoints."""
+    gen = torch.Generator().manual_seed(seed)
+    words = torch.randint(-(1 << 63), (1 << 63) - 1, (count,), generator=gen, dtype=torch.int64)
+    exponent = torch.randint(1023 - 160, 1023 + 140, (count,), generator=gen, dtype=torch.int64)
+    words[: count * 9 // 10] = (words[: count * 9 // 10] & ~(0x7FF << 52)) | (exponent[: count * 9 // 10] << 52)
+    values = words.view(torch.float64).tolist()  # the last tenth: fully random words (NaN, inf, subnormal)
+    for dtype, (p, emin, _, _) in _FORMATS.items():
+        base = torch.randn(count // 10, generator=gen, dtype=torch.float64) * torch.exp2(
+            torch.randint(emin - p - 2, 18, (count // 10,), generator=gen).double())
+        for v in base.to(dtype).double().tolist():
+            if math.isfinite(v) and v != 0:
+                half = 2.0 ** (max(math.frexp(abs(v))[1] - 1, emin) - p - 1)
+                mid = v + math.copysign(half, v)
+                values += [mid, math.nextafter(mid, math.inf), math.nextafter(mid, -math.inf)]
+    return values
+
+
+def _store_words(values: list[float], dtype: torch.dtype) -> list[int]:
+    src = torch.tensor(values, dtype=torch.float64, device="cuda")
+    out = torch.empty(len(values), dtype=dtype, device="cuda")
+    kbw._store_fp64_single_round(src, out)
+    mask = (1 << _FORMATS[dtype][3]) - 1
+    return [w & mask for w in out.view(torch.int16 if dtype != torch.float32 else torch.int32).tolist()]
+
+
+@needs_sm120
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_store_fp64_single_round_equals_a_fraction_oracle(dtype):
+    values = [*_SINGLE_ROUND_CASES, *(-v for v in _SINGLE_ROUND_CASES), *_random_fp64(12000, 5)]
+    assert len(values) >= 10_000
+    words = _store_words(values, dtype)
+    qnan = {torch.float16: 0x7E00, torch.bfloat16: 0x7FC0}.get(dtype)
+    for x, word in zip(values, words):
+        expected = _round_once(x, dtype)
+        if expected is None:  # NaN: the quiet NaN of FP16 / BF16, any NaN for the FP32 conversion
+            assert word == qnan if qnan else math.isnan(struct.unpack("<f", struct.pack("<I", word))[0]), hex(word)
+        else:
+            assert word == expected, (x.hex(), hex(word), hex(expected))
+    finite = [x for x in values if not math.isnan(x)]
+    signbit = 1 << (_FORMATS[dtype][3] - 1)
+    assert [w ^ signbit for w in _store_words(finite, dtype)] == _store_words([-x for x in finite], dtype)
+
+
+@needs_sm120
+def test_store_fp64_single_round_astra_witness_words():
+    for dtype, x, words in ((torch.float16, 1 + 2 ** -11 + 2 ** -26, (0x3C01, 0xBC01)),
+                            (torch.bfloat16, 1 + 2 ** -8 + 2 ** -26, (0x3F81, 0xBF81)),
+                            (torch.float32, 1 + 2 ** -24 + 2 ** -48, (0x3F800001, 0xBF800001))):
+        assert tuple(_store_words([x, -x], dtype)) == words
+    assert _store_words([2 ** -25, 2 ** -25 + 2 ** -60, -2 ** -25], torch.float16) == [0x0000, 0x0001, 0x8000]
+    assert _store_words([2 ** -134, 2 ** -134 + 2 ** -170], torch.bfloat16) == [0x0000, 0x0001]
+    assert _store_words([1023.5 * 2 ** -24, 65520.0, -65520.0], torch.float16) == [0x0400, 0x7C00, 0xFC00]
+    assert _store_words([math.nan, -math.nan, math.inf, -math.inf, 0.0, -0.0], torch.bfloat16) == \
+        [0x7FC0, 0x7FC0, 0x7F80, 0xFF80, 0x0000, 0x8000]
+
+
+@needs_sm120
+@pytest.mark.parametrize("out_dtype, lanes, words", [
+    (torch.float16, [1.0, 2 ** -6, 2 ** -6, 2 ** -13], (0x3C01, 0xBC01)),
+    (torch.bfloat16, [1.0, 2 ** -4, 2 ** -13], (0x3F81, 0xBF81)),
+    (torch.float32, [1.0, 2 ** -12, 2 ** -24], (0x3F800001, 0xBF800001)),
+])
+def test_chunked_syrk_rounds_the_fp64_sum_once(out_dtype, lanes, words):
+    """Astra's K = 65,537 witness: one product per chunk, the FP64 sum just above a destination midpoint."""
+    row = torch.zeros(65537, dtype=torch.float64)
+    for i, v in enumerate(lanes):
+        row[4096 * i] = v
+    X = torch.stack([row, -row]).half().cuda()
+    width = torch.int16 if out_dtype != torch.float32 else torch.int32
+    mask = 0xFFFF if out_dtype != torch.float32 else 0xFFFFFFFF
+    positive, negative = words
+    for gram in (kbw.triton_syrk(X, out_dtype), kbw.triton_syrk(X.T.contiguous().T, out_dtype)):
+        assert [[w & mask for w in r] for r in gram.view(width).tolist()] == [[positive, negative],
+                                                                              [negative, positive]]
+    G = c5._input([4, 65537], 3, torch.device("cuda"))  # the historical hook rounds the same way
+    for kernel in c5.KERNELS:
+        call = c5.circuit(kernel, "bf16")
+        assert c5.bit_equal(call(G), c5._chunked_reference(call, G))
+
+
+@needs_sm120
+def test_chunked_syrk_caps_programs_per_launch_at_grid_y_and_max_bytes():
+    device = torch.device("cuda")
+    sizes = []
+
+    def record(kernel, grid, *args):
+        sizes.append(args[0].shape[0])
+        kbw._direct_launch(kernel, grid, *args)
+
+    X = torch.ones(1, 1 << 28, dtype=torch.float16, device=device)  # 512 MiB: 65,536 chunks
+    out = torch.empty(1, 1, 1, dtype=torch.float32, device=device)
+    kbw._syrk_chunked(X[None], out, record)
+    assert sizes == [65535, 1] and out.item() == 268435456.0
+    assert kbw.triton_syrk(X, torch.float32).item() == 268435456.0  # the public API on a contiguous input
+    del X, out
+    torch.cuda.empty_cache()
+    gen = torch.Generator().manual_seed(9)
+    X = torch.randint(-2, 3, (256, 70000), generator=gen).half()  # integer Gram: every partial and sum exact
+    exact = (X.double() @ X.double().T).float()
+    view = X.cuda()[None]
+    capped = torch.empty(1, 256, 256, dtype=torch.float32, device=device)
+    sizes.clear()
+    kbw._syrk_chunked(view, capped, record, max_bytes=1 << 20)  # 4 chunk Gram matrices per launch
+    assert sizes == [4, 4, 4, 4, 1, 1]  # 17 chunks, then the 368-column remainder
+    default = torch.empty_like(capped)
+    sizes.clear()
+    kbw._syrk_chunked(view, default, record)
+    assert sizes == [17, 1]
+    assert c5.bit_equal(capped[0].cpu(), exact) and c5.bit_equal(default, capped)
+
+
 @needs_sm120
 def test_long_k_circuits_equal_the_audited_chunked_gram_and_replay_in_graphs():
     device = torch.device("cuda")
@@ -213,11 +484,53 @@ def test_long_k_circuits_equal_the_audited_chunked_gram_and_replay_in_graphs():
 @needs_sm120
 def test_c4_03_chunked_gram_still_hooks_the_long_k_launches():
     G = c5._input([4, 1 << 17], 0, torch.device("cuda"))
-    mitigation = c3.ChunkedGram(4096, 65536)
-    with mitigation.patched():
-        assert ssb.SYRK_CHUNK_GATE == 1 << 60
-        c3.kernel_call("ss3_54", "fp16")(G)
-    assert mitigation.launches > 0 and ssb.SYRK_CHUNK_GATE == 65536
+    for kernel in ("ps3_55", "ss3_54"):
+        mitigation = c3.ChunkedGram(4096, 65536)
+        with mitigation.patched():
+            assert psb.SYRK_CHUNK_GATE == ssb.SYRK_CHUNK_GATE == 1 << 60
+            c3.kernel_call(kernel, "fp16")(G)
+        assert mitigation.launches > 0 and psb.SYRK_CHUNK_GATE == ssb.SYRK_CHUNK_GATE == 65536
+
+
+@needs_sm120
+def test_c4_03_hook_honors_a_custom_gate_above_65536():
+    """``ChunkedGram(4096, 131072)`` at K = 100,000: the single unchunked launch on both circuits."""
+    G = c5._input([4, 100000], 983, torch.device("cuda"))
+    gram, launch = psb._gram, ssb._launch
+    for kernel in ("ps3_55", "ss3_54"):
+        call = c5.circuit(kernel, "fp16")
+        with c5.ungated():
+            single = call(G)
+        mitigation = c3.ChunkedGram(4096, 131072)
+        with mitigation.patched():
+            assert psb.SYRK_CHUNK_GATE == ssb.SYRK_CHUNK_GATE == 1 << 60
+            hooked = call(G)
+        assert mitigation.launches == 0 and c5.bit_equal(hooked, single), kernel
+        assert not c5.bit_equal(call(G), single)  # the native path chunks above 65,536
+        assert psb.SYRK_CHUNK_GATE == ssb.SYRK_CHUNK_GATE == 65536
+    with pytest.raises(RuntimeError, match="inside the hook"):
+        with c3.ChunkedGram(4096, 131072).patched():
+            raise RuntimeError("inside the hook")
+    assert psb.SYRK_CHUNK_GATE == ssb.SYRK_CHUNK_GATE == 65536
+    assert psb._gram is gram and ssb._launch is launch
+
+
+@needs_sm120
+def test_graph_equality_replays_both_graphs_before_comparing():
+    def capture(value):
+        out = torch.zeros(4, device="cuda")
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out.fill_(value)
+        return graph, out
+
+    divergent = {"native": capture(1.0), "control": capture(2.0)}
+    assert c5.bit_equal(divergent["native"][1], divergent["control"][1])  # captured, not yet run: both zero
+    assert not c5.graphs_bitwise_equal(divergent, torch.ones(4, device="cuda"))
+    assert divergent["native"][1].tolist() == [1.0] * 4 and divergent["control"][1].tolist() == [2.0] * 4
+    same = {"native": capture(1.0), "control": capture(1.0)}
+    assert c5.graphs_bitwise_equal(same, torch.ones(4, device="cuda"))
+    assert not c5.graphs_bitwise_equal(same, torch.full((4,), 2.0, device="cuda"))  # both differ from eager
 
 
 @needs_sm120
@@ -239,6 +552,23 @@ def test_live_mma_matches_the_model_on_witnesses_and_random_dots():
         for bk in (16, 128):
             measured, _ = mm.probe_dots(a, a, dtype=dtype, bk=bk)
             assert torch.equal(mm._bits(measured), mm._bits(mm.sm120_mma_batched(a, a, dtype=dtype)))
+
+
+@needs_sm120
+def test_live_mma_raw_words_of_nan_and_underflow_cases_equal_the_model():
+    for dtype, name, a_words, b_words, c_word in (*NAN_CASES, UNDERFLOW_WITNESS):
+        expected = 0 if name == "neg_underflow" else mm.NAN_BITS
+        assert _hardware_word(dtype, a_words, b_words, c_word) == expected, (dtype, name)
+        assert _model_words(dtype, a_words, b_words, c_word, "cuda") == [expected] * 4, (dtype, name)
+    for seed in (0, 1):
+        a, b, acc = _underflow_batch(2048, seed)
+        measured, _ = mm.probe_dots(a, b, acc, dtype="bf16")
+        assert torch.equal(mm._bits(measured), mm._bits(mm.sm120_mma_batched(a, b, acc, dtype="bf16")))
+        assert torch.equal(mm._bits(measured), mm._bits(mm.sm120_mma_batched(a.cuda(), b.cuda(), acc.cuda(),
+                                                                            dtype="bf16")))
+        scalar = torch.tensor([mm.sm120_mma_accumulate(a[i].tolist(), b[i].tolist(), acc[i].item(), dtype="bf16")
+                               for i in range(256)], dtype=torch.float32)
+        assert torch.equal(mm._bits(measured[:256]), mm._bits(scalar))
 
 
 # ------------------------------------------------------------------ the driver
@@ -277,6 +607,67 @@ def _tamper_checks(payload, canonical):
     ):
         with pytest.raises(ValueError):
             c5.validate_results(edited, canonical=canonical)
+    for edit, match in _structural_probes(canonical):
+        with pytest.raises(ValueError, match=match):
+            c5.validate_results(_rederived(payload, edit), canonical=canonical)
+
+
+def _rederived(payload, edit):
+    """``payload`` after ``edit``, with ``derived`` recomputed so only the probed check can fail."""
+    payload = copy.deepcopy(payload)
+    edit(payload)
+    payload["derived"] = json.loads(json.dumps(c5.derive(payload), allow_nan=False))
+    return payload
+
+
+def _set(path, value):
+    def edit(payload):
+        node = payload
+        for key in path[:-1]:
+            node = node[key]
+        node[path[-1]] = value
+    return edit
+
+
+def _mma_mismatch(payload):
+    record = next(r for r in payload["mma"]["stress"] if r["bit_matches"] == r["cases"])
+    record["bit_matches"] -= 1
+    record["mismatches"] = [{"index": 0, "hardware": "0x1.0p+0", "model": "0x1.000002p+0"}]
+
+
+def _structural_probes(canonical):
+    """Astra's validator bypasses (C5-01 audit): each must now be rejected."""
+    probes = [
+        (_set(["timing", "cells", 0, "dtype"], "fp64"), "dtype differs"),
+        (lambda p: p["long_k"]["opus_l6"].pop(), "opus_l6 rows"),
+        (_set(["long_k", "opus_l6", 0, "shape"], [2, 16]), "opus_l6 rows"),
+        (_set(["long_k", "opus_l6", 0, "dtype"], "fp64"), "opus_l6 rows"),
+        (_set(["long_k", "grid", 0, "shape"], [0, 0]), "shape differs"),
+        (lambda p: p["long_k"]["syrk"].pop(), "syrk rows"),
+        (lambda p: p["long_k"]["boundaries"].pop(0), "boundaries rows"),
+        (lambda p: p["long_k"]["inputs"].pop(), "inputs rows"),
+        (_set(["long_k", "graphs", 0, "shape"], [2, 16]), "graphs rows"),
+    ]
+    if canonical:
+        probes += [
+            (_mma_mismatch, "promotion: mma all_dot_products"),
+            (_set(["mma", "edge_cases", 0, "model_equals_hardware"], False), "promotion: mma edge_cases"),
+            (_set(["mma", "edge_cases", 0, "vectorized_equals_hardware"], False), "promotion: mma edge_cases"),
+            (_set(["mma", "witnesses", 0, "configs_equal_hardware"], False), "promotion: mma witnesses"),
+            (_set(["mma", "syrk_configs", 0, "fused_store_matches"], 0), "promotion: mma syrk_fused_store"),
+            (lambda p: p["meta"]["code_modules"].append("research.polar_opt.bogus"), "code_modules"),
+            (lambda p: p["meta"]["code_modules"].append(p["meta"]["code_modules"][0]), "code_modules"),
+            (_set(["timing", "cells", 0, "outputs_bitwise_equal"], False), "timing cell's outputs"),
+            (_set(["long_k", "graphs", 0, "bitwise_equal"], False), "promotion: long_k graphs_bitwise"),
+            (_set(["long_k", "syrk", 0, "symmetric"], False), "promotion: long_k syrk_symmetric"),
+            (_set(["long_k", "syrk", 0, "sync_free"], False), "promotion: long_k syrk_sync_free"),
+            (_set(["long_k", "inputs", 0, "bitwise_equal_c4_03"], False), "promotion: long_k inputs_bitwise_c4_03"),
+            (_set(["long_k", "opus_l6", 0, "bitwise_equal_c4_03"], False), "promotion: long_k opus_l6_bitwise_c4_03"),
+            (_set(["long_k", "boundaries", 0, "bitwise_equal_reference"], False),
+             "promotion: long_k boundaries_bitwise_reference"),
+            (_set(["long_k", "opus_l6", 0, "native", "sigma_max"], 2.0), "Opus L6 cell exceeds"),
+        ]
+    return probes
 
 
 def test_quick_driver_payload_is_valid_and_rejects_tampering(quick):
@@ -302,3 +693,7 @@ def test_committed_canonical_artifact():
     assert d["long_k"]["grid_cells"] == 654 and d["long_k"]["grid_above_design_ceiling"] == 0
     assert d["long_k"]["graphs_max_abs_diff"] == 0.0
     assert d["mma"]["all_dot_products"][1] >= 50_000
+    assert d["mma"]["all_dot_products"][0] == d["mma"]["all_dot_products"][1]
+    assert d["mma"]["edge_cases"][0] == d["mma"]["edge_cases"][1]
+    assert d["timing"]["outputs_bitwise_equal"] == d["timing"]["cells"]
+    assert all(len(r["samples"]) == 4 for r in payload["long_k"]["opus_l6"])

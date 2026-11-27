@@ -10,8 +10,10 @@ One run writes one strict JSON file (``allow_nan=False``) with five sections:
   every SYRK is the single pre-C5-01 launch). Both variants share the compiled kernels, so the
   comparison isolates the gate. Per round: a 4 x L2 (268 MB) flush, both variants in the
   Williams order of the round (AB, BA, AB, ...), CUDA events (``gpu``) and the host clock
-  between two synchronizes (``wall``), for CUDA-graph replay and for eager calls. Every raw
-  sample is stored; ``validate_results`` recomputes medians, ratios and paired 95% CIs.
+  between two synchronizes (``wall``), for CUDA-graph replay and for eager calls. A graph cell's
+  ``outputs_bitwise_equal`` is taken after both graphs replay, against a fresh eager call. Every
+  raw sample is stored; ``validate_results`` recomputes medians, ratios and paired 95% CIs and
+  checks the identity of every recorded cell against the protocol.
 * ``long_k``: invariants of the chunked path (bitwise symmetry, no host synchronization,
   CUDA-graph replay equal to eager, gate boundaries, tall/batched/degenerate inputs,
   ``sigma_hat`` and ``scaling="frobenius"``, bitwise equality with the audited C4-03
@@ -70,7 +72,7 @@ from research.quant_ptq import micro_rotated_ptq as q
 
 ROOT = Path(__file__).resolve().parents[2]
 RESULTS = ROOT / "results"
-SCHEMA_VERSION = "cycle5_c5_01.v1"
+SCHEMA_VERSION = "cycle5_c5_01.v2"
 TASK = ("Cycle 5 C5-01: zero-regression native K > 65536 chunked SYRK in the production Blackwell kernels and "
         "the exact sm_120 Tensor-Core MMA rounding model on the RTX 5080")
 CANONICAL_OUTPUT = RESULTS / "cycle5_c5_01_syrk_and_mma.json"
@@ -98,7 +100,7 @@ CANONICAL = {
         "boundaries": [65535, 65536, 65537, 69632, 69633, 100000], "boundary_rows": 4,
         "graph_shapes": [[4, 131072], [4, 1 << 20]], "symmetry_shapes": [[4, 131072], [3, 5, 100000], [100000, 6]],
         "shapes": [[100000, 4], [3, 4, 100000], [3, 100000, 4], [2, 3, 200000]],
-        "opus_shapes": OPUS_SHAPES, "opus_reps": 3, "opus_seed": 0,
+        "opus_shapes": OPUS_SHAPES, "opus_reps": 4, "opus_seed": 0,  # even: AB, BA, AB, BA
         "opus_control_pin": c3.PIN_CONFIG,
         "grid_families": c3.CANONICAL["drift"]["families"], "ceiling": c3.DESIGN_CEILING},
     "mma": {"stress_seed": 2026, "stress_dots": 4096, "scalar_crosscheck": 512, "chain_dots": 512,
@@ -397,6 +399,19 @@ def _graph(call, G: Tensor, variant: str):
     return graph, out
 
 
+def graphs_bitwise_equal(graphs: dict, eager: Tensor) -> bool:
+    """Replay every captured graph, synchronize, then compare their outputs with each other and ``eager``.
+
+    ``graphs`` maps a variant to ``(CUDAGraph, output)``. Capture records the work without running
+    it, so the output buffers hold nothing meaningful until the first replay.
+    """
+    for graph, _ in graphs.values():
+        graph.replay()
+    torch.cuda.synchronize()
+    outputs = [out for _, out in graphs.values()]
+    return all(bit_equal(out, eager) for out in outputs)
+
+
 def timing(protocol: dict, device: torch.device, log) -> dict:
     spec = protocol["timing"]
     properties = torch.cuda.get_device_properties(device)
@@ -410,7 +425,7 @@ def timing(protocol: dict, device: torch.device, log) -> dict:
                 if mode == "graph":
                     graphs = {v: _graph(call, G, v) for v in VARIANTS}
                     runs = {v: graphs[v][0].replay for v in VARIANTS}
-                    equal = bit_equal(graphs["native"][1], graphs["control"][1])
+                    equal = graphs_bitwise_equal(graphs, call(G))  # both replays equal a fresh eager call
                 else:
                     runs = {v: functools.partial(call, G) for v in VARIANTS}
                     with ungated():
@@ -527,15 +542,25 @@ def _boundaries(protocol: dict, device: torch.device, legacy: dict) -> list[dict
     return rows
 
 
+def _input_case_specs(protocol: dict) -> list[tuple]:
+    """(name, shape, special, options) of every ``_inputs_cases`` input."""
+    cases = [(f"shape {s}", s, None, {}) for s in protocol["long_k"]["shapes"]]
+    k = protocol["long_k"]["shapes"][0][0]
+    return cases + [("mixed batch: normal, zero, tiny, NaN, inf", [5, 4, k], "mixed", {}),
+                    ("sigma_hat", [2, 4, k], None, {"sigma_hat": 0.9}),
+                    ("scaling frobenius", [2, 4, k], None, {"scaling": "frobenius"})]
+
+
+def _input_case_cells(protocol: dict) -> list[tuple]:
+    """(case, shape, kernel, dtype) of every ``_inputs_cases`` row, in order."""
+    return [(name, shape, kernel, dtype) for name, shape, _, options in _input_case_specs(protocol)
+            for kernel in protocol["kernels"] if not (options and kernel == "ps3_55") for dtype in protocol["dtypes"]]
+
+
 def _inputs_cases(protocol: dict, device: torch.device) -> list[dict]:
     """Tall, batched, degenerate (zero, tiny, non-finite) and explicit-scale inputs above the gate."""
     rows = []
-    cases = [(f"shape {s}", s, None, {}) for s in protocol["long_k"]["shapes"]]
-    k = protocol["long_k"]["shapes"][0][0]
-    cases += [("mixed batch: normal, zero, tiny, NaN, inf", [5, 4, k], "mixed", {}),
-              ("sigma_hat", [2, 4, k], None, {"sigma_hat": 0.9}),
-              ("scaling frobenius", [2, 4, k], None, {"scaling": "frobenius"})]
-    for name, shape, special, options in cases:
+    for name, shape, special, options in _input_case_specs(protocol):
         G = _input(shape, 11, device)
         if special == "mixed":
             G[1] = 0.0
@@ -840,6 +865,8 @@ def _validate_timing(payload: dict) -> None:
              "the L2 flush must be flush_l2_multiple x L2")
     for c in cells:
         where = f"timing {c['mode']} {c['kernel']} {c['shape']}"
+        _require(c["dtype"] == spec["dtype"], f"{where}: dtype differs from the protocol")
+        _require(isinstance(c["outputs_bitwise_equal"], bool), f"{where}: outputs_bitwise_equal must be a bool")
         _require(len(c["rounds"]) == spec["rounds"], f"{where}: round count differs")
         for i, r in enumerate(c["rounds"]):
             _require(r["round"] == i and r["order"] == williams_order(i), f"{where}: round {i} order differs")
@@ -852,6 +879,25 @@ def _validate_long_k(payload: dict) -> None:
     lk, protocol = payload["long_k"], payload["protocol"]
     spec = protocol["long_k"]
     design = c3.design_ceilings(list(protocol["kernels"]))
+    kernels, dtypes = protocol["kernels"], protocol["dtypes"]
+    out_dtypes = {d: str(mm.DTYPES[d]).replace("torch.", "") for d in dtypes}
+    identities = {
+        "syrk": ([(r["shape"], r["dtype"], r["out_dtype"]) for r in lk["syrk"]],
+                 [(s, d, o) for s in spec["symmetry_shapes"] for d in dtypes for o in (out_dtypes[d], "float32")]),
+        "boundaries": ([(r["k"], r["shape"], r["kernel"], r["dtype"], r["chunked"], r["reference"])
+                        for r in lk["boundaries"]],
+                       [(k, [spec["boundary_rows"], k] if o == "wide" else [k, 3], kn, d, k > protocol["gate"],
+                         "c4_03_chunked_gram" if k > protocol["gate"] else "legacy")
+                        for k in spec["boundaries"] for o in ("wide", "tall") for kn in kernels for d in dtypes]),
+        "inputs": ([(r["case"], r["shape"], r["kernel"], r["dtype"]) for r in lk["inputs"]],
+                   _input_case_cells(protocol)),
+        "graphs": ([(r["shape"], r["kernel"], r["dtype"]) for r in lk["graphs"]],
+                   [(s, kn, d) for s in spec["graph_shapes"] for kn in kernels for d in dtypes]),
+        "opus_l6": ([(r["shape"], r["kernel"], r["dtype"]) for r in lk["opus_l6"]],
+                    [(s, kn, d) for s in spec["opus_shapes"] for kn in kernels for d in dtypes]),
+    }
+    for name, (recorded, expected) in identities.items():
+        _require(recorded == expected, f"long_k {name} rows differ from the protocol")
     for r in lk["opus_l6"]:
         where = f"opus_l6 {r['shape']} {r['kernel']} {r['dtype']}"
         _require(len(r["samples"]) == spec["opus_reps"], f"{where}: sample count differs")
@@ -866,6 +912,9 @@ def _validate_long_k(payload: dict) -> None:
              "grid rows differ from the protocol families")
     names = {f"{k}_{d}" for k in protocol["kernels"] for d in protocol["dtypes"]}
     for r in lk["grid"]:
+        fam = spec["grid_families"][r["family"]]
+        shape = [fam["n"], r["k"]] if fam["orientation"] == "wide" else [r["k"], fam["n"]]
+        _require(r["n"] == fam["n"] and r["shape"] == shape, f"grid {r['family']} 2^{r['k_exponent']}: shape differs")
         _require(set(r["cells"]) == names, f"grid {r['family']} 2^{r['k_exponent']}: kernel cells differ")
         _require(r["chunked"] == (r["k"] > protocol["gate"]) and r["k"] == 1 << r["k_exponent"], "grid chunk flag")
         for name, c in r["cells"].items():
@@ -921,6 +970,9 @@ def validate_results(payload: dict, *, canonical: bool | None = None) -> None:
                  "canonical results need a 40-hex git_sha and a clean tree")
         _require(list(env["capability"]) >= [12, 0], "a canonical result needs an sm_120+ CUDA device")
         _require(protocol == CANONICAL, "protocol differs from the canonical protocol")
+        modules = meta["code_modules"]
+        _require(len(set(modules)) == len(modules) and all(m.startswith("research.") for m in modules)
+                 and modules == list(code_modules()), "code_modules differ from the static import closure")
     zr = payload["zero_regression"]
     spec = protocol["zero_regression"]
     expected = [(s, seed, k, d) for s in spec["shapes"] for seed in spec["seeds"]
@@ -938,6 +990,16 @@ def validate_results(payload: dict, *, canonical: bool | None = None) -> None:
         _require(d["zero_regression"]["launches_equal"] == d["zero_regression"]["launch_cells"]
                  and d["zero_regression"]["launches_at_512x2048"] == spec["launch_expected"], "launch counts differ")
         _require(d["long_k"]["grid_above_design_ceiling"] == 0, "a chunked cell exceeds its own design ceiling")
+        _require(d["timing"]["outputs_bitwise_equal"] == d["timing"]["cells"], "a timing cell's outputs differ")
+        _require(d["long_k"]["opus_l6_native_above_design"] == 0, "an Opus L6 cell exceeds its own design ceiling")
+        m = d["mma"]
+        _require(m["all_dot_products"][0] == m["all_dot_products"][1] > 0, "promotion: mma all_dot_products")
+        for key in ("witnesses", "witness_permutations", "exponent_table", "edge_cases", "syrk_fused_store",
+                    "audit_seed719_fused_store", "scalar_crosscheck"):
+            _require(m[key][0] == m[key][1], f"promotion: mma {key}")
+        for key in ("syrk_symmetric", "syrk_sync_free", "graphs_bitwise", "boundaries_bitwise_reference",
+                    "inputs_bitwise_c4_03", "opus_l6_bitwise_c4_03"):
+            _require(d["long_k"][key][0] == d["long_k"][key][1], f"promotion: long_k {key}")
 
 
 # ======================================================================================
@@ -955,8 +1017,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if reserved(args.output) and (args.quick or args.output.resolve().name != CANONICAL_OUTPUT.name):
         parser.error(f"Refusing to write the reserved {args.output.name} from a --quick run; "
                      f"choose a path outside {RESERVED_PATTERN}")
-    if args.canonical and not reserved(args.output):
-        parser.error(f"The canonical protocol writes {CANONICAL_OUTPUT.name}; use --quick for other paths")
+    if args.canonical and (args.output.is_symlink() or args.output.resolve() != CANONICAL_OUTPUT.resolve()):
+        parser.error(f"The canonical protocol writes {CANONICAL_OUTPUT} of this checkout (no symlink); "
+                     "use --quick for other paths")
     args.protocol = copy.deepcopy(QUICK if args.quick else CANONICAL)
     return args
 

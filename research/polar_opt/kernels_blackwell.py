@@ -212,12 +212,70 @@ def _tri_grid(N: int, B: int):
 SYRK_CHUNK_GATE = 65536  # K above this is chunked
 SYRK_CHUNK_SIZE = 4096  # columns per chunk: the FP32 accumulation length of one partial
 SYRK_CHUNK_MAX_BYTES = 1 << 28  # FP32 partial Gram matrices per launch: at most 256 MiB
+_MAX_GRID_Y = 65535  # CUDA limit of gridDim.y: one chunk Gram matrix per grid-y program
 _INT32_LIMIT = 1 << 31
 _MAX_BK = max(config.kwargs["BK"] for config in _CONFIGS)
 
 
 def _direct_launch(kernel, grid, *args):
     kernel[grid](*args)
+
+
+@triton.jit
+def _cast_fp64_to_half_rn_kernel(src_ptr, dst_ptr, numel, IS_BF16: tl.constexpr, BLOCK: tl.constexpr):
+    """dst = src rounded once to nearest even, from FP64 bits (int64 view) to FP16 / BF16 bits (int16 view).
+
+    Integer arithmetic on the raw words, so there is no intermediate FP32 rounding. ``sig`` is the
+    53-bit significand, ``e`` the unbiased exponent (FP64 subnormals use -1022). The result in units
+    of the destination quantum is ``sig >> shift``, rounded on the dropped bits; ``shift`` grows by
+    ``EMIN - e`` below the smallest normal and is clamped at 54, where every dropped value is below
+    half a quantum (shifts stay in [42, 54], so they are defined for 64-bit words). Adding the
+    rounded significand to ``(e - EMIN) << P`` lets a carry move into the next binade, from the
+    largest subnormal into the smallest normal, and from the largest finite value into infinity
+    (clamped to the infinity word). NaN becomes the quiet NaN of the destination.
+    """
+    P: tl.constexpr = 7 if IS_BF16 else 10  # stored significand bits
+    EMIN: tl.constexpr = -126 if IS_BF16 else -14  # smallest normal exponent
+    INF: tl.constexpr = 0x7F80 if IS_BF16 else 0x7C00
+    QNAN: tl.constexpr = 0x7FC0 if IS_BF16 else 0x7E00
+    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < numel
+    bits = tl.load(src_ptr + offs, mask=mask, other=0).to(tl.uint64, bitcast=True)
+    sign = (bits >> 63) << 15
+    field = (bits >> 52) & 0x7FF
+    frac = bits & 0xFFFFFFFFFFFFF
+    sig = tl.where(field != 0, frac | 0x10000000000000, frac)
+    e = tl.maximum(field.to(tl.int64), 1) - 1023
+    shift = tl.minimum(52 - P + tl.maximum(EMIN - e, 0), 54).to(tl.uint64)
+    one = tl.full([BLOCK], 1, tl.uint64)
+    kept = sig >> shift
+    dropped = sig & ((one << shift) - 1)
+    half = one << (shift - 1)
+    up = (dropped > half) | ((dropped == half) & ((kept & 1) == 1))
+    magnitude = (tl.maximum(e - EMIN, 0).to(tl.uint64) << P) + kept + up.to(tl.uint64)
+    magnitude = tl.minimum(magnitude, INF)
+    word = tl.where(field == 0x7FF, tl.where(frac != 0, QNAN, sign | INF), sign | magnitude)
+    tl.store(dst_ptr + offs, word.to(tl.uint16).to(tl.int16, bitcast=True), mask=mask)
+
+
+def _store_fp64_single_round(src: torch.Tensor, out: torch.Tensor) -> None:
+    """Write the FP64 tensor ``src`` into ``out`` (same shape) with one IEEE-754 round to nearest even.
+
+    PyTorch's CUDA ``copy_`` from FP64 to FP16 / BF16 rounds through FP32 (double rounding), so the
+    two half formats use ``_cast_fp64_to_half_rn_kernel``; FP32 is a direct conversion. No host
+    synchronization: the call is CUDA-graph capturable.
+    """
+    if out.dtype == torch.float32:
+        out.copy_(src)
+        return
+    if out.dtype not in _HALF or src.dtype != torch.float64 or src.shape != out.shape or not out.is_contiguous():
+        raise ValueError("need an FP64 source and a contiguous FP16 / BF16 output of the same shape")
+    src = src.contiguous()
+    numel = src.numel()
+    if numel:
+        block = 1024
+        _cast_fp64_to_half_rn_kernel[(triton.cdiv(numel, block),)](
+            src.view(torch.int64), out.view(torch.int16), numel, IS_BF16=out.dtype == torch.bfloat16, BLOCK=block)
 
 
 def _syrk_chunked(view: torch.Tensor, out: torch.Tensor, launch_fn=None, grid_fn=None, *,
@@ -227,11 +285,13 @@ def _syrk_chunked(view: torch.Tensor, out: torch.Tensor, launch_fn=None, grid_fn
     ``view`` may have any strides, for example ``X.mT`` of a tall ``X`` (``sxn = 1``, ``sxk = n``).
     ``out`` is contiguous float16, bfloat16 or float32. Each matrix is split into ``k // chunk``
     zero-copy strided chunks (count, n, chunk) plus a ``k % chunk`` remainder. One ``_syrk_kernel``
-    launch computes up to ``max(1, max_bytes // (4 n^2))`` FP32 chunk Gram matrices; they are summed
-    in FP64 and rounded once to ``out`` (through FP32, which is innocuous: 24 >= 2 p + 2 bits for
-    FP16 and BF16). Every partial is bitwise symmetric and the FP64 sum and the
-    cast are elementwise, so ``out`` is bitwise symmetric. No host synchronization: the call is
-    CUDA-graph capturable after one eager warm-up per shape.
+    launch computes up to ``min(65535, max(1, max_bytes // (4 n^2)))`` FP32 chunk Gram matrices (one
+    per grid-y program; CUDA allows at most 65,535). They are summed in FP64 and the sum is rounded
+    exactly once to ``out``: IEEE-754 round to nearest even, ties to even, with subnormals and
+    overflow to infinity (``_store_fp64_single_round``; there is no intermediate FP32 rounding).
+    Every partial is bitwise symmetric and the FP64 sum and the rounding are elementwise, so ``out``
+    is bitwise symmetric. No host synchronization: the call is CUDA-graph capturable after one
+    eager warm-up per shape.
 
     ``launch_fn(kernel, grid, *args)`` and ``grid_fn(n, batch)`` default to a direct Triton launch
     on the triangle grid; ``polar_switch_blackwell`` passes its cached launcher.
@@ -245,7 +305,7 @@ def _syrk_chunked(view: torch.Tensor, out: torch.Tensor, launch_fn=None, grid_fn
     if _MAX_BK * sxk >= _INT32_LIMIT > sxk:  # see the int64 audit above _syrk_kernel
         raise ValueError(f"column stride {sxk} overflows the int32 in-tile offsets of _syrk_kernel")
     count, rest = divmod(k, chunk)
-    step = max(1, max_bytes // (4 * n * n))
+    step = min(_MAX_GRID_Y, max(1, max_bytes // (4 * n * n)))
     total = torch.zeros((batch, n, n), dtype=torch.float64, device=view.device)
     for index in range(batch):
         matrix = view[index]
@@ -258,7 +318,7 @@ def _syrk_chunked(view: torch.Tensor, out: torch.Tensor, launch_fn=None, grid_fn
             parts = torch.empty((len(piece), n, n), dtype=torch.float32, device=view.device)
             launch_fn(_syrk_kernel, grid_fn(n, len(piece)), piece, parts, n, piece.shape[-1], *piece.stride())
             total[index] += parts.sum(0, dtype=torch.float64)
-    out.copy_(total)
+    _store_fp64_single_round(total, out)
 
 
 def triton_syrk(X: torch.Tensor, out_dtype: torch.dtype | None = None) -> torch.Tensor:

@@ -10,7 +10,10 @@ and ``syrk_raw`` read it from the compiled kernels). One instruction computes, p
    *field* exponent: ``floor(log2 |x|)`` of a normal number and the smallest normal exponent of a
    subnormal one (FP16 -14, BF16 and FP32 -126). A product enters with the sum of its input
    exponents, before its significand in ``[1, 4)`` is normalized. This is the difference from the
-   C4-03 rule, which aligned to the binade of the product itself.
+   C4-03 rule, which aligned to the binade of the product itself. ``E`` is at least -133
+   (``ALIGN_EMIN``): with ``C = 0`` and every product below ``2^-133`` (BF16 only), the terms
+   still align to ``2^-158``, so a negative product below ``2^-158`` cannot lower a result at the
+   FP32 subnormal floor (found by the C5-01 remediation's subnormal-boundary batches).
 3. Every addend (16 products and ``C``) is truncated toward zero to a multiple of ``2^(E - 25)``:
    24 bits plus 2 guard bits on the scale ``2^E``, no sticky bit.
 4. The 17 truncated addends are summed exactly in one adder: no lane groups, no tree with
@@ -38,6 +41,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import math
+import struct
 
 import torch
 import triton
@@ -47,8 +51,12 @@ DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 EMIN = {"fp16": -14, "bf16": -126}  # smallest normal exponent of the operand format
 FP32_EMIN = -126
 GUARD = 2  # bits kept below the 24-bit significand on the alignment scale
+ALIGN_EMIN = -133  # smallest alignment exponent E: products below 2^-133 still align to 2^-158
 GROUP = 16  # products per instruction (k16)
 NAN_BITS = 0x7FFFFFFF  # the NaN the MMA writes
+# The same NaN as a Python float: converting it to FP32 (``struct.pack('<f')``, ``torch.tensor``)
+# gives exactly ``NAN_BITS``, where ``math.nan`` would give the default NaN 0x7fc00000.
+_NAN_FLOAT = struct.unpack("<f", struct.pack("<I", NAN_BITS))[0]
 _U = 320  # integer unit 2^-320 of the scalar reference: products of BF16 values reach 2^-266
 
 
@@ -74,17 +82,17 @@ def _rz(value: int, shift: int) -> int:
 def _special(a, b, acc: float) -> float | None:
     """NaN / infinity result of one instruction, or None for finite inputs."""
     if math.isnan(acc) or any(math.isnan(x) or math.isnan(y) for x, y in zip(a, b)):
-        return math.nan
+        return _NAN_FLOAT
     signs = set()
     if math.isinf(acc):
         signs.add(acc > 0)
     for x, y in zip(a, b):
         if math.isinf(x) or math.isinf(y):
             if x == 0 or y == 0:
-                return math.nan
+                return _NAN_FLOAT
             signs.add((x > 0) == (y > 0))
     if len(signs) == 2:
-        return math.nan
+        return _NAN_FLOAT
     return math.inf if signs == {True} else -math.inf if signs else None
 
 
@@ -104,7 +112,7 @@ def sm120_mma_group(a, b, acc: float = 0.0, *, dtype: str = "fp16") -> float:
         exponents.append(_field_exponent(acc, FP32_EMIN))
     if not terms:
         return 0.0
-    E = max(exponents)
+    E = max(*exponents, ALIGN_EMIN)
     total = sum(_rz(t, _U + E - 23 - GUARD) for t in terms)
     if total == 0:
         return 0.0
@@ -153,7 +161,7 @@ def _group_batched(a: torch.Tensor, b: torch.Tensor, acc: torch.Tensor, emin: in
     e_products = torch.where(products == 0, -math.inf, _exponents(a, emin) + _exponents(b, emin))
     E = torch.maximum(e_products.amax(-1), _exponents(c, FP32_EMIN))
     live = torch.isfinite(E)
-    E = torch.where(live, E, 0.0)
+    E = torch.where(live, torch.clamp(E, min=float(ALIGN_EMIN)), 0.0)
     unit = torch.ldexp(torch.ones_like(E), (E - 23 - GUARD).long())
     # Every truncated addend is an integer below 2^27 units: the sum of 17 is exact in FP64.
     total = torch.trunc(products / unit[:, None]).sum(-1) + torch.trunc(c / unit)
@@ -161,7 +169,7 @@ def _group_batched(a: torch.Tensor, b: torch.Tensor, acc: torch.Tensor, emin: in
     shift = torch.clamp(torch.maximum(bits - 24, -124.0 - E), min=0.0)
     scale = torch.ldexp(torch.ones_like(shift), shift.long())
     value = torch.trunc(total / scale) * scale * unit
-    value = torch.where(live & (total != 0), value, 0.0)
+    value = torch.where(live & (value != 0), value, 0.0)  # a zero magnitude, also -0 after truncation, is +0
     value = torch.where(value.abs() >= 2.0 ** 128, torch.copysign(torch.full_like(value, math.inf), value), value)
     value = torch.where(positive, math.inf, torch.where(negative, -math.inf, value))
     return torch.where(nan, math.nan, value)
@@ -174,7 +182,10 @@ def sm120_mma_batched(A: torch.Tensor, B: torch.Tensor, acc: torch.Tensor | None
     value = torch.zeros(A.shape[0], dtype=torch.float64, device=A.device) if acc is None else acc.double()
     for start in range(0, A.shape[-1], GROUP):
         value = _group_batched(A[:, start:start + GROUP], B[:, start:start + GROUP], value, EMIN[dtype])
-    return value.float()
+    out = value.float()  # exact: every value has at most 24 significant bits
+    words = torch.where(torch.isnan(out), torch.tensor(NAN_BITS, dtype=torch.int32, device=out.device),
+                        out.view(torch.int32))
+    return words.view(torch.float32)  # the NaN word of the MMA, not the default NaN of the cast
 
 
 def sm120_predict_diag(row: torch.Tensor, *, dtype: str = "fp16", prefix_groups: int = 1 << 12) -> float:
@@ -267,7 +278,7 @@ def variant_accumulate(a, b, acc: float = 0.0, *, dtype: str = "fp16", exponent:
         values = [(v, e) for v, e in values if v != 0]
         if not values:
             return 0
-        E = max(e for _, e in values)
+        E = max(*(e for _, e in values), ALIGN_EMIN)
         total = sum(cut(v, _U + E - 23 - guard, term) for v, _ in values)
         if total == 0:
             return 0
@@ -435,6 +446,9 @@ EDGE_CASES = (
     ("acc -1 + 1 = +0", "fp16", [1.0], [1.0], -1.0),
     ("acc -0, zero products = +0", "fp16", [0.0], [0.0], -0.0),
     ("acc -0, -0 product = +0", "fp16", [-0.0], [1.0], -0.0),
+    ("bf16 -2^-80 * 2^-80 = +0", "bf16", [-2.0 ** -80], [2.0 ** -80], 0.0),
+    ("bf16 2^-140 - 2^-158 (alignment floor 2^-158)", "bf16", [2.0 ** -70, -2.0 ** -80], [2.0 ** -70, 2.0 ** -78], 0.0),
+    ("bf16 2^-140 - 2^-159 (below the floor)", "bf16", [2.0 ** -70, -2.0 ** -80], [2.0 ** -70, 2.0 ** -79], 0.0),
     ("inf * 0", "bf16", [_INF], [0.0], 0.0),
     ("inf * 1", "bf16", [_INF], [1.0], 0.0),
     ("inf - inf", "bf16", [_INF, _INF], [1.0, -1.0], 0.0),
@@ -457,9 +471,8 @@ def normal_mantissa(shape, gen: torch.Generator, lo: int = -12, hi: int = -3, si
 
 
 def _bits(x: torch.Tensor) -> torch.Tensor:
-    """FP32 bit patterns with every NaN mapped to ``NAN_BITS`` (the MMA's NaN)."""
-    x = x.float().cpu()
-    return torch.where(torch.isnan(x), torch.tensor(NAN_BITS, dtype=torch.int32), x.view(torch.int32))
+    """The unmodified FP32 words of ``x`` as int32 (no NaN is rewritten)."""
+    return x.float().cpu().contiguous().view(torch.int32)
 
 
 def _hex(x: float) -> str:
