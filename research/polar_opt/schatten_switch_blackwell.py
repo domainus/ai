@@ -46,6 +46,10 @@ Scale handling (the Cycle 1 P0 findings & zero-sync CUDA-graph execution)
   the sum of squares of the rounded tile (``_tile_sumsq``, one slot per tile, no atomics), so
   a CUDA-graph replay repeats the eager result bit for bit. All device scalars of a call are
   in one scratch allocation that the call owns (``_scratch_layout``).
+* Long K (Cycle 5, C5-01). For ``k > SYRK_CHUNK_GATE`` both SYRKs are ``_syrk_chunked``: FP32
+  chunk Gram matrices of ``SYRK_CHUNK_SIZE`` columns, summed in FP64. Segment 1 then stores
+  ``||R_h||_F^2`` as its only tile partial and folds with the slack of ``k = SYRK_CHUNK_SIZE``.
+  At or below the gate every launch is the one of C3-03.
 
 Inputs have shape ``(..., rows, columns)``; tall, wide, square, odd, and ``min(rows, columns)
 == 1`` are supported.
@@ -61,7 +65,15 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-from research.polar_opt.kernels_blackwell import _CONFIGS, _store_sym, _syrk_kernel, _tri_tile
+from research.polar_opt.kernels_blackwell import (
+    _CONFIGS,
+    SYRK_CHUNK_GATE,
+    SYRK_CHUNK_SIZE,
+    _store_sym,
+    _syrk_chunked,
+    _syrk_kernel,
+    _tri_tile,
+)
 from research.polar_opt.polar_switch_blackwell import (
     _apply,
     _launch,
@@ -750,8 +762,9 @@ def _fold_segment1(circuit: SchattenSwitchCircuit, R: Tensor, S: Tensor, scratch
     """Launch ``_fold_and_row0_axpy_kernel`` on the stored ``R_h`` and ``S`` of shape (batch, n, n).
 
     ``scratch`` holds ``tiles_r`` and ``tiles_s`` tile partials per matrix (``_scratch_layout``).
-    The kernel writes the coefficient rows there and updates ``S`` in place. ``k`` is the long
-    side of the input: above 2^16 columns the slack grows with the FP32 Gram bias (Fable M1).
+    The kernel writes the coefficient rows there and updates ``S`` in place. ``k`` is the FP32
+    accumulation length of ``R_h``: the long side of the input, or ``SYRK_CHUNK_SIZE`` when the
+    SYRK was chunked. Above 2^16 the slack grows with the FP32 Gram bias (Fable M1).
     """
     batch, n, _ = R.shape
     nn = n * n
@@ -830,12 +843,18 @@ def schatten_switch_blackwell(G: Tensor, variant=None, *, dtype: torch.dtype = t
     work = X.new_empty(circuit.buffers, batch, n, n).unbind(0)
     grid = _triangle_grid(n, batch)
     view = X.mT if rows > columns else X
-    tiles_r = _tile_count(n, _launch(_syrk_norm_kernel, grid, view, work[0], scratch, n, k, *view.stride(),
-                                     off_r, stride))
+    if k <= SYRK_CHUNK_GATE:
+        tiles_r = _tile_count(n, _launch(_syrk_norm_kernel, grid, view, work[0], scratch, n, k, *view.stride(),
+                                         off_r, stride))
+        accumulated = k
+    else:  # long K: chunked SYRK, then ||R_h||_F^2 of the stored R_h as the only tile partial
+        _syrk_chunked(view, work[0], _launch, _triangle_grid)
+        scratch[:, off_r] = work[0].double().square().sum((-2, -1))
+        tiles_r, accumulated = 1, SYRK_CHUNK_SIZE  # the FP32 accumulation length is one chunk
     tiles_s = _tile_count(n, _launch(_square_norm_kernel, grid, work[0], work[1], scratch, n, float(alpha),
                                      off_s, stride))
 
-    _fold_segment1(circuit, work[0], work[1], scratch, tiles_r, tiles_s, k=k,
+    _fold_segment1(circuit, work[0], work[1], scratch, tiles_r, tiles_s, k=accumulated,
                    use_frobenius=has_factors != 0 or scaling == "frobenius")
     for j, (dst, src, add, *_rest) in enumerate(seg1_rows[1:], 1):
         _launch(_symprod_ptr_kernel, grid, work[src], work[src], work[add], work[dst], scratch,
@@ -857,7 +876,10 @@ def schatten_switch_blackwell(G: Tensor, variant=None, *, dtype: torch.dtype = t
 
     for phase, (residual, iterations) in enumerate(table[1:], 1):
         view = X.mT if rows > columns else X
-        _launch(_syrk_kernel, grid, view, work[0], n, k, *view.stride())
+        if k <= SYRK_CHUNK_GATE:
+            _launch(_syrk_kernel, grid, view, work[0], n, k, *view.stride())
+        else:
+            _syrk_chunked(view, work[0], _launch, _triangle_grid)
         for dst, src, add, a, b, c in iterations:
             _launch(_symprod_kernel, grid, work[src], work[src], work[add], work[dst], n, a, b, c)
         X = _apply(work[dst], X, residual, out_dtype if phase == last else dtype)

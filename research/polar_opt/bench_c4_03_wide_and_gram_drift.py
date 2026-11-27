@@ -769,7 +769,7 @@ class ChunkedGram:
         from research.polar_opt import polar_switch_blackwell as psb
         from research.polar_opt import schatten_switch_blackwell as ssb
 
-        gram, launch, fold = psb._gram, ssb._launch, ssb._fold_segment1
+        gram, launch, fold, gate = psb._gram, ssb._launch, ssb._fold_segment1, ssb.SYRK_CHUNK_GATE
 
         def patched_gram(X, out, sketch_norm=None):
             view = X.mT if X.shape[-2] > X.shape[-1] else X
@@ -794,11 +794,15 @@ class ChunkedGram:
             return fold(circuit, R, S, scratch, tiles_r, tiles_s, k=self.chunk if k > self.gate else k,
                         use_frobenius=use_frobenius)
 
+        # C5-01: the native chunked path of ``ssb`` is switched off, so the historical hook above
+        # still sees the long-K ``_syrk_norm_kernel`` / ``_syrk_kernel`` launches.
         psb._gram, ssb._launch, ssb._fold_segment1 = patched_gram, patched_launch, patched_fold
+        ssb.SYRK_CHUNK_GATE = 1 << 60
         try:
             yield self
         finally:
             psb._gram, ssb._launch, ssb._fold_segment1 = gram, launch, fold
+            ssb.SYRK_CHUNK_GATE = gate
 
 
 @contextmanager

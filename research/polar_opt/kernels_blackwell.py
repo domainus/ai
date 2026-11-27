@@ -95,6 +95,10 @@ def _store_sym(out_ptr, val, i, j, N, BLOCK: tl.constexpr):
     tl.store(out_ptr + rn[:, None].to(tl.int64) * N + rm[None, :], tl.trans(v), mask=lower)
 
 
+# int64 audit (C5-01). Row offsets ``rm * sxn`` / ``rn * sxn``, the batch offset ``bidx * sxb``
+# and every store offset are int64. ``rk * sxk`` and the step ``BK * sxk`` are int32 when Triton
+# types ``sxk`` as int32 (|sxk| < 2^31), so they need ``128 * |sxk| < 2^31``; the K walk itself
+# advances 64-bit pointers, so no offset grows with K. ``_syrk_chunked`` checks the bound.
 @triton.autotune(configs=_CONFIGS, key=["N", "K"])
 @triton.jit
 def _syrk_kernel(
@@ -198,11 +202,72 @@ def _tri_grid(N: int, B: int):
     return grid
 
 
+# --------------------------------------------------------------------------------------
+# Long-K SYRK (C5-01)
+# --------------------------------------------------------------------------------------
+# One K loop of FP32 Tensor-Core accumulates loses low bits of every product once the
+# accumulator outgrows it, so the diagonal of a Gram matrix drifts down by about 5e-9 per
+# product (C4-03: -15.6% at K = 2^25). Above the gate the Gram matrix is the FP64 sum of
+# chunk Gram matrices instead; at or below it, the single-launch kernel runs unchanged.
+SYRK_CHUNK_GATE = 65536  # K above this is chunked
+SYRK_CHUNK_SIZE = 4096  # columns per chunk: the FP32 accumulation length of one partial
+SYRK_CHUNK_MAX_BYTES = 1 << 28  # FP32 partial Gram matrices per launch: at most 256 MiB
+_INT32_LIMIT = 1 << 31
+_MAX_BK = max(config.kwargs["BK"] for config in _CONFIGS)
+
+
+def _direct_launch(kernel, grid, *args):
+    kernel[grid](*args)
+
+
+def _syrk_chunked(view: torch.Tensor, out: torch.Tensor, launch_fn=None, grid_fn=None, *,
+                  chunk: int = SYRK_CHUNK_SIZE, max_bytes: int = SYRK_CHUNK_MAX_BYTES) -> None:
+    """Write the Gram matrices ``view @ view.mT`` of a (batch, n, k) view into ``out`` (batch, n, n).
+
+    ``view`` may have any strides, for example ``X.mT`` of a tall ``X`` (``sxn = 1``, ``sxk = n``).
+    ``out`` is contiguous float16, bfloat16 or float32. Each matrix is split into ``k // chunk``
+    zero-copy strided chunks (count, n, chunk) plus a ``k % chunk`` remainder. One ``_syrk_kernel``
+    launch computes up to ``max(1, max_bytes // (4 n^2))`` FP32 chunk Gram matrices; they are summed
+    in FP64 and rounded once to ``out`` (through FP32, which is innocuous: 24 >= 2 p + 2 bits for
+    FP16 and BF16). Every partial is bitwise symmetric and the FP64 sum and the
+    cast are elementwise, so ``out`` is bitwise symmetric. No host synchronization: the call is
+    CUDA-graph capturable after one eager warm-up per shape.
+
+    ``launch_fn(kernel, grid, *args)`` and ``grid_fn(n, batch)`` default to a direct Triton launch
+    on the triangle grid; ``polar_switch_blackwell`` passes its cached launcher.
+    """
+    launch_fn = launch_fn or _direct_launch
+    grid_fn = grid_fn or _tri_grid
+    batch, n, k = view.shape
+    if chunk <= 0 or out.shape != (batch, n, n) or not out.is_contiguous():
+        raise ValueError("need chunk > 0 and a contiguous (batch, n, n) output")
+    sxk = abs(view.stride(2))
+    if _MAX_BK * sxk >= _INT32_LIMIT > sxk:  # see the int64 audit above _syrk_kernel
+        raise ValueError(f"column stride {sxk} overflows the int32 in-tile offsets of _syrk_kernel")
+    count, rest = divmod(k, chunk)
+    step = max(1, max_bytes // (4 * n * n))
+    total = torch.zeros((batch, n, n), dtype=torch.float64, device=view.device)
+    for index in range(batch):
+        matrix = view[index]
+        # (n, count * chunk) -> (count, n, chunk): column block c of the matrix is chunk c.
+        chunks = matrix[:, :count * chunk].unflatten(1, (count, chunk)).transpose(0, 1)
+        pieces = [chunks[s:s + step] for s in range(0, count, step)]
+        if rest:
+            pieces.append(matrix[None, :, count * chunk:])
+        for piece in pieces:
+            parts = torch.empty((len(piece), n, n), dtype=torch.float32, device=view.device)
+            launch_fn(_syrk_kernel, grid_fn(n, len(piece)), piece, parts, n, piece.shape[-1], *piece.stride())
+            total[index] += parts.sum(0, dtype=torch.float64)
+    out.copy_(total)
+
+
 def triton_syrk(X: torch.Tensor, out_dtype: torch.dtype | None = None) -> torch.Tensor:
     """Symmetric Gram matrix ``X @ X.mT`` for fp16/bf16 ``X`` of shape (N, M) or (B, N, M).
 
     Computes only upper-triangle tiles (~half of the MMA work), accumulates in fp32, rounds once
     to ``out_dtype`` (default: input dtype) and mirrors tiles so the output is exactly symmetric.
+    For ``M > SYRK_CHUNK_GATE`` the FP32 partials of ``SYRK_CHUNK_SIZE`` columns are summed in
+    FP64 (``_syrk_chunked``).
     """
     if X.dtype not in _HALF:
         raise TypeError(f"triton_syrk supports float16/bfloat16, got {X.dtype}")
@@ -210,7 +275,10 @@ def triton_syrk(X: torch.Tensor, out_dtype: torch.dtype | None = None) -> torch.
     B, N, K = Xb.shape
     out = torch.empty((B, N, N), dtype=out_dtype or X.dtype, device=X.device)
     if out.numel():
-        _syrk_kernel[_tri_grid(N, B)](Xb, out, N, K, Xb.stride(0), Xb.stride(1), Xb.stride(2))
+        if K > SYRK_CHUNK_GATE:
+            _syrk_chunked(Xb, out)
+        else:
+            _syrk_kernel[_tri_grid(N, B)](Xb, out, N, K, Xb.stride(0), Xb.stride(1), Xb.stride(2))
     return out[0] if squeeze else out
 
 

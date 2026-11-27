@@ -40,8 +40,10 @@ from triton.runtime import driver
 from research.polar_opt.baselines import POLAR_EXPRESS_COEFFICIENTS, _SWITCH_TABLES, _take_steps
 from research.polar_opt.kernels_blackwell import (
     _CONFIGS,
+    SYRK_CHUNK_GATE,
     _fp8_quant,
     _store_sym,
+    _syrk_chunked,
     _syrk_kernel,
     _tri_tile,
 )
@@ -226,6 +228,9 @@ def _gram(X: Tensor, out: Tensor, sketch_norm: Tensor | None = None) -> None:
     ||X||_F^2. Although trace rescaling keeps sigma_max bounded, ``poly(A_sketch)`` does not
     commute with the true ``X @ X.mT``, increasing median Tier-1 error by +18-23% and rotating
     left singular vectors on rank-deficient matrices (do not promote over exact FP16 Gram).
+
+    Without a sketch, ``k > SYRK_CHUNK_GATE`` columns use ``_syrk_chunked``; shorter inputs run the
+    single ``_syrk_kernel`` launch.
     """
     target = out
     if sketch_norm is not None:
@@ -233,7 +238,10 @@ def _gram(X: Tensor, out: Tensor, sketch_norm: Tensor | None = None) -> None:
         out = torch.empty(target.shape, dtype=torch.float32, device=X.device)
     view = X.mT if X.shape[-2] > X.shape[-1] else X
     batch, n, k = view.shape
-    _launch(_syrk_kernel, _triangle_grid(n, batch), view, out, n, k, *view.stride())
+    if k > SYRK_CHUNK_GATE and sketch_norm is None:  # long K: FP64 sum of chunk Gram matrices
+        _syrk_chunked(view, out, _launch, _triangle_grid)
+    else:
+        _launch(_syrk_kernel, _triangle_grid(n, batch), view, out, n, k, *view.stride())
     if sketch_norm is not None:
         energy = torch.where(
             torch.isfinite(sketch_norm),
