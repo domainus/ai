@@ -1,0 +1,789 @@
+{
+  "backend": "mlx",
+  "library": "mlx",
+  "library_version": "0.32.5",
+  "thread_environment": {},
+  "hardware": {
+    "machine": "arm64",
+    "system": "Darwin",
+    "release": "27.2.0",
+    "hostname": "Ryans-MacBook-Pro.local",
+    "machdep.cpu.brand_string": "Apple M5 Max",
+    "hw.model": "Mac17,7",
+    "hw.memsize": "137438953472"
+  },
+  "quick": false,
+  "seed": 0,
+  "seeds": [
+    0
+  ],
+  "created_at": "2026-11-27T11:10:36.704572+00:00",
+  "timestamp": "2026-11-27T11:10:36.704572+00:00",
+  "git_sha": "7eacbb6516ef71d8ff19f63c723b861d3dd799fb",
+  "git_dirty": false,
+  "thermal_before": {
+    "timestamp": "2026-11-27T11:10:36.717988+00:00",
+    "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+    "batt": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=24117347)\t80%; AC attached; not charging present: true",
+    "clamshell": "|   \"AppleClamshellState\" = Yes"
+  },
+  "thermal_after": {
+    "timestamp": "2026-11-27T11:10:41.541734+00:00",
+    "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+    "batt": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=24117347)\t80%; AC attached; not charging present: true",
+    "clamshell": "|   \"AppleClamshellState\" = Yes"
+  },
+  "sleep_detected": false,
+  "ab_metal": false,
+  "methods": [
+    "jordan_ns5",
+    "polar_express",
+    "gram_ns",
+    "PS2_55",
+    "PS3_55"
+  ],
+  "skipped_methods": [],
+  "paired_ab_summary": [],
+  "source_sha256": "eb2bdc11b4da2b9ed48b197ef6a5fbd234033ab21473991ba0d5b92fd957ea15",
+  "dtype": "float32",
+  "dtypes": [
+    "float32"
+  ],
+  "input_dtype": "float32",
+  "use_metal_syrk_requested": true,
+  "use_metal_syrk": false,
+  "use_metal_symprod": false,
+  "reference": "numpy_float64_svd",
+  "error_metric": "relative_frobenius",
+  "divergence_limit": 2.0,
+  "divergences": 0,
+  "warmups": 5,
+  "repeats": 10,
+  "method_order": [
+    {
+      "shape": [
+        1024,
+        4096
+      ],
+      "dtype": "float32",
+      "seed": 0,
+      "blocks": [
+        [
+          "gram_ns",
+          "PS2_55",
+          "jordan_ns5",
+          "PS3_55",
+          "polar_express"
+        ],
+        [
+          "jordan_ns5",
+          "PS3_55",
+          "polar_express",
+          "gram_ns",
+          "PS2_55"
+        ],
+        [
+          "PS3_55",
+          "polar_express",
+          "gram_ns",
+          "PS2_55",
+          "jordan_ns5"
+        ],
+        [
+          "polar_express",
+          "gram_ns",
+          "PS2_55",
+          "jordan_ns5",
+          "PS3_55"
+        ],
+        [
+          "PS2_55",
+          "jordan_ns5",
+          "PS3_55",
+          "polar_express",
+          "gram_ns"
+        ],
+        [
+          "polar_express",
+          "gram_ns",
+          "PS2_55",
+          "jordan_ns5",
+          "PS3_55"
+        ],
+        [
+          "PS3_55",
+          "polar_express",
+          "gram_ns",
+          "PS2_55",
+          "jordan_ns5"
+        ],
+        [
+          "jordan_ns5",
+          "PS3_55",
+          "polar_express",
+          "gram_ns",
+          "PS2_55"
+        ],
+        [
+          "PS2_55",
+          "jordan_ns5",
+          "PS3_55",
+          "polar_express",
+          "gram_ns"
+        ],
+        [
+          "gram_ns",
+          "PS2_55",
+          "jordan_ns5",
+          "PS3_55",
+          "polar_express"
+        ]
+      ],
+      "thermal_before": {
+        "timestamp": "2026-11-27T11:10:37.234253+00:00",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "batt": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=24117347)\t80%; AC attached; not charging present: true",
+        "clamshell": "|   \"AppleClamshellState\" = Yes"
+      },
+      "thermal_after": {
+        "timestamp": "2026-11-27T11:10:37.769171+00:00",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "batt": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=24117347)\t80%; AC attached; not charging present: true",
+        "clamshell": "|   \"AppleClamshellState\" = Yes"
+      }
+    },
+    {
+      "shape": [
+        2048,
+        2048
+      ],
+      "dtype": "float32",
+      "seed": 0,
+      "blocks": [
+        [
+          "polar_express",
+          "PS3_55",
+          "gram_ns",
+          "jordan_ns5",
+          "PS2_55"
+        ],
+        [
+          "gram_ns",
+          "jordan_ns5",
+          "PS2_55",
+          "polar_express",
+          "PS3_55"
+        ],
+        [
+          "PS2_55",
+          "polar_express",
+          "PS3_55",
+          "gram_ns",
+          "jordan_ns5"
+        ],
+        [
+          "PS3_55",
+          "gram_ns",
+          "jordan_ns5",
+          "PS2_55",
+          "polar_express"
+        ],
+        [
+          "jordan_ns5",
+          "PS2_55",
+          "polar_express",
+          "PS3_55",
+          "gram_ns"
+        ],
+        [
+          "PS3_55",
+          "PS2_55",
+          "polar_express",
+          "jordan_ns5",
+          "gram_ns"
+        ],
+        [
+          "jordan_ns5",
+          "gram_ns",
+          "PS3_55",
+          "PS2_55",
+          "polar_express"
+        ],
+        [
+          "gram_ns",
+          "PS3_55",
+          "PS2_55",
+          "polar_express",
+          "jordan_ns5"
+        ],
+        [
+          "polar_express",
+          "jordan_ns5",
+          "gram_ns",
+          "PS3_55",
+          "PS2_55"
+        ],
+        [
+          "PS2_55",
+          "polar_express",
+          "jordan_ns5",
+          "gram_ns",
+          "PS3_55"
+        ]
+      ],
+      "thermal_before": {
+        "timestamp": "2026-11-27T11:10:38.872731+00:00",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "batt": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=24117347)\t80%; AC attached; not charging present: true",
+        "clamshell": "|   \"AppleClamshellState\" = Yes"
+      },
+      "thermal_after": {
+        "timestamp": "2026-11-27T11:10:41.503301+00:00",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "batt": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=24117347)\t80%; AC attached; not charging present: true",
+        "clamshell": "|   \"AppleClamshellState\" = Yes"
+      }
+    }
+  ],
+  "results": [
+    {
+      "method": "jordan_ns5",
+      "shape": [
+        1024,
+        4096
+      ],
+      "backend": "mlx",
+      "dtype": "float32",
+      "use_metal_syrk": false,
+      "use_metal_symprod": false,
+      "metal_syrk_tile": null,
+      "metal_symprod_tile": null,
+      "output_dtype": "mlx.core.float32",
+      "samples_ms": [
+        3.634875,
+        3.706666,
+        3.573917,
+        3.592583,
+        3.563833,
+        3.542458,
+        3.577292,
+        3.538417,
+        3.772625,
+        3.555
+      ],
+      "sample_wall_s": [
+        0.003638029098510742,
+        0.0037093162536621094,
+        0.003576040267944336,
+        0.0035941600799560547,
+        0.0035638809204101562,
+        0.003542661666870117,
+        0.00357818603515625,
+        0.0035390853881835938,
+        0.003773927688598633,
+        0.0035562515258789062
+      ],
+      "median_ms": 3.5756045,
+      "latency_ms": 3.5756045,
+      "iqr_ms": 0.06709375000000017,
+      "p25_ms": 3.55720825,
+      "p75_ms": 3.624302,
+      "min_ms": 3.538417,
+      "sleep_detected": false,
+      "finite": true,
+      "diverged": false,
+      "polar_error": 0.15986748124013117,
+      "relative_frobenius_error": 0.15986748124013117,
+      "sigma_max": 1.1355126829326512,
+      "orthogonality_err": 0.29141354572930045,
+      "seed": 0
+    },
+    {
+      "method": "polar_express",
+      "shape": [
+        1024,
+        4096
+      ],
+      "backend": "mlx",
+      "dtype": "float32",
+      "use_metal_syrk": false,
+      "use_metal_symprod": false,
+      "metal_syrk_tile": null,
+      "metal_symprod_tile": null,
+      "output_dtype": "mlx.core.float32",
+      "samples_ms": [
+        3.665417,
+        3.610667,
+        3.604125,
+        3.64825,
+        3.560834,
+        3.552125,
+        3.562,
+        3.549167,
+        3.564083,
+        3.691208
+      ],
+      "sample_wall_s": [
+        0.0036683082580566406,
+        0.0036127567291259766,
+        0.003606081008911133,
+        0.003648996353149414,
+        0.0035610198974609375,
+        0.0035529136657714844,
+        0.00356292724609375,
+        0.003551006317138672,
+        0.0035657882690429688,
+        0.003692150115966797
+      ],
+      "median_ms": 3.584104,
+      "latency_ms": 3.584104,
+      "iqr_ms": 0.07772875000000035,
+      "p25_ms": 3.5611254999999997,
+      "p75_ms": 3.63885425,
+      "min_ms": 3.549167,
+      "sleep_detected": false,
+      "finite": true,
+      "diverged": false,
+      "polar_error": 0.09505560246561147,
+      "relative_frobenius_error": 0.09505560246561147,
+      "sigma_max": 1.1317930181748788,
+      "orthogonality_err": 0.18770028955954968,
+      "seed": 0
+    },
+    {
+      "method": "gram_ns",
+      "shape": [
+        1024,
+        4096
+      ],
+      "backend": "mlx",
+      "dtype": "float32",
+      "use_metal_syrk": false,
+      "use_metal_symprod": false,
+      "metal_syrk_tile": null,
+      "metal_symprod_tile": null,
+      "output_dtype": "mlx.core.float32",
+      "samples_ms": [
+        2.573416,
+        2.633541,
+        2.604292,
+        2.590917,
+        2.562,
+        2.607375,
+        2.579084,
+        2.579709,
+        2.594791,
+        2.577334
+      ],
+      "sample_wall_s": [
+        0.0025789737701416016,
+        0.002635955810546875,
+        0.0026051998138427734,
+        0.0025908946990966797,
+        0.002562999725341797,
+        0.002608060836791992,
+        0.0025801658630371094,
+        0.002579927444458008,
+        0.0025959014892578125,
+        0.0025780200958251953
+      ],
+      "median_ms": 2.585313,
+      "latency_ms": 2.585313,
+      "iqr_ms": 0.024145250000000118,
+      "p25_ms": 2.5777715,
+      "p75_ms": 2.60191675,
+      "min_ms": 2.562,
+      "sleep_detected": false,
+      "finite": true,
+      "diverged": false,
+      "polar_error": 0.10305415522133878,
+      "relative_frobenius_error": 0.10305415522133878,
+      "sigma_max": 1.1232428016485259,
+      "orthogonality_err": 0.20665848198920556,
+      "seed": 0
+    },
+    {
+      "method": "PS2_55",
+      "shape": [
+        1024,
+        4096
+      ],
+      "backend": "mlx",
+      "dtype": "float32",
+      "use_metal_syrk": false,
+      "use_metal_symprod": false,
+      "metal_syrk_tile": null,
+      "metal_symprod_tile": null,
+      "output_dtype": "mlx.core.float32",
+      "samples_ms": [
+        2.461666,
+        2.485041,
+        2.428417,
+        2.432542,
+        2.434625,
+        2.419709,
+        2.416917,
+        2.417916,
+        2.431375,
+        2.436417
+      ],
+      "sample_wall_s": [
+        0.002463817596435547,
+        0.0024869441986083984,
+        0.0024290084838867188,
+        0.0024330615997314453,
+        0.002434968948364258,
+        0.0024204254150390625,
+        0.0024178028106689453,
+        0.0024192333221435547,
+        0.0024330615997314453,
+        0.0024378299713134766
+      ],
+      "median_ms": 2.4319585000000004,
+      "latency_ms": 2.4319585000000004,
+      "iqr_ms": 0.014082999999999846,
+      "p25_ms": 2.421886,
+      "p75_ms": 2.435969,
+      "min_ms": 2.416917,
+      "sleep_detected": false,
+      "finite": true,
+      "diverged": false,
+      "polar_error": 0.06212800886892406,
+      "relative_frobenius_error": 0.06212800886892406,
+      "sigma_max": 1.0874169630460226,
+      "orthogonality_err": 0.12010276069324867,
+      "seed": 0
+    },
+    {
+      "method": "PS3_55",
+      "shape": [
+        1024,
+        4096
+      ],
+      "backend": "mlx",
+      "dtype": "float32",
+      "use_metal_syrk": false,
+      "use_metal_symprod": false,
+      "metal_syrk_tile": null,
+      "metal_symprod_tile": null,
+      "output_dtype": "mlx.core.float32",
+      "samples_ms": [
+        2.498334,
+        2.556875,
+        2.501292,
+        2.4345,
+        2.409708,
+        2.443125,
+        2.410667,
+        2.456792,
+        2.44925,
+        2.426166
+      ],
+      "sample_wall_s": [
+        0.0025000572204589844,
+        0.0025582313537597656,
+        0.002502918243408203,
+        0.002435922622680664,
+        0.002410888671875,
+        0.002444028854370117,
+        0.002412080764770508,
+        0.002457857131958008,
+        0.002450227737426758,
+        0.0024268627166748047
+      ],
+      "median_ms": 2.4461875,
+      "latency_ms": 2.4461875,
+      "iqr_ms": 0.05969900000000017,
+      "p25_ms": 2.4282494999999997,
+      "p75_ms": 2.4879485,
+      "min_ms": 2.409708,
+      "sleep_detected": false,
+      "finite": true,
+      "diverged": false,
+      "polar_error": 0.06264779714718201,
+      "relative_frobenius_error": 0.06264779714718201,
+      "sigma_max": 1.0634636811050744,
+      "orthogonality_err": 0.12161589843810931,
+      "seed": 0
+    },
+    {
+      "method": "jordan_ns5",
+      "shape": [
+        2048,
+        2048
+      ],
+      "backend": "mlx",
+      "dtype": "float32",
+      "use_metal_syrk": false,
+      "use_metal_symprod": false,
+      "metal_syrk_tile": null,
+      "metal_symprod_tile": null,
+      "output_dtype": "mlx.core.float32",
+      "samples_ms": [
+        7.673333,
+        7.55125,
+        7.144583,
+        7.097625,
+        7.036042,
+        7.103417,
+        7.373125,
+        7.150625,
+        7.219041,
+        7.249708
+      ],
+      "sample_wall_s": [
+        0.007674694061279297,
+        0.0075531005859375,
+        0.0071451663970947266,
+        0.007097959518432617,
+        0.007035970687866211,
+        0.007104158401489258,
+        0.007375001907348633,
+        0.007150888442993164,
+        0.007219076156616211,
+        0.0072498321533203125
+      ],
+      "median_ms": 7.184832999999999,
+      "latency_ms": 7.184832999999999,
+      "iqr_ms": 0.22856224999999952,
+      "p25_ms": 7.1137085,
+      "p75_ms": 7.34227075,
+      "min_ms": 7.036042,
+      "sleep_detected": false,
+      "finite": true,
+      "diverged": false,
+      "polar_error": 0.22325151738932023,
+      "relative_frobenius_error": 0.22325151738932023,
+      "sigma_max": 1.2033933285656482,
+      "orthogonality_err": 0.35960862240030284,
+      "seed": 0
+    },
+    {
+      "method": "polar_express",
+      "shape": [
+        2048,
+        2048
+      ],
+      "backend": "mlx",
+      "dtype": "float32",
+      "use_metal_syrk": false,
+      "use_metal_symprod": false,
+      "metal_syrk_tile": null,
+      "metal_symprod_tile": null,
+      "output_dtype": "mlx.core.float32",
+      "samples_ms": [
+        7.265583,
+        7.589083,
+        7.585333,
+        7.195584,
+        7.246917,
+        7.13275,
+        7.3015,
+        7.250416,
+        7.168375,
+        7.173709
+      ],
+      "sample_wall_s": [
+        0.0072689056396484375,
+        0.007589817047119141,
+        0.007586956024169922,
+        0.007195949554443359,
+        0.0072479248046875,
+        0.007132768630981445,
+        0.007301807403564453,
+        0.00725102424621582,
+        0.0071680545806884766,
+        0.007174015045166016
+      ],
+      "median_ms": 7.248666500000001,
+      "latency_ms": 7.248666500000001,
+      "iqr_ms": 0.11334299999999953,
+      "p25_ms": 7.17917775,
+      "p75_ms": 7.2925207499999996,
+      "min_ms": 7.13275,
+      "sleep_detected": false,
+      "finite": true,
+      "diverged": false,
+      "polar_error": 0.13697224587719464,
+      "relative_frobenius_error": 0.13697224587719464,
+      "sigma_max": 1.1318614714964723,
+      "orthogonality_err": 0.22382682043543997,
+      "seed": 0
+    },
+    {
+      "method": "gram_ns",
+      "shape": [
+        2048,
+        2048
+      ],
+      "backend": "mlx",
+      "dtype": "float32",
+      "use_metal_syrk": false,
+      "use_metal_symprod": false,
+      "metal_syrk_tile": null,
+      "metal_symprod_tile": null,
+      "output_dtype": "mlx.core.float32",
+      "samples_ms": [
+        7.608875,
+        7.709709,
+        7.335125,
+        7.082542,
+        7.107083,
+        7.211125,
+        7.242708,
+        7.179792,
+        7.182292,
+        7.230917
+      ],
+      "sample_wall_s": [
+        0.00761103630065918,
+        0.007712125778198242,
+        0.0073359012603759766,
+        0.007082939147949219,
+        0.0071070194244384766,
+        0.007211923599243164,
+        0.0072438716888427734,
+        0.007180213928222656,
+        0.007182121276855469,
+        0.007231950759887695
+      ],
+      "median_ms": 7.221021,
+      "latency_ms": 7.221021,
+      "iqr_ms": 0.13160375000000002,
+      "p25_ms": 7.180417,
+      "p75_ms": 7.31202075,
+      "min_ms": 7.082542,
+      "sleep_detected": false,
+      "finite": true,
+      "diverged": false,
+      "polar_error": 0.14667720208211543,
+      "relative_frobenius_error": 0.14667720208211543,
+      "sigma_max": 1.124403719780141,
+      "orthogonality_err": 0.23687993910218635,
+      "seed": 0
+    },
+    {
+      "method": "PS2_55",
+      "shape": [
+        2048,
+        2048
+      ],
+      "backend": "mlx",
+      "dtype": "float32",
+      "use_metal_syrk": false,
+      "use_metal_symprod": false,
+      "metal_syrk_tile": null,
+      "metal_symprod_tile": null,
+      "output_dtype": "mlx.core.float32",
+      "samples_ms": [
+        8.664542,
+        8.684875,
+        8.498334,
+        8.069708,
+        8.175333,
+        8.175667,
+        8.265833,
+        8.172083,
+        8.262041,
+        8.321709
+      ],
+      "sample_wall_s": [
+        0.008667230606079102,
+        0.008687019348144531,
+        0.008500099182128906,
+        0.008071184158325195,
+        0.008176803588867188,
+        0.008177042007446289,
+        0.008265972137451172,
+        0.008172988891601562,
+        0.008263111114501953,
+        0.008322715759277344
+      ],
+      "median_ms": 8.263937,
+      "latency_ms": 8.263937,
+      "iqr_ms": 0.27876124999999874,
+      "p25_ms": 8.1754165,
+      "p75_ms": 8.45417775,
+      "min_ms": 8.069708,
+      "sleep_detected": false,
+      "finite": true,
+      "diverged": false,
+      "polar_error": 0.12166460824606064,
+      "relative_frobenius_error": 0.12166460824606064,
+      "sigma_max": 1.105650005004625,
+      "orthogonality_err": 0.18743784659797816,
+      "seed": 0
+    },
+    {
+      "method": "PS3_55",
+      "shape": [
+        2048,
+        2048
+      ],
+      "backend": "mlx",
+      "dtype": "float32",
+      "use_metal_syrk": false,
+      "use_metal_symprod": false,
+      "metal_syrk_tile": null,
+      "metal_symprod_tile": null,
+      "output_dtype": "mlx.core.float32",
+      "samples_ms": [
+        8.603166,
+        8.619084,
+        8.196667,
+        8.132334,
+        8.1715,
+        8.177625,
+        8.31425,
+        8.277084,
+        8.343708,
+        8.181084
+      ],
+      "sample_wall_s": [
+        0.00860595703125,
+        0.008620977401733398,
+        0.008198022842407227,
+        0.008133172988891602,
+        0.008171796798706055,
+        0.008177995681762695,
+        0.008314847946166992,
+        0.00827789306640625,
+        0.008344888687133789,
+        0.008180856704711914
+      ],
+      "median_ms": 8.2368755,
+      "latency_ms": 8.2368755,
+      "iqr_ms": 0.15785374999999924,
+      "p25_ms": 8.17848975,
+      "p75_ms": 8.3363435,
+      "min_ms": 8.132334,
+      "sleep_detected": false,
+      "finite": true,
+      "diverged": false,
+      "polar_error": 0.11357141596357778,
+      "relative_frobenius_error": 0.11357141596357778,
+      "sigma_max": 1.0817902789170424,
+      "orthogonality_err": 0.17116867498139535,
+      "seed": 0
+    }
+  ],
+  "command": [
+    "/Users/ryan/Documents/Projects/ai/.venv/bin/python",
+    "research/polar_opt/kernels_mlx.py",
+    "--backend",
+    "mlx",
+    "--use-metal-syrk",
+    "--dtypes",
+    "float32",
+    "--shapes",
+    "1024x4096,2048x2048",
+    "--seeds",
+    "0",
+    "--warmups",
+    "5",
+    "--repeats",
+    "10",
+    "--output",
+    "results/m5_max_fp32_gate_check_cycle3.json"
+  ]
+}

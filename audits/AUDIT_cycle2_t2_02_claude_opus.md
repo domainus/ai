@@ -171,3 +171,15 @@ Applied on `exp/t2-02-m5-max` after `origin/main` (`877c2a8`) rebase (with Metal
 - **F7 (Tiny kernel name isolation):** Distinguished tiny kernel specialization names (`polar_{syrk,symprod}_tiny_{tile_size}`).
 - **L1, L2, L3, L4 (Guards & live coverage):** Added `_METAL_MAX_N = 65535` 32-bit index overflow guards in `metal_syrk`/`metal_symprod`, documented upper-triangle `addend` symmetry requirement in `metal_symprod`, guarded `addend.size < 8` constant-space binding (`test_metal_overflow_and_tiny_addend_guards`), and expanded `test_live_metal_syrk_and_fused_symprod` to cover wide production orientations `(17, 33)`, `(35, 67)`, and `(2048, 4096)`.
 - **Open items tracked for Cycle 2.5 / 3:** Commit primitive-profile generator (`F5`), record honest FP32 vs FP16/BF16 `2048²` goal accounting in `state/BACKLOG.md` (`F8`), run `tests/test_mlx.py` live on `MacBook Pro` after merge, and perform an open-lid `caffeinate -dimsu` single-session interleaved `4096²` rerun (`F2`, `L5`).
+
+### M5 Max implementation follow-up
+
+Baseline `6236a52` passed all 82 MLX tests with zero skips. Implementation `7eacbb6` passed all 101 with zero skips. Each of the following result files records that clean implementation commit and its source hash.
+
+| Finding | Live evidence |
+|---|---|
+| F2, F4, L5 | The [A/B run](../results/m5_max_ab_ss3_cycle3.json) paired arms within 60 timed blocks per method, dtype and shape, across three seeds. All 192 rows passed. The sample-level sleep flag stayed false. All snapshots recorded a closed lid, AC power at 80% and no warning. An open-lid replication remains outstanding. |
+| F5 | The [primitive script](../research/polar_opt/bench_mlx_primitives.py) generated [60 measurements](../results/m5_max_primitives_cycle3.json) over 12 cases with five warmups and 20 timed blocks. All custom primitives selected the 64-tile kernel. |
+| F1, F3, F8 | All ten [FP32 rows](../results/m5_max_fp32_gate_check_cycle3.json) stayed dense with null tile fields. At 2048×2048, the paired PS3_55 speedup over Polar Express was 0.88× in dense FP32 and 1.80× in each low-precision Metal run. |
+
+Cycle 3 SS3 results are Tier-1 measurements. Independent cycle review and Tier-2 transfer are separate research gates.
