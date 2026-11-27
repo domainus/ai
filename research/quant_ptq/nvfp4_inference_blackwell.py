@@ -1,6 +1,6 @@
-"""Fused NVFP4 activation quantization and W4A4 linear layers for Blackwell (sm_120, Cycle 4 C4-02).
+"""Fused NVFP4 activation quantization and W4A4 linear layers for Blackwell (sm_120; C4-02, tuned in C5-03).
 
-One Triton kernel turns BF16/FP16/FP32 activations ``x`` (M, K) into the three operands that
+The Triton kernels turn BF16/FP16/FP32 activations ``x`` (M, K) into the three operands that
 ``F.scaled_mm`` needs for an NVFP4 GEMM:
 
 * ``packed``  (M, K // 2) ``torch.float4_e2m1fn_x2``. Element 2i is in the low nibble.
@@ -15,31 +15,46 @@ Optionally the kernel first applies a block-16 rotation in registers (``hadamard
 written to memory.
 
 Global scale modes
-    dynamic  Two launches. Pass 1 writes one NaN-propagating amax per program (no atomics, so the
-             result is deterministic). Pass 2 reduces these partials in every program (at most
-             ``MAX_PARTIALS`` values, read from L2), then quantizes, packs and swizzles.
+    dynamic  Two launches. Pass 1 (``_amax_kernel``) writes one NaN-propagating amax per program, at
+             most 256 programs (no atomics, so the result is deterministic). Pass 2
+             (``_quant_kernel``) reduces these partials in every program, then quantizes, packs and
+             swizzles. Pass 2 uses programmatic dependent launch (PDL): it may start while pass 1
+             runs, loads and rotates its tile and computes the block maxima, and waits
+             (``griddepcontrol.wait``) only before it reads the partials.
     static   One launch. The caller gives a pre-calibrated FP32 ``global_scale`` tensor. Values
              above the calibrated range saturate (block scale 448, element 6).
+
+C5-03 changes against C4-02 (all measured on the RTX 5080 with a 4x L2 flush; see
+``bench_c5_03_nvfp4_120m_fusion.py``): E2M1 codes from the native ``cvt.rn.satfinite.e2m1x2.f32``;
+pass 2 reduces only the ``n_part`` partials that pass 1 wrote (``PBLOCK = next_pow2(n_part)``, at
+most 256, instead of a fixed 512); shape-aware tiles (pass-2 group tiles that divide the padded
+scale columns, so K = 1408 no longer runs half-empty 16-group tiles); PDL between the passes; a
+workspace of ``n_part + 1`` floats. A single-program fused quantizer and a cooperative
+single-launch quantizer with a grid barrier were measured and rejected (both slower; see the
+benchmark's ablation section).
 
 Numerics: the kernel matches ``micro_rotated_ptq.nvfp4_encode`` (plus ``pack_e2m1`` and
 ``to_blocked``) bit for bit, including NaN and Inf inputs and rotations. To get this:
 * divisions use ``tl.div_rn`` (IEEE), as the PyTorch tensor divisions of the reference do;
 * the kernels compile with ``enable_fp_fusion=False``, so ``c * a + s * d`` of the butterfly is
   two rounded products and one rounded sum, as in eager PyTorch (no FMA contraction);
-* E2M1 rounding uses the same seven midpoint comparisons as ``e2m1_codes`` (ties to the even
-  code). The PTX ``cvt.rn.satfinite.e2m1x2.f32`` instruction is not used: it has the same
-  round-to-nearest-even rule for finite values but maps NaN differently;
+* E2M1 rounding: ``cvt.rn.satfinite.e2m1x2.f32`` rounds to nearest even and saturates at 6, which
+  is the tie rule of the seven midpoint comparisons of ``e2m1_codes``; it keeps the sign of zeros
+  and of values that round to zero. It maps NaN to 6, whereas the reference gives a signed zero
+  code (all comparisons false), so NaN inputs are first replaced by a zero with their sign bit;
 * the E4M3 block scale uses Triton's FP32 -> ``float8e4nv`` conversion (``cvt.rn.satfinite``)
   after a NaN-propagating clamp to 448. That is the reference ``clamp(max=448).to(e4m3fn)``.
 
-Launch overhead: after the first call for a specialization, kernels go through Triton's C
-launcher directly (``polar_switch_blackwell._c_launcher``). Every launch, buffer and GEMM runs on
-the current stream without a host synchronization, so ``NVFP4Linear`` is CUDA-graph capturable.
+Launch overhead: launch plans (tiles, grids, constants) are cached per shape, and after the first
+call for a specialization the kernels go through Triton's C launcher directly
+(``polar_switch_blackwell._c_launcher``). Every launch, buffer and GEMM runs on the current stream
+without a host synchronization, so ``NVFP4Linear`` is CUDA-graph capturable.
 Warm up each shape eagerly once before capture (the first call compiles).
 """
 
 from __future__ import annotations
 
+import functools
 from typing import NamedTuple
 
 import torch
@@ -54,19 +69,45 @@ from research.polar_opt.polar_switch_blackwell import _c_launcher
 from research.quant_ptq import micro_rotated_ptq as q
 
 ROTATIONS = {"none": 0, "hadamard_b16": 1, "adaptive_butterfly_b16": 2}
-MAX_PARTIALS = 512  # pass-1 programs; pass 2 reduces this many values per program
+MAX_PARTIALS = 512  # capacity of a ``launch_amax`` workspace (pass 1 writes at most PASS1_PROGRAMS)
+PASS1_PROGRAMS = 256
+# Ablation switches for the benchmark only (read at launch time, so a CUDA graph keeps the setting
+# of its capture): PDL between the passes and the native E2M1 conversion (else the comparison ladder).
+OPTIONS = {"pdl": True, "native_cvt": True}
 
 
-def _tile(M: int, rotation: str) -> tuple[int, int, int]:
-    """(rows, 16-input groups, warps) per program. Rows must divide 128 (the scale-row padding).
-
-    From a sweep on the RTX 5080 with a flushed L2 (M in 16..8192, K in 512..8192): narrow
-    8-row tiles suit the add-only rotations; the butterfly, with its per-group angle loads,
-    prefers 32 x 4 once M fills the GPU.
-    """
+def _amax_tile(M: int, K: int, rotation: str) -> tuple[int, int, int]:
+    """(rows, 16-input groups, warps) per pass-1 tile (sweep over M in 16..2048, K in 512..8192)."""
     if rotation == "adaptive_butterfly_b16":
-        return (8, 4, 4) if M < 128 else (32, 4, 4)
-    return (8, 8, 4) if M < 128 else (8, 16, 4)
+        return (16, 8, 4) if M <= 16 else (32, 8, 4)
+    return 16, 16, 4
+
+
+def _quant_tile(M: int, K: int, rotation: str) -> tuple[int, int, int]:
+    """(rows, groups, warps) per pass-2 tile. Rows divide 128 (the scale-row padding).
+
+    16-group tiles only where they divide the padded scale columns; small tiles with few warps keep
+    many programs in flight. The butterfly, with its per-group angle loads, takes 16 x 16 tiles once
+    the operand is large.
+    """
+    pc = -(-(K // 16) // 4) * 4
+    if rotation == "none":
+        return (8, 16, 4) if pc % 16 == 0 else (16, 8, 2)
+    if rotation == "hadamard_b16":
+        return (8, 8, 4) if M * K < 1 << 21 else (16, 8, 4)
+    return (16, 16, 4) if M * K >= 1 << 22 and pc % 16 == 0 else (8, 8, 2)
+
+
+def quantizer_plan(M: int, K: int, rotation: str, static: bool = False) -> dict:
+    """The launches that ``quantize_activation`` makes for an (M, K) input (for result records)."""
+    pr, pc = scale_layout(M, K)
+    bm, bg, warps = _quant_tile(M, K, rotation)
+    plan = {"pass2_tile": [bm, bg, warps], "pass2_programs": (pr // bm) * -(-pc // bg)}
+    if static:
+        return {"launches": 1, **plan}
+    abm, abg, awarps = _amax_tile(M, K, rotation)
+    return {"launches": 2, "pass1_tile": [abm, abg, awarps], "pass1_programs": _n_partials(M, K, rotation),
+            **plan, "pdl": OPTIONS["pdl"], "native_cvt": OPTIONS["native_cvt"]}
 
 
 # ======================================================================================
@@ -127,59 +168,54 @@ def _load_rotated(x_ptr, cos_ptr, sin_ptr, rows, g0, M, K, G, stride_m, stride_k
 
 
 @triton.jit
-def _amax_kernel(x_ptr, part_ptr, cos_ptr, sin_ptr, M, K, G, stride_m, stride_k, n_gt, n_tiles,
-                 ROT: tl.constexpr, BM: tl.constexpr, BG: tl.constexpr):
-    """Pass 1: partial[program] = NaN-propagating max |R x| over a strided set of tiles."""
-    pid = tl.program_id(0)
-    acc = tl.zeros((), dtype=tl.float32)
-    for t in range(pid, n_tiles, tl.num_programs(0)):
-        rows = (t // n_gt) * BM + tl.arange(0, BM)
-        v = _load_rotated(x_ptr, cos_ptr, sin_ptr, rows, (t % n_gt) * BG, M, K, G, stride_m, stride_k,
-                          ROT, BM, BG)
-        acc = _nanmax(acc, tl.reduce(tl.abs(v), None, _nanmax))
-    tl.store(part_ptr + pid, acc)
+def _ladder(a):
+    """E2M1 magnitude index of ``a = |y|``: the midpoint comparisons of ``e2m1_codes`` (ties to even)."""
+    return ((a > 0.25).to(tl.uint8) + (a >= 0.75).to(tl.uint8) + (a > 1.25).to(tl.uint8)
+            + (a >= 1.75).to(tl.uint8) + (a > 2.5).to(tl.uint8) + (a >= 3.5).to(tl.uint8)
+            + (a > 5.0).to(tl.uint8))
 
 
 @triton.jit
-def _quant_kernel(x_ptr, q_ptr, s_ptr, gs_ptr, part_ptr, cos_ptr, sin_ptr, M, K, G, stride_m, stride_k,
-                  pc4, n_part, ROT: tl.constexpr, DYNAMIC: tl.constexpr, BM: tl.constexpr, BG: tl.constexpr,
-                  PBLOCK: tl.constexpr):
-    """Pass 2 (or the only pass with a static scale): quantize, pack and swizzle one tile.
+def _signed_zero_if_nan(y):
+    bits = y.to(tl.int32, bitcast=True)
+    return tl.where(y == y, y, ((bits >> 31) << 31).to(tl.float32, bitcast=True))
 
-    The grid covers the padded scale matrix (ceil(M / 128) * 128 rows, ``4 * pc4`` columns).
-    """
-    pid_m, pid_g = tl.program_id(0), tl.program_id(1)
-    if DYNAMIC:
-        p = tl.arange(0, PBLOCK)
-        amax = tl.reduce(tl.load(part_ptr + p, mask=p < n_part, other=0.0), None, _nanmax)
-        raw_gs = tl.div_rn(amax, 2688.0)  # amax / (6 * 448)
-        gs = tl.where(raw_gs > 0, raw_gs, 1.0)  # 0, underflowing subnormal, or NaN -> 1
-        if (pid_m == 0) & (pid_g == 0):
-            tl.store(gs_ptr, gs)
+
+@triton.jit
+def _e2m1x2(lo, hi, NATIVE: tl.constexpr):
+    """Packed E2M1 byte ``code(hi) << 4 | code(lo)`` of two FP32 tensors (sign from the IEEE sign bit)."""
+    if NATIVE:
+        packed = tl.inline_asm_elementwise(
+            "{ .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, $2, $1; cvt.u32.u8 $0, t; }", "=r,r,r",
+            [_signed_zero_if_nan(lo), _signed_zero_if_nan(hi)], dtype=tl.uint32, is_pure=True, pack=1)
+        return packed.to(tl.uint8)
     else:
-        gs = tl.load(gs_ptr)
+        slo = ((lo.to(tl.int32, bitcast=True) >> 31) & 1).to(tl.uint8)
+        shi = ((hi.to(tl.int32, bitcast=True) >> 31) & 1).to(tl.uint8)
+        return (_ladder(tl.abs(lo)) | (slo << 3)) | ((_ladder(tl.abs(hi)) | (shi << 3)) << 4)
+
+
+@triton.jit
+def _global_scale(amax):
+    raw_gs = tl.div_rn(amax, 2688.0)  # amax / (6 * 448)
+    return tl.where(raw_gs > 0, raw_gs, 1.0)  # 0, underflowing subnormal, or NaN -> 1
+
+
+@triton.jit
+def _store_tile(v, bamax, q_ptr, s_ptr, gs, pid_m, pid_g, M, K, G, pc4, BM: tl.constexpr, BG: tl.constexpr,
+                NATIVE: tl.constexpr):
+    """Block scales, E2M1 codes, packing and the swizzled scale store of a rotated (BM, BG, 16) tile."""
     rows = pid_m * BM + tl.arange(0, BM)
     groups = pid_g * BG + tl.arange(0, BG)
-    v = _load_rotated(x_ptr, cos_ptr, sin_ptr, rows, pid_g * BG, M, K, G, stride_m, stride_k, ROT, BM, BG)
-    v = tl.reshape(v, (BM, BG, 16))
-
     # E4M3 block scale: clamp(amax / (6 gs), max=448) -> e4m3 (round to nearest even).
-    bamax = tl.reduce(tl.abs(v), 2, _nanmax)
     block = tl.minimum(tl.div_rn(bamax, 6.0 * gs), 448.0, propagate_nan=tl.PropagateNan.ALL)
     block8 = block.to(tl.float8e4nv)
     scale = block8.to(tl.float32) * gs
     safe = tl.where(scale > 0, scale, 1.0)
     y = tl.div_rn(v, safe[:, :, None])
 
-    # E2M1 codes: the comparisons of ``e2m1_codes`` (ties to even), sign from the IEEE sign bit.
-    a = tl.abs(y)
-    code = ((a > 0.25).to(tl.uint8) + (a >= 0.75).to(tl.uint8) + (a > 1.25).to(tl.uint8)
-            + (a >= 1.75).to(tl.uint8) + (a > 2.5).to(tl.uint8) + (a >= 3.5).to(tl.uint8)
-            + (a > 5.0).to(tl.uint8))
-    sign = ((y.to(tl.int32, bitcast=True) >> 31) & 1).to(tl.uint8)
-    code = code | (sign << 3)
-    lo, hi = tl.split(tl.reshape(code, (BM, BG, 8, 2)))
-    packed = tl.reshape(lo | (hi << 4), (BM, BG * 8))
+    lo, hi = tl.split(tl.reshape(y, (BM, BG, 8, 2)))
+    packed = tl.reshape(_e2m1x2(lo, hi, NATIVE), (BM, BG * 8))
     pcols = pid_g * BG * 8 + tl.arange(0, BG * 8)
     half = K // 2
     tl.store(q_ptr + rows[:, None].to(tl.int64) * half + pcols[None, :], packed,
@@ -194,6 +230,46 @@ def _quant_kernel(x_ptr, q_ptr, s_ptr, gs_ptr, part_ptr, cos_ptr, sin_ptr, M, K,
     tl.store(s_ptr + offs, bits, mask=groups[None, :] < pc4 * 4)
 
 
+@triton.jit
+def _amax_kernel(x_ptr, part_ptr, cos_ptr, sin_ptr, M, K, G, stride_m, stride_k, n_gt, n_tiles,
+                 ROT: tl.constexpr, BM: tl.constexpr, BG: tl.constexpr):
+    """Pass 1: partial[program] = NaN-propagating max |R x| over a strided set of tiles."""
+    tl.extra.cuda.gdc_launch_dependents()  # pass 2 may start now (a no-op without PDL)
+    pid = tl.program_id(0)
+    acc = tl.zeros((), dtype=tl.float32)
+    for t in range(pid, n_tiles, tl.num_programs(0)):
+        rows = (t // n_gt) * BM + tl.arange(0, BM)
+        v = _load_rotated(x_ptr, cos_ptr, sin_ptr, rows, (t % n_gt) * BG, M, K, G, stride_m, stride_k,
+                          ROT, BM, BG)
+        acc = _nanmax(acc, tl.reduce(tl.abs(v), None, _nanmax))
+    tl.store(part_ptr + pid, acc)
+
+
+@triton.jit
+def _quant_kernel(x_ptr, q_ptr, s_ptr, gs_ptr, part_ptr, cos_ptr, sin_ptr, M, K, G, stride_m, stride_k,
+                  pc4, n_part, ROT: tl.constexpr, DYNAMIC: tl.constexpr, BM: tl.constexpr, BG: tl.constexpr,
+                  PBLOCK: tl.constexpr, NATIVE: tl.constexpr, PDL: tl.constexpr):
+    """Pass 2 (or the only pass with a static scale): quantize, pack and swizzle one tile.
+
+    The grid covers the padded scale matrix (ceil(M / 128) * 128 rows, ``4 * pc4`` columns).
+    """
+    pid_m, pid_g = tl.program_id(0), tl.program_id(1)
+    rows = pid_m * BM + tl.arange(0, BM)
+    v = tl.reshape(_load_rotated(x_ptr, cos_ptr, sin_ptr, rows, pid_g * BG, M, K, G, stride_m, stride_k,
+                                 ROT, BM, BG), (BM, BG, 16))
+    bamax = tl.reduce(tl.abs(v), 2, _nanmax)
+    if DYNAMIC:
+        if PDL:  # the lines above only read x and the tables; the partials are complete after the wait
+            tl.extra.cuda.gdc_wait()
+        p = tl.arange(0, PBLOCK)
+        gs = _global_scale(tl.reduce(tl.load(part_ptr + p, mask=p < n_part, other=0.0), None, _nanmax))
+        if (pid_m == 0) & (pid_g == 0):
+            tl.store(gs_ptr, gs)
+    else:
+        gs = tl.load(gs_ptr)
+    _store_tile(v, bamax, q_ptr, s_ptr, gs, pid_m, pid_g, M, K, G, pc4, BM, BG, NATIVE)
+
+
 # ======================================================================================
 # Launch
 # ======================================================================================
@@ -201,19 +277,21 @@ _PLANS: dict = {}
 
 
 def _launch(kernel, grid: tuple[int, int, int], tensors: tuple, scalars: tuple, constants: tuple,
-            num_warps: int) -> None:
+            num_warps: int, pdl: bool = False) -> None:
     """Launch ``kernel(*tensors, *scalars, *constants)`` with FP contraction disabled.
 
     The first call per specialization compiles; later calls use Triton's C launcher. The plan key
-    holds what Triton specializes on: dtypes, 16-byte alignment and integer values.
+    holds what Triton specializes on: dtypes, 16-byte alignment and integer values. ``pdl`` sets the
+    programmatic-stream-serialization launch attribute (a CUDA graph keeps it as a programmatic edge).
     """
-    key = (kernel, tensors[0].device, constants, num_warps, *[(t.dtype, t.data_ptr() & 15) for t in tensors],
+    key = (kernel, tensors[0].device, constants, num_warps, pdl, *[(t.dtype, t.data_ptr() & 15) for t in tensors],
            *scalars)
     plan = _PLANS.get(key)
     if plan is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Warm up NVFP4 kernels eagerly once per shape before CUDA-graph capture")
-        compiled = kernel[grid](*tensors, *scalars, *constants, num_warps=num_warps, enable_fp_fusion=False)
+        compiled = kernel[grid](*tensors, *scalars, *constants, num_warps=num_warps, enable_fp_fusion=False,
+                                launch_pdl=pdl)
         _PLANS[key] = compiled, _c_launcher(compiled)
         return
     compiled, direct = plan
@@ -266,43 +344,117 @@ def _check(x: Tensor, rotation: str, tables) -> tuple[int, int, tuple[Tensor, Te
     return M, K, None
 
 
-def _amax(x, M, K, workspace, rot, tables) -> int:
+@functools.cache
+def _pass1(M: int, K: int, rot: str) -> tuple:
+    """(grid, scalars after the strides, constants, warps) of pass 1 (cached per shape)."""
     G = K // 16
-    bm, bg, warps = _tile(M, rot)
+    bm, bg, warps = _amax_tile(M, K, rot)
     n_gt = -(-G // bg)
     n_tiles = -(-M // bm) * n_gt
-    programs = max(1, min(n_tiles, MAX_PARTIALS))
-    cos, sin = tables if tables is not None else (workspace, workspace)
-    _launch(_amax_kernel, (programs, 1, 1), (x, workspace, cos, sin),
-            (M, K, G, x.stride(0), x.stride(1), n_gt, max(n_tiles, 1)), (ROTATIONS[rot], bm, bg), warps)
-    return programs
+    programs = max(1, min(n_tiles, PASS1_PROGRAMS))
+    return (programs, 1, 1), (n_gt, n_tiles), (ROTATIONS[rot], bm, bg), warps
 
 
-def _quant(x, M, K, packed_u8, scale, gs, workspace, n_part, rot, tables) -> None:
+@functools.cache
+def _pass2(M: int, K: int, rot: str, dynamic: bool, n_part: int, pdl: bool, native: bool) -> tuple:
+    """(grid, pc // 4, constants, warps) of pass 2 (cached per shape and setting)."""
     pr, pc = scale_layout(M, K)
-    bm, bg, warps = _tile(M, rot)
+    bm, bg, warps = _quant_tile(M, K, rot)
+    pblock = 1 << max(n_part - 1, 0).bit_length() if dynamic else 1  # next power of 2
+    return (pr // bm, -(-pc // bg), 1), pc // 4, (ROTATIONS[rot], dynamic, bm, bg, pblock, native, pdl), warps
+
+
+def _n_partials(M: int, K: int, rot: str) -> int:
+    """Pass-1 programs (= partials): one per tile, at most ``PASS1_PROGRAMS``."""
+    return _pass1(M, K, rot)[0][0]
+
+
+def _amax(x, M, K, workspace, rot, tables) -> int:
+    grid, (n_gt, n_tiles), constants, warps = _pass1(M, K, rot)
+    cos, sin = tables if tables is not None else (workspace, workspace)
+    _launch(_amax_kernel, grid, (x, workspace, cos, sin), (M, K, K // 16, x.stride(0), x.stride(1), n_gt, n_tiles),
+            constants, warps)
+    return grid[0]
+
+
+def _quant(x, M, K, packed_u8, scale, gs, workspace, n_part, rot, tables, pdl: bool = False) -> None:
     dynamic = workspace is not None
+    pdl = pdl and dynamic and OPTIONS["pdl"]
+    grid, pc4, constants, warps = _pass2(M, K, rot, dynamic, n_part if dynamic else 0, pdl, OPTIONS["native_cvt"])
     ws = workspace if dynamic else gs
     cos, sin = tables if tables is not None else (ws, ws)
-    _launch(_quant_kernel, (pr // bm, -(-pc // bg), 1), (x, packed_u8, scale, gs, ws, cos, sin),
-            (M, K, K // 16, x.stride(0), x.stride(1), pc // 4, n_part),
-            (ROTATIONS[rot], dynamic, bm, bg, MAX_PARTIALS), warps)
+    _launch(_quant_kernel, grid, (x, packed_u8, scale, gs, ws, cos, sin),
+            (M, K, K // 16, x.stride(0), x.stride(1), pc4, n_part), constants, warps, pdl)
+
+
+def _check_buffer(t, name: str, x: Tensor, dtypes: tuple, *, shape=None, numel=None, min_numel=None,
+                  flat: bool = False) -> None:
+    """A caller-owned buffer: a contiguous tensor on ``x.device`` with one of ``dtypes`` and the given size."""
+    if not isinstance(t, Tensor):
+        raise ValueError(f"{name} must be a tensor")
+    if t.device != x.device:
+        raise ValueError(f"{name} must be on {x.device}, not {t.device}")
+    if t.dtype not in dtypes:
+        raise ValueError(f"{name} must have dtype {' or '.join(str(d) for d in dtypes)}, not {t.dtype}")
+    if not t.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    if flat and t.ndim != 1:
+        raise ValueError(f"{name} must be 1-D, not {t.ndim}-D")
+    if shape is not None and tuple(t.shape) != tuple(shape):
+        raise ValueError(f"{name} must have shape {tuple(shape)}, not {tuple(t.shape)}")
+    if numel is not None and t.numel() != numel:
+        raise ValueError(f"{name} must have {numel} elements, not {t.numel()}")
+    if min_numel is not None and t.numel() < min_numel:
+        raise ValueError(f"{name} must have at least {min_numel} elements, not {t.numel()}")
 
 
 def launch_amax(x: Tensor, workspace: Tensor, rotation: str = "none", tables=None) -> int:
-    """Pass 1 into ``workspace`` (>= MAX_PARTIALS + 1 float32). Returns the number of partials."""
+    """Pass 1 of the dynamic mode into ``workspace``. Returns the number of partials ``n``.
+
+    ``x``: CUDA (M, K) float32 / bfloat16 / float16, K a multiple of 16 (any strides).
+    ``workspace``: caller-owned 1-D contiguous ``torch.float32`` tensor on ``x.device`` with at least
+    ``n`` elements; ``n`` is at most ``PASS1_PROGRAMS``, so ``MAX_PARTIALS`` elements are always enough.
+    The kernel writes ``workspace[:n]`` only. Pass ``n`` to ``launch_quant(..., n_part=n)``.
+    """
     M, K, tables = _check(x, rotation, tables)
+    _check_buffer(workspace, "workspace", x, (torch.float32,), flat=True, min_numel=_n_partials(M, K, rotation))
     return _amax(x, M, K, workspace, rotation, tables)
 
 
 def launch_quant(x: Tensor, packed: Tensor, scale: Tensor, global_scale: Tensor, *, rotation: str = "none",
                  tables=None, workspace: Tensor | None = None, n_part: int = 0) -> None:
-    """Pass 2 or the static single pass, into ``packed`` (uint8 view) and ``scale`` (float8_e4m3fn).
+    """Pass 2 (dynamic) or the static single pass, into caller-owned ``packed``, ``scale`` and ``global_scale``.
 
-    With ``workspace`` (dynamic) the kernel reduces its first ``n_part`` partials and writes the
-    tensor scale to ``global_scale``; without it, ``global_scale`` is read (static).
+    Buffers (all contiguous and on ``x.device``; ``(pr, pc) = scale_layout(M, K)``):
+    * ``packed``: shape (M, K // 2), ``torch.uint8`` or ``torch.float4_e2m1fn_x2``;
+    * ``scale``: ``pr * pc`` elements, ``torch.uint8`` or ``torch.float8_e4m3fn`` (swizzled, padding written);
+    * ``global_scale``: one ``torch.float32`` element.
+
+    Dynamic (``workspace`` given): ``workspace`` is a 1-D contiguous ``torch.float32`` tensor with at
+    least ``n = _n_partials(M, K, rotation)`` elements that ``launch_amax`` filled, and ``n_part`` must
+    equal the exact count ``n`` returned by ``launch_amax`` for ``(M, K, rotation)`` (any other count,
+    including ``0``, ``n - 1``, or ``n + 1``, raises ``ValueError``); the kernel reduces ``workspace[:n_part]``
+    and writes the tensor scale to ``global_scale``.
+    Static (``workspace`` None): ``global_scale`` is read, and ``n_part`` must stay 0.
+    This public entry point launches without PDL (the caller may write ``x`` between the two passes).
     """
     M, K, tables = _check(x, rotation, tables)
+    pr, pc = scale_layout(M, K)
+    _check_buffer(packed, "packed", x, (torch.uint8, torch.float4_e2m1fn_x2), shape=(M, K // 2))
+    _check_buffer(scale, "scale", x, (torch.uint8, torch.float8_e4m3fn), numel=pr * pc)
+    _check_buffer(global_scale, "global_scale", x, (torch.float32,), numel=1)
+    if type(n_part) is not int:
+        raise ValueError(f"n_part must be an int, not {type(n_part).__name__}")
+    if workspace is not None:
+        expected_n = _n_partials(M, K, rotation)
+        _check_buffer(workspace, "workspace", x, (torch.float32,), flat=True, min_numel=expected_n)
+        if n_part != expected_n:
+            raise ValueError(
+                f"dynamic launch_quant needs n_part == {expected_n} "
+                f"(the count returned by launch_amax for ({M}, {K}, {rotation!r})), not {n_part}"
+            )
+    elif n_part != 0:
+        raise ValueError(f"static launch_quant (no workspace) takes n_part = 0, not {n_part}")
     _quant(x, M, K, packed.view(torch.uint8), scale.view(torch.float8_e4m3fn), global_scale, workspace, n_part,
            rotation, tables)
 
@@ -312,14 +464,15 @@ def _quantize(x: Tensor, M: int, K: int, rotation: str, tables, global_scale: Te
     packed = torch.empty((M, K // 2), dtype=torch.float4_e2m1fn_x2, device=x.device)
     scale = torch.empty(pr * pc, dtype=torch.float8_e4m3fn, device=x.device)
     packed_u8 = packed.view(torch.uint8)
-    if global_scale is None:
-        workspace = torch.empty(MAX_PARTIALS + 1, dtype=torch.float32, device=x.device)
-        gs = workspace[MAX_PARTIALS]
-        n_part = _amax(x, M, K, workspace, rotation, tables)
-        _quant(x, M, K, packed_u8, scale, gs, workspace, n_part, rotation, tables)
-    else:
-        gs = global_scale
-        _quant(x, M, K, packed_u8, scale, gs, None, 0, rotation, tables)
+    if global_scale is not None:
+        _quant(x, M, K, packed_u8, scale, global_scale, None, 0, rotation, tables)
+        return NVFP4Activation(packed, scale, global_scale)
+    n = _n_partials(M, K, rotation)
+    workspace = torch.empty(n + 1, dtype=torch.float32, device=x.device)
+    gs = workspace[n]
+    _amax(x, M, K, workspace, rotation, tables)
+    # Pass 1 is the launch right before pass 2 and only reads x, so pass 2 may overlap it (PDL).
+    _quant(x, M, K, packed_u8, scale, gs, workspace, n, rotation, tables, pdl=True)
     return NVFP4Activation(packed, scale, gs)
 
 
@@ -509,4 +662,4 @@ def dequantized_weight(layer: NVFP4Linear) -> Tensor:
 
 __all__ = ["NVFP4Activation", "NVFP4Linear", "quantize_activation", "quantize_activation_ref", "launch_amax",
            "launch_quant", "nvfp4_scaled_mm", "nvfp4_scaled_mm_public", "dequantize", "dequantized_weight", "nvfp4_encode_ref",
-           "butterfly_tables", "scale_layout", "ROTATIONS", "MAX_PARTIALS"]
+           "butterfly_tables", "scale_layout", "quantizer_plan", "ROTATIONS", "MAX_PARTIALS", "PASS1_PROGRAMS", "OPTIONS"]
