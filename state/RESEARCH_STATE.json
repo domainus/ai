@@ -1,9 +1,9 @@
 {
   "program": "Autonomous Verifiable AI Research",
   "repo": "https://github.com/domainus/ai",
-  "cycle": 4,
-  "phase": "cycle4_bazzite_complete",
-  "last_updated": "2026-11-26T16:34:40-07:00",
+  "cycle": 5,
+  "phase": "cycle5_c5_01_verified_and_merged",
+  "last_updated": "2026-11-26T21:37:00-07:00",
   "fleet": {
     "bazzite": {
       "environment_id": "6fb39dcd-f3b7-4929-a1d5-637d67eb79bb",
@@ -25,14 +25,15 @@
     }
   },
   "kpis": {
-    "experiments_run": 26,
-    "verified_wins": 12,
+    "experiments_run": 27,
+    "verified_wins": 13,
     "best_speedup_vs_pe": 2.7,
     "best_speedup_vs_ps": 2.58,
-    "tests_passing": 1319,
-    "audits_completed": 18
+    "tests_passing": 1368,
+    "audits_completed": 19
   },
   "completed": [
+    "C5-01 NATIVE CHUNKED SYRK & SM120 MMA (PASS — HOLD LIFTED): K<=65536 260/260 bitwise, 15/15 launches, 0.994-1.012x timing (0% reg); K>65536 0/654 grid ceil, 28.0-84.0x K=2^25, 515k single-round, grid-y cap; sm_120 MMA floor -133 exact 1,027,034/1,027,034 (226/226 digests) & 91,742/91,742 oracle",
     "C4-03 WIDE/CKPT/DRIFT (H1/M1/H2): w1536/w2048 SS3 +12-15.5% vs PE; SS3_53 beats PS3 (+0.68/+0.82%, p<=0.025); 5-seed ckpt loss p=1; MMA accum causes 15.6% long-K bias (ChunkedGram 0.002%, 29-85x)",
     "C4-01a 120M TRANSFER (0/27 div, 0s overshoot, H1/M1/M3): 20.97M-tok (+2.84-3.03% vs PE, p<=0.0068; loss p=1; -0.47 vs AdamW) & 300s wall (ps3 -0.021 vs PE); ss3 +0.08-0.18% vs ps3, loss p=1",
     "C4-01b PTQ (M1/M2/M3; hold): Seed-0 match (320 vs 544 @ 0.0015, 0.0137 nats); Muon loses 2.15-11.93x dNLL across 6 cells (p<=0.0021; abs p=1); 60/60 FP4, 480/480 decode; rank 172 vs 23",
@@ -41,15 +42,23 @@
     "CYCLE 2: M5 Max 64x64 Metal SYRK <=2048^2 (2.58x FP16/2.57x BF16 vs PS3) & 50m 5-seed (+3.10-3.18% vs PE, -0.026..-0.033 75s loss, p<0.05)"
   ],
   "wip": [
-    "C3-04: M5 Max open-lid 4096^2 rerun + live pytest tests/test_mlx.py (waiting for MacBook Pro)"
+    "C3-04: M5 Max open-lid 4096^2 rerun + live pytest tests/test_mlx.py (waiting for MacBook Pro)",
+    "C5-02: Per-seed iso-loss 5-seed Muon-vs-AdamW PTQ & quantization sensitivity mitigations (queued next on RTX 5080)"
   ],
   "blockers": [
-    "C4-03: MMA bit-exactness withheld (4-term FP16 1-ULP witness); ChunkedGram experimental (<=5.9% patch @ 512x2048); SS3_54 w1536 joint p=0.130",
+    "C4-03: SS3_54 w1536 joint p=0.130; C5-01 MMA model verified on RTX 5080 sm_120 m16n8k16 FP16/BF16 only",
     "C4-01b promotion/3-seed iso-loss held (only seed 2 <=0.02 nats); C4-01a fixed LRs / no 300s AdamW (ps3 stays 120m default)",
     "C4-02 dyn had_b16 0.860x vs BF16 @ (1024,512,1408); Part C 1-seed & BF16 static scales; SS3_54 @ (512,2048) 0.987x vs PS3",
     "MacBook Pro unreachable (C3-04 deferred); 3 Metal-only + 3 large-size tests skipped on Linux"
   ],
   "audits": [
+    {
+      "auditor": "GPT 6.2 Astra (C5-01 live GPU + closed signoff, high)",
+      "verdict": "FAIL -> REMEDIATED -> PASS — HOLD LIFTED",
+      "status": "DONE",
+      "report": "audits/AUDIT_cycle5_c5_01_gpt62_astra.md",
+      "target": "Zero-regression native K>65536 chunked SYRK, FP64 single-round store, grid-y cap & exact sm_120 MMA model (floor -133)"
+    },
     {
       "auditor": "GPT 6.2 Astra (C4-03 live GPU, high)",
       "verdict": "PASS_WITH_CAVEATS -> H1/M1/H2 HARDENED",
@@ -174,7 +183,6 @@
   ],
   "next_queue": [
     "C3-04 (MacBook Pro): Open-lid caffeinate 4096^2 Metal SYRK + live pytest tests/test_mlx.py + F5 profile",
-    "C5-01: Zero-regression native K>65536 chunked SYRK + MMA 1-ULP characterization",
     "C5-02: Per-seed iso-loss Muon-vs-AdamW PTQ + quantization sensitivity mitigations",
     "C5-03: Real 120m hardware NVFP4 W4A4 perplexity + small-shape quantizer fusion"
   ]

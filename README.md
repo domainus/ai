@@ -4,6 +4,15 @@ An open, continuously operating autonomous AI research repository investigating 
 
 ---
 
+## Cycle 5 Progress — `C5-01` Audited & Merged (1368 Passed, 6 Skipped on RTX 5080)
+
+- **`C5-01` (Zero-Regression Native `K > 65536` Chunked SYRK & Exact `sm_120` Tensor-Core MMA Model):** Audited live on RTX 5080 (`sm_120`) + closed Finding 5 signoff by **GPT 6.2 Astra (`high`)** (`FAIL -> REMEDIATED -> PASS — HOLD LIFTED`, [`AUDIT_cycle5_c5_01_gpt62_astra.md`](audits/AUDIT_cycle5_c5_01_gpt62_astra.md)); artifact [`results/cycle5_c5_01_syrk_and_mma.json`](results/cycle5_c5_01_syrk_and_mma.json) (`schema_version: cycle5_c5_01.v2`, SHA-256 `52821ce629c8dca05bd22bab08088521a30a02b6ea23a70fb440bc6ec3b80271`):
+  - **Zero Regression (`K <= 65536`):** `260/260` bitwise identical vs pre-C5-01 legacy blobs across `ps3_55`, `ss3_54`, `ss3_53`, `gram_ns`, and `triton_syrk`; `15/15` identical launch counts (`16/16/15`, `15/15` sync-free); `30/30` bitwise timing cells (`40` Williams rounds × `268 MB` `4×` L2 flush): graph GPU `0.9979–1.0027×` (wall `0.9971–1.0035×`), eager GPU `0.9936–1.0112×`.
+  - **Native `K > 65536` Chunked SYRK:** `0/654` grid design-ceiling violations (`654/654` bitwise `ChunkedGram` parity), `27.98–83.97×` (`27.92–84.14×` paired geomean) `K = 2^25` Opus speedup, `12/12` bitwise symmetry/sync-free (`diag_bias_max <= 0.003596` BF16 / `0.000458` FP16 / `0.0000226` FP32), `72/72` boundary parity, `38/38` special/degenerate inputs, `12/12` CUDA-graph replay (`0.0` diff), single-rounded FP64 store (`253,962` FP16 + `261,130` BF16 midpoint words), and `(1, 2^28)` CUDA `grid-y` cap (`[65535, 1]`).
+  - **Exact `sm_120` Tensor-Core MMA Model (`floor = -133`):** `1,027,034/1,027,034` bitwise dot-product matches across `226/226` live hardware digests (`64,512` stress + `59,422` SYRK configs + `903,100` audit seeds, `0` mismatches), `91,742/91,742` independent integer-oracle direct outputs isolating alignment floor `-133` from `-134`/`-132`/unfloored, `567,840/567,840` witness lane permutations, `31/31` edge cases (`0x7fffffff` NaN & `+0` negative underflow), and `52/52` closed Finding 5 offline-validator negative probes. *Scope limit:* verified on RTX 5080 `sm_120` `m16n8k16` FP16/BF16.
+
+---
+
 ## Cycle 4 Complete on RTX 5080 — `C4-02`, `C4-01b`, `C4-01a` & `C4-03` Audited & Merged (1319 Passed, 6 Skipped on RTX 5080)
 
 - **`C4-02` (End-to-End Blackwell NVFP4 W4A4 Inference — Online Triton Activation Quantizer, Block-16 Rotation & Real Hardware Perplexity):** Audited live on RTX 5080 (`sm_120`) by **GPT 6.2 Astra (`high`)** (`FAIL -> 7 findings remediated -> PASS — HOLD LIFTED`, [`AUDIT_cycle4_c4_02_gpt62_astra.md`](audits/AUDIT_cycle4_c4_02_gpt62_astra.md)); artifact [`results/cycle4_c4_02_nvfp4_e2e.json`](results/cycle4_c4_02_nvfp4_e2e.json) (`schema_version: cycle4_c4_02.v2`, `69,960` GPU events & `13,404` wall samples persisted, `0` D2H syncs, `216/216` quant parity, `60/60` int32 weight parity across all 5 methods):
@@ -86,6 +95,9 @@ Sources: [`results/m5_max_dense_cycle2.json`](results/m5_max_dense_cycle2.json),
 
 ## Independent Adversarial Audits (`audits/`)
 
+### Cycle 5
+- **C5-01 (`GPT 6.2 Astra`, live RTX 5080 + closed Finding 5 signoff, `high`):** [`AUDIT_cycle5_c5_01_gpt62_astra.md`](audits/AUDIT_cycle5_c5_01_gpt62_astra.md) — `FAIL -> REMEDIATED -> PASS — HOLD LIFTED` (zero-regression `K <= 65536` `260/260` bitwise & `0.994–1.011×` timing; native `K > 65536` chunked SYRK `0/654` ceilings, `28.0–84.0×` `K=2^25`, `grid-y` `[65535, 1]`, `515k` FP64 single-round words; exact `sm_120` MMA floor `-133` across `1,027,034` dot products & `91,742` oracle checks; `52/52` closed validator probes)
+
 ### Cycle 4
 - **C4-03 (`GPT 6.2 Astra`, live RTX 5080, `high`):** [`AUDIT_cycle4_c4_03_gpt62_astra.md`](audits/AUDIT_cycle4_c4_03_gpt62_astra.md) — `PASS_WITH_CAVEATS` -> H1/M1/H2 hardened (`w1536`/`w2048` wide transfer, negative 5-seed ckpt replication + deterministic eval-neutrality check, sequential MMA drift diagnosis + 4-term normal 1-ULP counterexample, `ChunkedGram` prototype, `353/353` live pytest cases)
 - **C4-01a (`GPT 6.2 Astra`, live RTX 5080, `high`):** [`AUDIT_cycle4_c4_01a_gpt62_astra.md`](audits/AUDIT_cycle4_c4_01a_gpt62_astra.md) — `PASS_WITH_CAVEATS` -> H1/M1/M3 hardened (`ps3_blackwell` stays `120m` default; `42/42` paired contrasts & `27/27` rows recomputed, `48/48` tests, live `sm_120` dispatch, bitwise deadline rollback & `--resume` probes)
@@ -108,8 +120,11 @@ Sources: [`results/m5_max_dense_cycle2.json`](results/m5_max_dense_cycle2.json),
 ## Reproduction Commands
 
 ```bash
-# Run full verified suite (1319 passed, 6 skipped on Linux RTX 5080)
+# Run full verified suite (1368 passed, 6 skipped on Linux RTX 5080)
 PYTHONPATH=. .venv/bin/pytest -q
+
+# Cycle 5 C5-01 zero-regression native K>65536 chunked SYRK & exact sm_120 MMA model
+PYTHONPATH=. .venv/bin/python research/polar_opt/bench_c5_01_syrk_and_mma.py
 
 # Cycle 4 C4-03 wide-model transfer, 5-seed common-ckpt replication & K=2^25 Gram drift
 PYTHONPATH=. .venv/bin/python research/polar_opt/bench_c4_03_wide_and_gram_drift.py --stage wide --data-dir artifacts/real_text
