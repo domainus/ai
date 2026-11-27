@@ -44,6 +44,7 @@ import fnmatch
 import functools
 import hashlib
 import importlib
+import io
 import json
 import math
 import os
@@ -54,7 +55,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from datetime import datetime
 from pathlib import Path
 from statistics import median
@@ -916,7 +917,7 @@ def _validate_polar_quality(q: dict, where: str, *, rank: int, extra_keys: set[s
         else:
             mid_lo = (smin - 1.0) ** 2 if smin > 1.0 else ((1.0 - smax) ** 2 if smax < 1.0 else 0.0)
             lo = math.sqrt(((smin - 1.0) ** 2 + (smax - 1.0) ** 2 + (rank - 2) * mid_lo) / rank)
-            hi = 1.0 + math.sqrt((smin ** 2 + (rank - 1) * smax ** 2) / rank)
+            hi = math.sqrt(((smin + 1.0) ** 2 + (rank - 1) * (smax + 1.0) ** 2) / rank)
         _require(lo - 1e-12 <= err <= hi + 1e-12, f"{where}: rel_fro_err violates singular-value bounds")
     else:
         _require(q["sigma_min"] is None and q["sigma_max"] is None and q["rel_fro_err"] is None,
@@ -956,11 +957,22 @@ def _parse_iso_timestamp(text: str, field: str) -> datetime:
         raise ValueError(f"meta.{field}: invalid ISO timestamp {text!r}") from exc
 
 
+def _has_nul(obj) -> bool:
+    if isinstance(obj, str):
+        return "\x00" in obj
+    if isinstance(obj, dict):
+        return any(_has_nul(k) or _has_nul(v) for k, v in obj.items())
+    if isinstance(obj, (list, tuple)):
+        return any(_has_nul(x) for x in obj)
+    return False
+
+
 def _validate_meta(meta: dict, *, canonical: bool) -> None:
     expected_keys = {"git_sha", "git_dirty", "command", "environment", "numerics", "code_sha256", "code_modules",
                      "timestamp_start", "loadavg_start", "gpu_telemetry", "section_seconds", "timestamp_end",
                      "loadavg_end", "total_seconds"}
     _require(isinstance(meta, dict) and set(meta.keys()) == expected_keys, "meta keys differ from schema")
+    _require(not _has_nul(meta), "meta strings must not contain NUL bytes")
     _require(meta["git_sha"] is None or _is_hex(meta["git_sha"], 40), "meta.git_sha must be 40-hex or None")
     _require(isinstance(meta["git_dirty"], bool), "git_dirty must be recorded")
     _require(isinstance(meta["command"], list) and len(meta["command"]) >= 2
@@ -969,6 +981,13 @@ def _validate_meta(meta: dict, *, canonical: bool) -> None:
     if canonical:
         _require(meta["command"][1].endswith("bench_c5_01_syrk_and_mma.py") and "--quick" not in meta["command"],
                  "meta.command invalid for canonical run")
+    if canonical or meta["command"][1].endswith("bench_c5_01_syrk_and_mma.py"):
+        try:
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                parsed_cmd = parse_args(meta["command"][2:])
+        except SystemExit as exc:
+            raise ValueError("meta.command is not a valid runnable invocation") from exc
+        _require(parsed_cmd.canonical is canonical, "meta.command canonical mode differs")
     env = meta["environment"]
     expected_env_keys = {"python", "platform", "torch", "cuda", "cudnn", "host_cpus", "numpy", "env",
                          "triton", "device", "capability", "driver"}
@@ -1104,6 +1123,9 @@ def _validate_timing(payload: dict) -> None:
                          f"{where}: non-positive sample")
                 _require(r[v]["gpu_ms"] <= r[v]["wall_ms"] + 0.005, f"{where}: gpu_ms exceeds wall_ms")
         _assert_close_strict(c["summary"], timing_summary(c["rounds"]), f"{where}.summary", 1e-9)
+    timing_wall_s = sum(r[v]["wall_ms"] for c in cells for r in c["rounds"] for v in VARIANTS) / 1e3
+    _require(timing_wall_s <= payload["meta"]["section_seconds"]["timing"] + 1e-3,
+             "timing sample wall_ms sum exceeds meta.section_seconds.timing")
 
 
 def _validate_long_k(payload: dict) -> None:
@@ -1249,6 +1271,9 @@ def _validate_long_k(payload: dict) -> None:
             twin = {k: gc[k] for k in ("finite", "sigma_min", "sigma_max", "rel_fro_err")}
             _assert_close_strict(r["native"], twin,
                                  f"opus_l6 {r['shape']} {r['kernel']} {r['dtype']}.native vs grid", 1e-12)
+    opus_wall_s = sum(s[v]["wall_ms"] for r in lk["opus_l6"] for s in r["samples"] for v in VARIANTS) / 1e3
+    _require(opus_wall_s <= payload["meta"]["section_seconds"]["long_k"] + 1e-3,
+             "long_k opus_l6 sample wall_ms sum exceeds meta.section_seconds.long_k")
 
 
 def _digest_words(x: Tensor) -> str:

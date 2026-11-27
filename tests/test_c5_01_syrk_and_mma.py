@@ -777,6 +777,24 @@ def _structural_probes(canonical):
         (lambda p: p["meta"]["gpu_telemetry"]["start"].pop("time"), "gpu_telemetry"),
         (lambda p: p["timing"]["cells"][0]["rounds"][0]["native"].__setitem__(
             "gpu_ms", p["timing"]["cells"][0]["rounds"][0]["native"]["wall_ms"] + 1.0), "gpu_ms exceeds wall_ms"),
+        (lambda p: (
+            p["meta"]["command"].__setitem__(1, "research/polar_opt/bench_c5_01_syrk_and_mma.py")
+            if not p["meta"]["command"][1].endswith("bench_c5_01_syrk_and_mma.py") else None,
+            p["meta"]["command"].append("--help"),
+        ), "not a valid runnable invocation"),
+        (_set(["meta", "environment", "env", "PYTHONPATH"], ".\x00x"), "NUL"),
+        (lambda p: (
+            p["meta"]["section_seconds"].__setitem__(
+                "mma", p["meta"]["section_seconds"]["mma"] + p["meta"]["section_seconds"]["timing"] - 1e-4),
+            p["meta"]["section_seconds"].__setitem__("timing", 1e-4),
+        ), "exceeds meta.section_seconds.timing"),
+        (lambda p: (
+            p["timing"]["cells"][0]["rounds"][0]["native"].__setitem__(
+                "wall_ms", p["meta"]["section_seconds"]["timing"] * 2e3),
+            p["timing"]["cells"][0].__setitem__("summary", c5.timing_summary(p["timing"]["cells"][0]["rounds"])),
+        ), "exceeds meta.section_seconds.timing"),
+        (lambda p: next(r for r in p["long_k"]["inputs"] if "normal_quality" in r)["normal_quality"].update(
+            sigma_min=0.25, sigma_max=1.0, rel_fro_err=1.85), "violates singular-value bounds"),
     ]
     if canonical:
         probes += [
@@ -802,6 +820,8 @@ def _structural_probes(canonical):
             (_set(["long_k", "grid", 96, "cells", "ps3_55_fp16", "sigma_min"], 0.5),
              "rank-1 matrix must have sigma_min == sigma_max"),
             (_set(["long_k", "opus_l6", 0, "native", "sigma_max"], 0.93), "vs grid"),
+            (lambda p: p["long_k"]["opus_l6"][6]["control"].update(
+                sigma_min=0.25, sigma_max=2.0, rel_fro_err=2.35), "violates singular-value bounds"),
         ]
     return probes
 
