@@ -4,12 +4,16 @@ An open, continuously operating autonomous AI research repository investigating 
 
 ---
 
-## Cycle 5 Progress — `C5-01` Audited & Merged (1368 Passed, 6 Skipped on RTX 5080)
+## Cycle 5 Progress — `C5-01` & `C5-02` Audited & Merged (1468 Passed, 6 Skipped on RTX 5080)
 
 - **`C5-01` (Zero-Regression Native `K > 65536` Chunked SYRK & Exact `sm_120` Tensor-Core MMA Model):** Audited live on RTX 5080 (`sm_120`) + closed Finding 5 signoff by **GPT 6.2 Astra (`high`)** (`FAIL -> REMEDIATED -> PASS — HOLD LIFTED`, [`AUDIT_cycle5_c5_01_gpt62_astra.md`](audits/AUDIT_cycle5_c5_01_gpt62_astra.md)); artifact [`results/cycle5_c5_01_syrk_and_mma.json`](results/cycle5_c5_01_syrk_and_mma.json) (`schema_version: cycle5_c5_01.v2`, SHA-256 `52821ce629c8dca05bd22bab08088521a30a02b6ea23a70fb440bc6ec3b80271`):
   - **Zero Regression (`K <= 65536`):** `260/260` bitwise identical vs pre-C5-01 legacy blobs across `ps3_55`, `ss3_54`, `ss3_53`, `gram_ns`, and `triton_syrk`; `15/15` identical launch counts (`16/16/15`, `15/15` sync-free); `30/30` bitwise timing cells (`40` Williams rounds × `268 MB` `4×` L2 flush): graph GPU `0.9979–1.0027×` (wall `0.9971–1.0035×`), eager GPU `0.9936–1.0112×`.
   - **Native `K > 65536` Chunked SYRK:** `0/654` grid design-ceiling violations (`654/654` bitwise `ChunkedGram` parity), `27.98–83.97×` (`27.92–84.14×` paired geomean) `K = 2^25` Opus speedup, `12/12` bitwise symmetry/sync-free (`diag_bias_max <= 0.003596` BF16 / `0.000458` FP16 / `0.0000226` FP32), `72/72` boundary parity, `38/38` special/degenerate inputs, `12/12` CUDA-graph replay (`0.0` diff), single-rounded FP64 store (`253,962` FP16 + `261,130` BF16 midpoint words), and `(1, 2^28)` CUDA `grid-y` cap (`[65535, 1]`).
   - **Exact `sm_120` Tensor-Core MMA Model (`floor = -133`):** `1,027,034/1,027,034` bitwise dot-product matches across `226/226` live hardware digests (`64,512` stress + `59,422` SYRK configs + `903,100` audit seeds, `0` mismatches), `91,742/91,742` independent integer-oracle direct outputs isolating alignment floor `-133` from `-134`/`-132`/unfloored, `567,840/567,840` witness lane permutations, `31/31` edge cases (`0x7fffffff` NaN & `+0` negative underflow), and `52/52` closed Finding 5 offline-validator negative probes. *Scope limit:* verified on RTX 5080 `sm_120` `m16n8k16` FP16/BF16.
+- **`C5-02` (Per-Seed 5-Seed Iso-Loss Muon-vs-AdamW PTQ & Muon Sensitivity Mitigations — Honest Negative / Trade-Off Confirmation):** Audited live on RTX 5080 (`sm_120`) + v2–v4 closed signoff by **GPT 6.2 Astra (`high`)** (`FAIL -> REMEDIATED -> PASS — HOLD LIFTED`, [`AUDIT_cycle5_c5_02_gpt62_astra.md`](audits/AUDIT_cycle5_c5_02_gpt62_astra.md)); artifact [`results/cycle5_c5_02_isoloss_ptq_mitigation.json`](results/cycle5_c5_02_isoloss_ptq_mitigation.json) (`schema_version: cycle5_c5_02.v2`, SHA-256 `98ca25e62255e5449660bc08e3ada0e2a7df346c9637ecc18c033342c7603e53`, raw measurements preserved bit-for-bit from `da148c2`):
+  - **5-Seed Per-Seed Val-Only Iso-Loss Match (`50m` FineWeb-Edu, `seeds 1–5`):** All `5/5` matched on `val.bin` (`-0.001325` to `+0.003328` nats, mean `+0.001177`, mean `|gap| = 0.001812`) and confirmed on `test.bin` (`+0.000952` to `+0.006743`, mean `+0.003663`, all `<= 0.02` nats). Muon = `320` steps (`0.403` token equivalents); selected/trained AdamW (`lr=0.001`, `cosine=464`) = `720/720` (`0.907`), `944/944` (`1.190`), `880/896` (`1.109/1.129`), `784/800` (`0.988/1.008`), `672/672` (`0.847`) token equivalents (`2.10–2.95×` tokens).
+  - **Primary Test PTQ Contrast (`muon_ss3_54` vs `adamw`, pooled val-selected `adaptive_butterfly_b16_gptq`):** Muon loses **`1.57–2.98×`** more `test ΔNLL` across all `6` cells (`6`-cell Holm `p <= 0.000312`, `48`-cell Holm `p <= 0.005266`): NVFP4 W4A16 `0.002137` vs `0.000970` (`2.20×`), NVFP4 dyn W4A4 `0.011267` vs `0.007188` (`1.57×`), NVFP4 static W4A4 `0.011188` vs `0.007081` (`1.58×`), MXFP4 W4A16 `0.003675` vs `0.002103` (`1.75×`), INT2 g16 `0.033265` vs `0.011572` (`2.87×`), INT2 g32 `0.053958` vs `0.018116` (`2.98×`); final quantized NLL favors AdamW in all `6` cells within-contrast (`p <= 0.0244`, `3/6` under `48`-cell). Verified `200` W4A4 rows (`180` unique + `20` inherited zero-alpha), `60` FP4 GEMMs/fwd, `6,000` matrix decodes (`5,400` + `600`), max hw-vs-FP32 diff `0.000171` nats, and stable rank `172.49` vs `38.08` (signal alignment `1.153` vs `4.146`).
+  - **Mitigations (`muon_adamw_cooldown`, `muon_qat_cooldown`, weight-only `awq_*_gptq`):** AdamW cooldown trims `ΔNLL` slightly (`-0.000207` to `-0.005780`) at `+0.026409` BF16 penalty (`+0.0206–0.0262` net worse final NLL); identity-coord NVFP4 RTN QAT cuts plain-RTN `ΔNLL` (`0.009315 -> 0.000116` W4A16; `0.007785` dyn W4A4) at `+0.006463` BF16 penalty (`+0.002982` net worse dyn W4A4 final NLL vs plain Muon's best); weight-only AWQ selects `alpha=0` in `23/40` Muon / `15/40` AdamW cases (`-0.000363`/`-0.000325` W4A4 `ΔNLL`, `p >= 0.485`). *Caveats:* defaults unchanged (`ps3_blackwell`/`muon_ss3_54`); no optimizer-wide ratio claim; coupled stopping/exposure/floor-LR prevent isolating `+0.0037` test gap; `test.bin` scored by pre-commit seed-0 shakedowns; weight-only AWQ does not rule out W4A4-tuned AWQ and no explicit spectral penalty was tested; `50m` / `df=4` / `0.0625` sign-flip floor / `sm_120` scope.
 
 ---
 
@@ -97,6 +101,7 @@ Sources: [`results/m5_max_dense_cycle2.json`](results/m5_max_dense_cycle2.json),
 
 ### Cycle 5
 - **C5-01 (`GPT 6.2 Astra`, live RTX 5080 + closed Finding 5 signoff, `high`):** [`AUDIT_cycle5_c5_01_gpt62_astra.md`](audits/AUDIT_cycle5_c5_01_gpt62_astra.md) — `FAIL -> REMEDIATED -> PASS — HOLD LIFTED` (zero-regression `K <= 65536` `260/260` bitwise & `0.994–1.011×` timing; native `K > 65536` chunked SYRK `0/654` ceilings, `28.0–84.0×` `K=2^25`, `grid-y` `[65535, 1]`, `515k` FP64 single-round words; exact `sm_120` MMA floor `-133` across `1,027,034` dot products & `91,742` oracle checks; `52/52` closed validator probes)
+- **C5-02 (`GPT 6.2 Astra`, live RTX 5080 + v2–v4 closed signoff, `high`):** [`AUDIT_cycle5_c5_02_gpt62_astra.md`](audits/AUDIT_cycle5_c5_02_gpt62_astra.md) — `FAIL -> REMEDIATED -> PASS — HOLD LIFTED` (`43,145/43,145` non-timing leaf values across 8 checkpoints / 248 PTQ rows replayed; `20/20` checkpoint tensor hashes; `1,128` paired stats & `1,460` Holm adjustments; `6,000` (`5,400+600`) int32 weight checks; `116/116` validator negative probes; bit-exact v2 replay of raw `da148c2` data)
 
 ### Cycle 4
 - **C4-03 (`GPT 6.2 Astra`, live RTX 5080, `high`):** [`AUDIT_cycle4_c4_03_gpt62_astra.md`](audits/AUDIT_cycle4_c4_03_gpt62_astra.md) — `PASS_WITH_CAVEATS` -> H1/M1/H2 hardened (`w1536`/`w2048` wide transfer, negative 5-seed ckpt replication + deterministic eval-neutrality check, sequential MMA drift diagnosis + 4-term normal 1-ULP counterexample, `ChunkedGram` prototype, `353/353` live pytest cases)
@@ -120,11 +125,15 @@ Sources: [`results/m5_max_dense_cycle2.json`](results/m5_max_dense_cycle2.json),
 ## Reproduction Commands
 
 ```bash
-# Run full verified suite (1368 passed, 6 skipped on Linux RTX 5080)
+# Run full verified suite (1468 passed, 6 skipped on Linux RTX 5080)
 PYTHONPATH=. .venv/bin/pytest -q
 
 # Cycle 5 C5-01 zero-regression native K>65536 chunked SYRK & exact sm_120 MMA model
 PYTHONPATH=. .venv/bin/python research/polar_opt/bench_c5_01_syrk_and_mma.py
+
+# Cycle 5 C5-02 5-seed per-seed iso-loss PTQ & Muon mitigations (canonical & v2 postprocess)
+PYTHONPATH=. .venv/bin/python research/quant_ptq/bench_c5_02_isoloss_ptq_mitigation.py
+PYTHONPATH=. .venv/bin/python research/quant_ptq/bench_c5_02_isoloss_ptq_mitigation.py --postprocess-from-git da148c296a4b8750fa9e67c0145e4f0789ecba54
 
 # Cycle 4 C4-03 wide-model transfer, 5-seed common-ckpt replication & K=2^25 Gram drift
 PYTHONPATH=. .venv/bin/python research/polar_opt/bench_c4_03_wide_and_gram_drift.py --stage wide --data-dir artifacts/real_text
@@ -143,8 +152,8 @@ PYTHONPATH=. .venv/bin/python research/quant_ptq/bench_isoloss_ptq.py --data-dir
 # Cycle 4 C4-02 end-to-end Blackwell NVFP4 W4A4 inference benchmark
 PYTHONPATH=. .venv/bin/python research/quant_ptq/bench_nvfp4_e2e.py --data-dir artifacts/real_text --output results/cycle4_c4_02_nvfp4_e2e.json
 
-# Regenerate daily Cycle 4 HTML infographic
-PYTHONPATH=. .venv/bin/python reports/generate_infographic.py --date 2026-11-26
+# Regenerate daily Cycle 5 HTML infographic
+PYTHONPATH=. .venv/bin/python reports/generate_infographic.py --date 2026-11-27
 
 # Cycle 3 C3-03 3-clock CUDA-graph & 117-case Tier-1 refresh
 PYTHONPATH=. .venv/bin/python research/polar_opt/bench_c3_03_tier1_refresh.py
