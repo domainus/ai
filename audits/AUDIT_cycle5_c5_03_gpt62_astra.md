@@ -222,3 +222,40 @@ for count in (n, n - 1, n + 1):
     print(count, gs.item(), ref.global_scale.item())
 PY
 ```
+
+## Post-Remediation Re-Check (v3)
+
+**FAIL — HOLD PROMOTION**
+
+The committed result at `39ad667` certifies offline, and its raw measurements match the pinned source. The hold remains because the offline validator certifies a canonical postprocess command that the writer rejects. The quick benchmark and launcher results below concern the RTX 5080 (sm_120), driver 615.78.08.
+
+**Canonical evidence.** Compared with `798488e`, `0df8a0e` changed only the Blackwell module, the C5-03 driver and its test file. `39ad667` changed only the result JSON. All seven protected definitions matched byte for byte, including decorators, in the old and new Git blobs. They were `_amax_kernel`, `_quant_kernel`, `_launch`, `_pass1`, `_pass2`, `quantizer_plan` and `NVFP4Linear`. All three retained evidence files matched their pinned digests.
+
+| SHA-256 check | Verified value |
+|---|---|
+| Committed v2 JSON at `39ad667` | `e48ab55f8be45cff370085a4b40da694537b4fe9fbd579420332a5105f25b61b` |
+| Source v1 JSON at `726b20c`, measured by `38cef48` | `9ed6c9fd3879566f78e943f5aa54657b1f0e1c27e543e3e93f11103413da14ce` |
+| Recorded `source_raw_measurements_sha256` and recomputed v2 `raw_measurements_sha256` | `bacb1484441a8413315daecb19187528f3bf6900c736813073ad810f0482f5f3` |
+
+An independent serialization of the ten raw fields, excluding derived Part C analysis, produced identical bytes for v1 and v2.
+
+**Postprocess provenance.** Four command edits failed full validation. Both the measuring and postprocess commands rejected a bare script basename and a `fake/` prefix. Three more edits failed at the expected chronology check. Each placed a timestamp one second before its corresponding Git commit. For the producer check, the end time moved with the start to preserve elapsed time. The actual producer, source and postprocessor commit times were 10:31:21, 11:30:16 and 12:48:53 MST on 2026-11-27. The recorded run spanned 10:31:28 to 11:29:48, and postprocessing followed at 12:48:55.
+
+**Canonical output path — open.** For the pinned source, the parser returned exit code 2 for `/tmp/copy.json`, an output containing `..`, and a symlink at the filename. A directory symlink to the checkout’s `results` directory gave a different result. The parser accepted the canonical filename under that alias. Appending just that output option to an in-memory copy of the committed postprocess command still returned `certified_canonical=True`. On disposable copies of the directory layout, the writer rejected both the in-tree and external directory aliases and preserved the target bytes. The CLI and offline validator need the same destination rule as the guarded writer. [Parser](../research/quant_ptq/bench_c5_03_nvfp4_120m_fusion.py#L2785) · [Offline command check](../research/quant_ptq/bench_c5_03_nvfp4_120m_fusion.py#L2673)
+
+**Atomic writer.** The regression suite covers four parent-traversal spellings in each of two guarded modes, plus target and ancestor symlinks. A separate syscall trace observed one exclusive, no-follow temp creation. The reread, final target check, both sides of the rename and the directory sync used the same parent descriptor. The writer synced the staged file before replacement. Injected file-sync and replacement errors each preserved the old JSON. An injected directory-sync error raised after replacement, with the new JSON already visible. All three failures left zero staging files. Old-file preservation therefore applies to failures before the rename. A directory-sync error leaves crash durability uncertain. [Atomic write](../research/quant_ptq/bench_c5_03_nvfp4_120m_fusion.py#L1975)
+
+**Split launcher — closed.** Repeating the v2 probe used the same 129 × 768 BF16 input, a final value of 256 and a workspace initialized to 65,536. `launch_amax` returned 27. With exactly 27 partials, all 49,536 packed bytes, all 12,288 scale bytes and the FP32 global-scale bits matched the reference (0.095238097012043). Counts 26, 28 and 0 each raised `ValueError`. A 26-element workspace with count 27 also raised `ValueError`.
+
+**FP4 profile — closed.** The fresh quick result validated as noncanonical for parts ABC. It contained 87 parity cases, two Part A shapes and 87 Part C grid rows across three seeds. CUPTI recorded a CUTLASS sm_120 block-scaled E2M1 GEMM. All ten independent profile edits failed full `validate_results`. Two replaced or supplemented the FP4 GEMM with a BF16 GEMM. Three replaced the dynamic C5-03 amax, C5-03 quant or C4-02 amax kernel. Four added amax or renamed quant in the two static profiles. One added a quantizer to the GEMM-only profile.
+
+**Caveats.** The quick report correctly identified eight calibration sequences (seed 20261126), eight tiny-model training steps, 16 evaluation windows per split, and three flushed calls at 4× L2. It reported three seeds, df = 2, a sign-flip floor of 0.25 and the measured device. It contained none of `120m`, `640 steps`, `38cef48`, `4736807` or `726b20c`. Calling `caveats()` with canonical settings, `postprocess=None` and producer `0df8a0e` attributed the measurement to that producer and described `38cef48` only as an earlier run. Both specific v2 attribution examples are closed.
+
+Two statements still exceed the evidence. The genuine synthetic quick result said earlier cycles had scored “the same test.bin,” although the synthetic evaluation split had SHA-256 `4b4c7490e3e3a53f0f236ce93a05b515a0ab20f0d793fa872b07dbdd14d18165` and the canonical test split has SHA-256 `4eb46f1424856849d2973923dbf3c886d37eb743cf22053fc7e1eea1f41ab92a`. Separately, a parser-accepted six-seed protocol generated the correct floor of 0.03125 followed by the claim that significance was impossible. The exact test returned 0.03125 for six same-sign differences, below 0.05. The benchmark’s `analyze()` returns `None` for six seeds. This was a reporting probe only. Bind the holdout-history statement to the split digest and the statistical caveat to the analysis actually produced. [Caveats](../research/quant_ptq/bench_c5_03_nvfp4_120m_fusion.py#L1565) · [Analysis](../research/quant_ptq/bench_c5_03_nvfp4_120m_fusion.py#L1420)
+
+**Test runs.** Both commands used `PYTHONPATH=.` and `/home/ryan/Documents/projects/ai/.venv/bin/python` in the isolated worktree. A temporary pytest hook passed `--data-dir` and `--no-verify` only to the C5-03 quick fixture’s benchmark invocation. It used the repository’s synthetic-data generator with 65,536 training tokens and 16,384 tokens in each evaluation split. All assertions and benchmark code ran unchanged. No canonical training or scoring of the published test shard took place.
+
+| Pytest selection | Result |
+|---|---|
+| `tests/test_nvfp4_inference.py tests/test_c5_03_nvfp4_120m_fusion.py` | 276 passed, 10 warnings, 334.37 s |
+| `tests/test_c5_02_isoloss_ptq_mitigation.py -k test_committed_canonical_artifact` | 3 passed, 97 deselected, 23.72 s |
