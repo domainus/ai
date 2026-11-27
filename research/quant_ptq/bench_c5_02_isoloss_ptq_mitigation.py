@@ -87,6 +87,7 @@ import itertools
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -381,6 +382,38 @@ def _code_sha256_at_commit(git_sha: str, modules: tuple[str, ...]) -> str:
             raise ValueError(f"cannot read {module} at git_sha {git_sha}")
         digest.update(module.encode() + b"\0" + blob.stdout)
     return digest.hexdigest()
+
+
+@functools.cache
+def _driver_capabilities_at_commit(git_sha: str) -> tuple[str | None, bool]:
+    """``(declared SCHEMA_VERSION, supports --postprocess-from-git)`` of the driver committed at ``git_sha``."""
+    _require_git_commit(git_sha, "git_sha")
+    try:
+        tree = ast.parse(_git_blob(git_sha, _module_repo_path(DRIVER_MODULE)).decode())
+    except (SyntaxError, UnicodeDecodeError) as exc:
+        raise ValueError(f"cannot parse {DRIVER_MODULE} at git_sha {git_sha}") from exc
+    schema_version = None
+    has_postprocess_fn = False
+    has_postprocess_cli = False
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) \
+                and node.targets[0].id == "SCHEMA_VERSION" and isinstance(node.value, ast.Constant) \
+                and isinstance(node.value.value, str):
+            schema_version = node.value.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) \
+                and node.target.id == "SCHEMA_VERSION" and isinstance(node.value, ast.Constant) \
+                and isinstance(node.value.value, str):
+            schema_version = node.value.value
+        elif isinstance(node, ast.FunctionDef) and node.name == "postprocess_from_git":
+            has_postprocess_fn = True
+        elif isinstance(node, ast.FunctionDef) and node.name == "build_parser":
+            for child in ast.walk(node):
+                if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute) \
+                        and child.func.attr == "add_argument" and child.args \
+                        and isinstance(child.args[0], ast.Constant) \
+                        and child.args[0].value == "--postprocess-from-git":
+                    has_postprocess_cli = True
+    return schema_version, has_postprocess_fn and has_postprocess_cli
 
 
 def _digest(obj) -> str:
@@ -1654,6 +1687,11 @@ def caveats(payload: dict) -> list[str]:
                     f"{hw['decode_inherited_zero_alpha_matrices']} of the {hw['decode_checked_matrices']} matrix "
                     f"decode comparisons are inherited (analysis.hardware gives the unique and the inherited "
                     f"counts).")
+    preceded = [s["seed"] for s in payload["stage_a"]["seeds"]
+                if next(r for r in s["rows"] if r["arm"] == ADAMW)["steps"]
+                < next(r for r in s["rows"] if r["arm"] == ADAMW)["trained_steps"]]
+    selected_note = (f" (preceding the stopping step on seed{'' if len(preceded) == 1 else 's'} "
+                     f"{_join([str(s) for s in preceded])})" if preceded else "")
     notes = [
         f"Five paired seeds give 4 degrees of freedom. The seeds share one corpus, one calibration draw and one "
         f"set of test documents; the intervals condition on these and on the val-selected methods, and they omit "
@@ -1662,11 +1700,11 @@ def caveats(payload: dict) -> list[str]:
         f"two-sided sign-flip p-value cannot be below {SIGN_FLIP_MIN_P}, so it cannot pass a 0.05 threshold, with "
         f"or without a correction. Absence of significance is not evidence of equal PTQ sensitivity. Inference is "
         f"restricted to the {payload['preset']} preset in this training regime on {device}.",
-        "AdamW is one run per seed, stopped on val.bin, and the stopped weights are evaluated without "
-        "retraining. The val match of Stage B is therefore the Stage A match by construction. test.bin is held "
-        "out from the canonical selection rules: training, stopping, checkpoint selection, calibration, alpha "
-        "selection and method selection read train.bin and val.bin only. It is not a previously unseen "
-        "study-level holdout: seed-0 shakedown runs (timing_seed0.log and timing_seed0b.log; shakedown JSON "
+        f"AdamW is one run per seed, stopped on val.bin, and the selected step's weights{selected_note} are "
+        "evaluated without retraining. The val match of Stage B is therefore the Stage A match by construction. "
+        "test.bin is held out from the canonical selection rules: training, stopping, checkpoint selection, "
+        "calibration, alpha selection and method selection read train.bin and val.bin only. It is not a previously "
+        "unseen study-level holdout: seed-0 shakedown runs (timing_seed0.log and timing_seed0b.log; shakedown JSON "
         "SHA-256 39f2d27e...) scored the same test.bin before the initial commit 05ea4ae and the amendment "
         "0355d16, and the logs cannot show whether a person used those scores for a design decision. Training is "
         "not bit-reproducible on this host: fresh AdamW runs of one configuration differed by 0.06 to 0.07 nats "
@@ -1686,9 +1724,10 @@ def caveats(payload: dict) -> list[str]:
         "The pilot floor-LR probe is a sensitivity check at different losses, not an equal-loss proof: "
         "identity-GPTQ val NLL increase 0.0010 (NVFP4) / 0.0096 (INT2 g16) at val NLL 5.414 of a run stopped at "
         "848 steps, against 0.0010 / 0.0106 at 5.298 and 0.0008 / 0.0106 at 5.235 for fresh cosine runs of 544 "
-        "and 608 steps (val NLL 5.235-5.414). The PTQ loss of AdamW at LR 0.001 is about three times that of the "
-        "C4-01b AdamW recipe (LR 0.0015); seeds, stopping, duration and LR changed together, so the difference is "
-        "not attributed to the LR.",
+        "and 608 steps (val NLL 5.235-5.414). In the canonical five-seed run, the primary AdamW test delta-NLL "
+        "means at LR 0.001 are 1.38-4.02x those of the C4-01b AdamW recipe at LR 0.0015 (NVFP4 W4A16 2.60x, "
+        "dynamic W4A4 1.42x, static W4A4 1.38x, MXFP4 1.97x, INT2 g16 3.54x, INT2 g32 4.02x); seeds, stopping, "
+        "duration and LR changed together, so the difference is not attributed to the LR.",
         "Both cooldown arms branch from snapshots of the seed's Muon run, so their first "
         f"{protocol['adamw_cooldown']['muon_steps']} / {protocol['qat_cooldown']['muon_steps']} steps are that "
         "run's steps. Their BF16 baselines differ from Muon; bf16_nll_diff and nll_diff report the net effect. "
@@ -1809,11 +1848,28 @@ def _timestamp(text, field: str) -> datetime:
         raise ValueError(f"{field}: invalid ISO timestamp {text!r}") from exc
 
 
+SCRIPT_REPO_PARTS = ("research", "quant_ptq", SCRIPT_NAME)
+
+
+def _is_python_executable(exe: str) -> bool:
+    return bool(re.fullmatch(r"python(\d+(\.\d+)*)?(\.exe)?", Path(exe).name.lower()))
+
+
+def _is_driver_script(arg: str) -> bool:
+    parts = Path(arg).parts
+    return parts == (SCRIPT_NAME,) or (len(parts) >= len(SCRIPT_REPO_PARTS)
+                                       and parts[-len(SCRIPT_REPO_PARTS):] == SCRIPT_REPO_PARTS)
+
+
+def _cli_option_present(argv: list[str], flag: str) -> bool:
+    return any(a == flag or a.startswith(flag + "=") for a in argv)
+
+
 def _parsed_command(command, label: str) -> argparse.Namespace:
     """``command`` as a runnable invocation of this script, parsed by its own CLI."""
     _require(isinstance(command, list) and len(command) >= 2 and all(isinstance(x, str) and x for x in command)
-             and "python" in Path(command[0]).name.lower(), f"{label} must be a Python invocation")
-    _require(command[1].endswith(SCRIPT_NAME), f"{label} is not an invocation of {SCRIPT_NAME}")
+             and _is_python_executable(command[0]), f"{label} must be a Python invocation")
+    _require(_is_driver_script(command[1]), f"{label} is not an invocation of {SCRIPT_NAME}")
     try:
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             return parse_args(command[2:])
@@ -1928,10 +1984,12 @@ def _validate_meta(payload: dict, *, canonical: bool, schema: str) -> None:
     meta = payload["meta"]
     _require(isinstance(meta, dict) and set(meta) == META_KEYS, "meta keys differ from the schema")
     _require(meta["git_sha"] is None or _is_hex(meta["git_sha"], 40), "meta.git_sha must be 40-hex or None")
+    if meta["git_sha"] is not None:
+        _require_git_commit(meta["git_sha"], "meta.git_sha")
     _require(meta["git_dirty"] is None or type(meta["git_dirty"]) is bool, "meta.git_dirty must be a bool")
     command = meta["command"]
     _require(isinstance(command, list) and len(command) >= 2 and all(isinstance(x, str) and x for x in command)
-             and "python" in Path(command[0]).name.lower(), "meta.command must be a Python invocation")
+             and _is_python_executable(command[0]), "meta.command must be a Python invocation")
     env = meta["environment"]
     _validate_environment(env, canonical=canonical)
     _require(_same(meta["numerics"], NUMERICS), "full-precision numerics are required")
@@ -1974,16 +2032,31 @@ def _validate_meta(payload: dict, *, canonical: bool, schema: str) -> None:
     if canonical:
         _require(_is_hex(meta["git_sha"], 40) and meta["git_dirty"] is False,
                  "a canonical result needs a 40-hex git_sha and a clean tree")
-        _require(command[1].endswith(SCRIPT_NAME) and "--quick" not in command,
+        _require(_is_driver_script(command[1]) and "--quick" not in command,
                  "meta.command is not the canonical invocation")
         parsed = _parsed_command(command, "meta.command")
         _require(parsed.canonical is True and parsed.postprocess_from_git is None,
                  "meta.command does not select the canonical protocol")
+        _require(parsed.resume == log["resume"], "meta.command --resume flag differs from meta.unit_log.resume")
+        if _cli_option_present(command[2:], "--checkpoint-dir"):
+            _require(str(parsed.checkpoint_dir) == meta["checkpoint_dir"],
+                     "meta.command --checkpoint-dir differs from meta.checkpoint_dir")
+        else:
+            _require(Path(meta["checkpoint_dir"]).parts[-2:] == ("artifacts", "c5_02_checkpoints"),
+                     "meta.checkpoint_dir differs from the canonical checkpoint directory")
+        if _cli_option_present(command[2:], "--data-dir"):
+            _require(str(parsed.data_dir) == payload["data"]["directory"],
+                     "meta.command --data-dir differs from data.directory")
     if payload["postprocess"] is None:  # a measuring run: the producer is this code
         _require(modules == list(code_modules()), "meta.code_modules differ from the static import closure")
         if canonical:
+            _require(modules == list(_code_modules_at_commit(meta["git_sha"])),
+                     "meta.code_modules differ from the static import closure at meta.git_sha")
             _require(meta["code_sha256"] == _code_sha256_at_commit(meta["git_sha"], tuple(modules)),
                      "meta.code_sha256 differs from the committed git blobs")
+            commit_schema, _ = _driver_capabilities_at_commit(meta["git_sha"])
+            _require(commit_schema == SCHEMA_VERSION,
+                     f"meta.git_sha declares schema {commit_schema!r}, not {SCHEMA_VERSION!r}")
 
 
 TRAINING_KEYS = {"arm", "seed", "steps", "warmup_steps", "lr", "auxiliary_lr", "weight_decay", "min_lr_ratio",
@@ -2171,10 +2244,10 @@ def _validate_butterfly_fits(c: dict, path: str, protocol: dict, layers: int, se
             _require(_same(fit["steps"], protocol["butterfly_steps"]) and _same(fit["lr"], BUTTERFLY_LR)
                      and _same(fit["layers"], layers) and _is_int(fit["layers_improved"])
                      and fit["layers_improved"] <= layers, f"{where}: steps, LR or layer counts differ")
-            _require(_nonneg(start) and _nonneg(fitted) and fitted <= start + 1e-9
-                     and (fitted < start) == (fit["layers_improved"] > 0),
-                     f"{where}: the fitted error must not exceed the Hadamard start, and must be below it "
-                     "exactly when a layer improved")
+            _require(_nonneg(start) and _nonneg(fitted) and fitted <= start
+                     and (fit["layers_improved"] > 0 or fitted == start),
+                     f"{where}: fitted error must satisfy 0 <= fitted <= start, and equal start when "
+                     "layers_improved == 0")
             _assert_close(fit["relative_error_reduction"], 1.0 - fitted / max(start, 1e-30),
                           f"{where}.relative_error_reduction")
 
@@ -2419,19 +2492,31 @@ def _validate_postprocess_provenance(payload: dict, *, canonical: bool) -> None:
                  f"{key} differs from the source artifact: a postprocess must not change a raw measurement")
     _require(post["source_raw_measurements_sha256"] == raw_measurements_sha256(payload),
              "postprocess.source_raw_measurements_sha256 differs from the raw measurements")
-    # Producer code: the import closure and the blobs of the commit that measured.
+    # Producer code: the import closure, blobs and schema declaration of the commit that measured.
     _require(meta["code_modules"] == list(_code_modules_at_commit(meta["git_sha"])),
              "meta.code_modules differ from the static import closure at meta.git_sha")
     _require(meta["code_sha256"] == _code_sha256_at_commit(meta["git_sha"], tuple(meta["code_modules"])),
              "meta.code_sha256 differs from the git blobs at meta.git_sha")
+    producer_schema, _ = _driver_capabilities_at_commit(meta["git_sha"])
+    _require(producer_schema == post["source_schema_version"],
+             f"meta.git_sha declares schema {producer_schema!r}, not {post['source_schema_version']!r}")
     # Postprocessing code: this code, as committed at postprocess_git_sha.
-    _require(post["postprocess_code_modules"] == list(code_modules()),
+    _require(post["postprocess_code_modules"] == list(code_modules())
+             and post["postprocess_code_modules"] == list(_code_modules_at_commit(post_sha)),
              "postprocess.postprocess_code_modules differ from the static import closure")
-    _require(post["postprocess_code_sha256"] == _code_sha256_at_commit(post_sha, tuple(code_modules())),
+    _require(post["postprocess_code_sha256"] == _code_sha256_at_commit(post_sha, tuple(post["postprocess_code_modules"])),
              "postprocess.postprocess_code_sha256 differs from the git blobs at postprocess_git_sha")
+    post_schema, has_post_cli = _driver_capabilities_at_commit(post_sha)
+    _require(post_schema == SCHEMA_VERSION and has_post_cli,
+             f"postprocess.postprocess_git_sha must commit {SCHEMA_VERSION} with --postprocess-from-git")
+    _require(post_sha != meta["git_sha"] and post_sha != source_sha,
+             "postprocess.postprocess_git_sha must differ from the producer and source commits")
     parsed = _parsed_command(post["postprocess_command"], "postprocess.postprocess_command")
     _require(parsed.postprocess_from_git == source_sha,
              "postprocess.postprocess_command must pass --postprocess-from-git with the source result commit")
+    if canonical:
+        _require(reserved(parsed.output) and Path(parsed.output).name == CANONICAL_OUTPUT.name,
+                 "postprocess.postprocess_command of a canonical result must target the canonical output path")
     _require(_timestamp(post["postprocess_timestamp"], "postprocess.postprocess_timestamp")
              >= _timestamp(meta["timestamp_end"], "meta.timestamp_end"),
              "postprocess.postprocess_timestamp is before the end of the measuring run")
@@ -2457,9 +2542,12 @@ def validate_results(payload: dict, *, canonical: bool | None = None) -> dict:
     * schema, strict JSON (no NaN / infinity, no NUL byte in any string), JSON integers and booleans
       with their exact types, and the exact protocol (canonical: the locked C5-02 protocol, the
       FineWeb-Edu GPT-2 shards with pinned hashes and token counts, sm_120+ device, clean tree);
-    * provenance of a measuring run (``postprocess`` is None): ``git_sha`` is a commit object,
-      ``code_sha256`` equals the transitive ``research.*`` blobs at that commit, and
-      ``run_config_hash`` / ``unit_config_hash`` are the recomputed digests;
+    * provenance of a measuring run (``postprocess`` is None): whenever ``meta.git_sha`` is non-None it is
+      checked as a git commit object (``git cat-file -t``), ``run_config_hash`` / ``unit_config_hash`` are the
+      recomputed digests, and ``meta.code_modules`` matches this driver's import closure. In canonical mode,
+      ``meta.git_dirty`` must be False, ``meta.code_sha256`` must equal the transitive ``research.*`` blobs at
+      ``meta.git_sha``, and the committed driver at ``meta.git_sha`` must declare ``SCHEMA_VERSION`` (exploratory
+      runs may start from dirty working trees and are not checked against committed blobs);
     * provenance of a postprocessed result: the source artifact is the committed file of
       ``source_result_git_sha`` (byte digest), every ``RAW_MEASUREMENT_KEYS`` value equals the source,
       the producer code is the import closure and the blobs at ``meta.git_sha`` (hashes under the
@@ -2710,10 +2798,13 @@ def postprocess_from_git(commit: str, command: list[str]) -> dict:
 
 
 def postprocess(args) -> dict:
-    """``--postprocess-from-git``: no GPU, no training. A reserved output needs a clean, committed tree."""
+    """``--postprocess-from-git``: no GPU, no training. A reserved output needs a clean tree and canonical source."""
     require_clean_tree(h.git_info(), args.output)  # before any work
     payload = postprocess_from_git(args.postprocess_from_git, [sys.executable, *sys.argv])
-    validate_results(payload, canonical=payload["canonical"])
+    want_canonical = True if reserved(args.output) else payload["canonical"]
+    cert = validate_results(payload, canonical=want_canonical)
+    if reserved(args.output) and not cert["certified_canonical"]:
+        raise ValueError(f"Refusing to write noncanonical postprocessed result to reserved {args.output.name}")
     return payload
 
 

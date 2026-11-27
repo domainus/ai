@@ -915,17 +915,28 @@ def _as_canonical(payload, monkeypatch):
     """Dress a --quick payload as a canonical one, so that every canonical branch of the validator runs."""
     p = copy.deepcopy(payload)
     hashes = {k: v["sha256"] for k, v in p["data"]["splits"].items()}
+    fake_sha = "a" * 40
+    orig_require, orig_modules, orig_code, orig_caps = (
+        b._require_git_commit, b._code_modules_at_commit, b._code_sha256_at_commit, b._driver_capabilities_at_commit)
     monkeypatch.setattr(b, "CANONICAL", copy.deepcopy(p["protocol"]))
     monkeypatch.setattr(b, "CANONICAL_DATA", {"source": copy.deepcopy(p["data"]["source"]),
                                               "encoding": p["data"]["encoding"],
                                               "tokens": {k: v["tokens"] for k, v in p["data"]["splits"].items()}})
     monkeypatch.setattr(b.q, "EXPECTED_SHA256", hashes)
-    monkeypatch.setattr(b, "_code_sha256_at_commit", lambda sha, modules: p["meta"]["code_sha256"])
+    monkeypatch.setattr(b, "_require_git_commit",
+                        lambda sha, label: None if sha == fake_sha else orig_require(sha, label))
+    monkeypatch.setattr(b, "_code_modules_at_commit",
+                        lambda sha: b.code_modules() if sha == fake_sha else orig_modules(sha))
+    monkeypatch.setattr(b, "_code_sha256_at_commit",
+                        lambda sha, modules: p["meta"]["code_sha256"] if sha == fake_sha else orig_code(sha, modules))
+    monkeypatch.setattr(b, "_driver_capabilities_at_commit",
+                        lambda sha: (b.SCHEMA_VERSION, True) if sha == fake_sha else orig_caps(sha))
     p["quick"], p["canonical"] = False, True
     p["data"].update(sha256_verified=True, expected_sha256=dict(hashes))
-    p["meta"].update(git_sha="a" * 40, git_dirty=False,
+    p["meta"].update(git_sha=fake_sha, git_dirty=False,
+                     checkpoint_dir=str(b.CANONICAL_CHECKPOINT_DIR),
                      command=["/venv/bin/python", f"research/quant_ptq/{b.SCRIPT_NAME}"])
-    p["run_config_hash"] = b.run_config_hash(False, p["protocol"], p["config"], p["meta"]["code_sha256"], "a" * 40,
+    p["run_config_hash"] = b.run_config_hash(False, p["protocol"], p["config"], p["meta"]["code_sha256"], fake_sha,
                                              p["meta"]["environment"], hashes)
     return p
 
@@ -966,6 +977,27 @@ def test_canonical_branches_of_the_validator_run_on_a_dressed_quick_payload(quic
             for row in unit["rows"][:3]:
                 row["orthogonalizer"] = "polar_express eager BF16 (CPU stand-in: the SS3_54 kernel needs CUDA)"
     _rejects(p, cpu_stand_in, "one orthogonalizer", canonical=True)
+    # CLI metadata consistency on a fresh canonical run (Astra re-check secondary findings).
+    _rejects(p, lambda x: _set(x, ["meta", "command"], [*x["meta"]["command"], "--resume"]),
+             "--resume flag differs", canonical=True)
+    _rejects(p, lambda x: _set(x, ["meta", "command"], [*x["meta"]["command"], "--checkpoint-dir", "elsewhere"]),
+             "--checkpoint-dir differs", canonical=True)
+    _rejects(p, lambda x: _set(x, ["meta", "command"], [*x["meta"]["command"], "--data-dir", "elsewhere"]),
+             "--data-dir differs", canonical=True)
+    _rejects(p, lambda x: _set(x, ["meta", "checkpoint_dir"], "/tmp/elsewhere"),
+             "canonical checkpoint directory", canonical=True)
+    # A v1 producer commit (0355d16) cannot be certified as the producer of a fresh v2 result.
+    v1_sha = "0355d16f258133b5fb7aec8e90fd223f781595e9"
+    v1_code = "424055b21b6f894ef850151501425839e5731e9919ac7399138d75788f7dc85b"
+
+    def v1_fresh_claim(x):
+        hashes = {k: v["sha256"] for k, v in x["data"]["splits"].items()}
+        x["meta"].update(git_sha=v1_sha, code_sha256=v1_code)
+        x["meta"]["unit_config_hash"] = b.unit_config_hash(
+            x["protocol"], x["config"], v1_code, x["meta"]["environment"], hashes, b.SCHEMA_VERSION)
+        x["run_config_hash"] = b.run_config_hash(
+            False, x["protocol"], x["config"], v1_code, v1_sha, x["meta"]["environment"], hashes, b.SCHEMA_VERSION)
+    _rejects(p, v1_fresh_claim, "declares schema 'cycle5_c5_02.v1'", canonical=True)
 
 
 def test_a_rejected_payload_is_kept_next_to_the_output(quick, quick_dir, monkeypatch):
@@ -1191,11 +1223,43 @@ def test_validate_results_rejects_stage_b_tampering(quick):
                                    2.0 * _get(p, [*fit, "weight_sq_error_hadamard_start"])), "fitted error")
     _rejects(quick, lambda p: _set(p, [*fit, "relative_error_reduction"], 0.5), "relative_error_reduction")
 
-    def improved_without_a_lower_error(p):
+    def unimproved_with_lower_error(p):
         record = _get(p, fit)
-        record["weight_sq_error_fitted"] = record["weight_sq_error_hadamard_start"]
+        record["weight_sq_error_fitted"] = 0.5 * record["weight_sq_error_hadamard_start"]
+        record["relative_error_reduction"], record["layers_improved"] = 0.5, 0
+    _rejects(quick, unimproved_with_lower_error, "equal start when layers_improved == 0")
+
+    def one_ulp_increase_when_unimproved(p):
+        record = _get(p, fit)
+        start = float(np.float32(0.001))
+        fitted = float(np.nextafter(np.float32(start), np.float32(1)))
+        record["weight_sq_error_hadamard_start"] = start
+        record["weight_sq_error_fitted"] = fitted
+        record["relative_error_reduction"] = 1.0 - fitted / start
+        record["layers_improved"] = 0
+    _rejects(quick, one_ulp_increase_when_unimproved, "0 <= fitted <= start")
+
+    def improved_with_rounded_equal_fp32_sum(p):
+        record = _get(p, fit)
+        record["weight_sq_error_hadamard_start"] = 190367301632.0
+        record["weight_sq_error_fitted"] = 190367301632.0
         record["relative_error_reduction"], record["layers_improved"] = 0.0, 1
-    _rejects(quick, improved_without_a_lower_error, "fitted error")
+    assert b.validate_results(_edited(quick, improved_with_rounded_equal_fp32_sum)) == NONCANONICAL
+
+    # Real CPU fit reproducer where 1 layer improves while the FP32 layer sum stays equal.
+    g = torch.Generator().manual_seed(7)
+    w = torch.randn(2, 1, 16, generator=g)
+    rot = q.Butterfly(16, q.Butterfly.initial_angles((2,), 16, 16))
+    fmt = q.FORMATS["nvfp4_g16"]
+    z = q.quantize_rtn(rot.forward(w), fmt)
+    noise = torch.randn(2, 1, 16, generator=g)
+    w[:1] = rot.inverse(z + 0.001 * noise)[:1] * 100_000_000
+    _, real_fit = q.fit_butterfly(w, fmt, steps=5)
+    assert real_fit["layers_improved"] == 1
+    assert real_fit["weight_sq_error_hadamard_start"] == real_fit["weight_sq_error_fitted"] == 190367301632.0
+    assert real_fit["relative_error_reduction"] == 0.0
+    real_accepted = _edited(quick, lambda p: _set(p, fit, {**real_fit, "layers": _get(p, [*fit, "layers"])}))
+    assert b.validate_results(real_accepted) == NONCANONICAL
     # Quantizer metadata, durations and exact scalar types of the grid rows.
     rtn = next(i for i, r in enumerate(grid) if r["method"] == "rtn" and r["mode"].endswith("fakequant"))
     assert grid[rtn]["gptq_damping_max"] is None and grid[fake]["gptq_damping_max"] >= b.GPTQ_DAMP
@@ -1282,6 +1346,15 @@ def test_validate_results_rejects_summary_provenance_and_schema_tampering(quick)
     _rejects(quick, lambda p: _set(p, ["meta", "code_sha256"], "0" * 64), "unit_config_hash|run_config_hash")
     _rejects(quick, lambda p: _set(p, ["meta", "unit_config_hash"], "0" * 16), "unit_config_hash")
     _rejects(quick, lambda p: _set(p, ["meta", "git_sha"], "xyz"), "git_sha")
+    hashes = {k: v["sha256"] for k, v in quick["data"]["splits"].items()}
+
+    def bogus_exploratory_commit(p):
+        zero = "0" * 40
+        p["meta"]["git_sha"] = zero
+        p["run_config_hash"] = b.run_config_hash(
+            p["quick"], p["protocol"], p["config"], p["meta"]["code_sha256"], zero,
+            p["meta"]["environment"], hashes, b.SCHEMA_VERSION)
+    _rejects(quick, bogus_exploratory_commit, "not a commit object")
     _rejects(quick, lambda p: _set(p, ["meta", "extra"], 1), "meta keys differ")
     _rejects(quick, lambda p: _set(p, ["meta", "numerics", "allow_tf32"], True), "full-precision numerics")
     _rejects(quick, lambda p: _set(p, ["meta", "unit_log", "units_run"], 3), "unit_log")
@@ -1680,6 +1753,32 @@ def test_committed_canonical_artifact_rejects_postprocess_provenance_tampering(c
     rejects(lambda p: _set(p, [*post, "postprocess_git_sha"], "0" * 40), "not a commit object")
     rejects(lambda p: _set(p, [*post, "postprocess_git_sha"], p["meta"]["git_sha"]),
             "git blobs at postprocess_git_sha")  # the v1 producer commit holds other code
+    # Astra re-check Blocking 1a: claiming v1 producer commit as both postprocessor and blob source is rejected.
+    rejects(lambda p: _update(_get(p, post), postprocess_git_sha=p["meta"]["git_sha"],
+                              postprocess_code_sha256=p["meta"]["code_sha256"]),
+            "must commit cycle5_c5_02.v2 with --postprocess-from-git")
+    # Astra re-check Blocking 1b: stripping postprocess and recomputing v2 hashes on v1 producer fails.
+    def v1_as_fresh_v2(p):
+        p["postprocess"] = None
+        hashes = {k: v["sha256"] for k, v in p["data"]["splits"].items()}
+        p["meta"]["unit_config_hash"] = b.unit_config_hash(
+            p["protocol"], p["config"], p["meta"]["code_sha256"], p["meta"]["environment"], hashes, b.SCHEMA_VERSION)
+        p["run_config_hash"] = b.run_config_hash(
+            False, p["protocol"], p["config"], p["meta"]["code_sha256"], p["meta"]["git_sha"],
+            p["meta"]["environment"], hashes, b.SCHEMA_VERSION)
+    rejects(v1_as_fresh_v2, "declares schema 'cycle5_c5_02.v1'")
+    # Astra re-check Blocking 3a/3b on canonical artifact: 1-ULP increase fails, rounded FP32 tie with 1 improved passes.
+    bf_key = "nvfp4_g16/adaptive_butterfly_b16_gptq"
+    bf_path = ["stage_b", "checkpoints", 0, "butterfly_fits", bf_key, "qkv"]
+
+    def canon_one_ulp_increase(p):
+        rec = _get(p, bf_path)
+        start = float(np.float32(0.001))
+        fitted = float(np.nextafter(np.float32(start), np.float32(1)))
+        rec.update(weight_sq_error_hadamard_start=start, weight_sq_error_fitted=fitted,
+                   relative_error_reduction=1.0 - fitted / start, layers_improved=0)
+    rejects(canon_one_ulp_increase, "0 <= fitted <= start")
+
     rejects(lambda p: _set(p, [*post, "postprocess_git_dirty"], True), "clean tree")
     # Command.
     command = canonical["postprocess"]["postprocess_command"]
@@ -1687,11 +1786,20 @@ def test_committed_canonical_artifact_rejects_postprocess_provenance_tampering(c
                        ([*command[:3], "0355d16f258133b5fb7aec8e90fd223f781595e9"], "source result commit"),
                        ([*command[:3], "da148c2"], "valid runnable invocation"),
                        ([*command, "--resume"], "valid runnable invocation"),
+                       ([*command, "--output", "/tmp/copy.json"], "must target the canonical output path"),
                        (["bash", *command[1:]], "Python invocation"),
+                       (["not-a-python-interpreter", *command[1:]], "Python invocation"),
                        ([command[0], "other.py", *command[2:]], "not an invocation"),
+                       ([command[0], "tests/test_bench_c5_02_isoloss_ptq_mitigation.py", *command[2:]],
+                        "not an invocation"),
                        ("python", "Python invocation")):
         rejects(lambda p: _set(p, [*post, "postprocess_command"], bad), match)
     rejects(lambda p: _set(p, ["meta", "command"], command), "source artifact|canonical protocol")
+    rejects(lambda p: _set(p, ["meta", "command"], ["not-a-python-interpreter", *p["meta"]["command"][1:]]),
+            "Python invocation")
+    rejects(lambda p: _set(p, ["meta", "command"],
+                           [p["meta"]["command"][0], "tests/test_bench_c5_02_isoloss_ptq_mitigation.py"]),
+            "canonical invocation")
     # Retained audit evidence.
     evidence = [*post, "retained_evidence_sha256"]
     rejects(lambda p: _set(p, [*evidence, "final_canonical_log"], "0" * 64), "pinned digests")
@@ -1704,6 +1812,48 @@ def test_canonical_postprocess_must_read_the_pinned_source(canonical, monkeypatc
     monkeypatch.setattr(b, "CANONICAL_SOURCE_ARTIFACTS", {SOURCE_COMMIT: "0" * 64})
     with pytest.raises(ValueError, match="pinned committed C5-02 result"):
         b.validate_results(canonical, canonical=True)
+
+
+def test_postprocess_cli_refuses_to_write_noncanonical_source_to_reserved_output(quick, tmp_path, monkeypatch):
+    """Astra re-check Blocking 2: --postprocess-from-git into reserved output refuses noncanonical payloads."""
+    res_dir = tmp_path / "results"
+    res_dir.mkdir()
+    reserved_out = res_dir / b.CANONICAL_OUTPUT.name
+    reserved_out.write_text('{"sentinel": true}\n')
+    monkeypatch.setattr(b, "CANONICAL_OUTPUT", reserved_out)
+    monkeypatch.setattr(b.h, "git_info", lambda: {"git_sha": "a" * 40, "git_dirty": False})
+    bad_payload = copy.deepcopy(quick)
+    bad_payload["postprocess"] = {
+        "source_schema_version": "cycle5_c5_02.v1", "source_result_git_sha": SOURCE_COMMIT,
+        "source_artifact_sha256": "0" * 64, "source_raw_measurements_sha256": "0" * 64,
+        "postprocess_git_sha": "a" * 40, "postprocess_git_dirty": False,
+        "postprocess_code_sha256": "0" * 64, "postprocess_code_modules": list(b.code_modules()),
+        "postprocess_command": ["/venv/bin/python", f"research/quant_ptq/{b.SCRIPT_NAME}",
+                                "--postprocess-from-git", SOURCE_COMMIT],
+        "postprocess_timestamp": "2026-11-27T06:00:00-0700",
+        "retained_evidence_sha256": dict(b.RETAINED_EVIDENCE_SHA256), "reason": b.POSTPROCESS_REASON}
+    monkeypatch.setattr(b, "postprocess_from_git", lambda commit, cmd: copy.deepcopy(bad_payload))
+    with pytest.raises(ValueError, match="not labeled canonical"):
+        b.main(["--postprocess-from-git", SOURCE_COMMIT, "--silent"])
+    assert reserved_out.read_text() == '{"sentinel": true}\n'
+
+    # Even if validate_results is bypassed or relaxed, the postprocess gate refuses uncertified reserved writes.
+    monkeypatch.setattr(b, "validate_results", lambda p, canonical=None: {
+        "mode": "noncanonical", "certified_canonical": False, "postprocessed": True})
+    with pytest.raises(ValueError, match="Refusing to write noncanonical postprocessed result"):
+        b.main(["--postprocess-from-git", SOURCE_COMMIT, "--silent"])
+    assert reserved_out.read_text() == '{"sentinel": true}\n'
+
+    # Non-reserved explicit --output still permits a validated exploratory postprocess.
+    free_out = tmp_path / "exploratory.json"
+    orig_validate = b.validate_results
+    monkeypatch.undo()
+    monkeypatch.setattr(b, "postprocess_from_git", lambda commit, cmd: copy.deepcopy(bad_payload))
+    monkeypatch.setattr(b, "validate_results", lambda p, canonical=None: {
+        "mode": "noncanonical", "certified_canonical": False, "postprocessed": True})
+    written = b.main(["--postprocess-from-git", SOURCE_COMMIT, "--output", str(free_out), "--silent"])
+    assert written["canonical"] is False and free_out.is_file()
+    assert orig_validate is not None
 
 
 @pytest.mark.parametrize("name, edit, match, noncanonical", ASTRA_B1_FIXTURES, ids=[f[0] for f in ASTRA_B1_FIXTURES])
@@ -1924,6 +2074,7 @@ def test_caveats_state_the_split_access_the_pilot_chronology_and_the_limits_of_t
     text = " ".join(notes)
     for claim in (
             # B3: split access and pilot chronology
+            "the selected step's weights (preceding the stopping step on seeds 3 and 4) are evaluated without retraining",
             "test.bin is held out from the canonical selection rules",
             "It is not a previously unseen study-level holdout",
             "timing_seed0.log and timing_seed0b.log", "SHA-256 39f2d27e...",
@@ -1934,6 +2085,8 @@ def test_caveats_state_the_split_access_the_pilot_chronology_and_the_limits_of_t
             "every one stopped below step 1280",
             # C1
             "sensitivity check at different losses, not an equal-loss proof", "val NLL 5.235-5.414",
+            "primary AdamW test delta-NLL means at LR 0.001 are 1.38-4.02x those of the C4-01b AdamW recipe at LR 0.0015",
+            "NVFP4 W4A16 2.60x, dynamic W4A4 1.42x, static W4A4 1.38x, MXFP4 1.97x, INT2 g16 3.54x, INT2 g32 4.02x",
             "Validation stopping, the additional token exposure, the floor-LR phase and the fresh restart are coupled",
             "cannot isolate which of them causes the mean BF16 test gap of +0.0037 nats",
             "supports no optimizer-wide PTQ ratio claim",
@@ -1948,7 +2101,7 @@ def test_caveats_state_the_split_access_the_pilot_chronology_and_the_limits_of_t
             "restricted to the 50m preset in this training regime on NVIDIA GeForce RTX 5080 (sm_120)"):
         assert claim in text, claim
     for stale in ("before test.bin was opened", "test.bin is the independent confirmation", "at equal val NLL",
-                  "less than one epoch"):
+                  "less than one epoch", "stopped weights are evaluated", "about three times"):
         assert stale not in text, stale
     source = Path(b.__file__).read_text()
     for stale in ("is not opened by the process until", "test.bin had not been opened",
