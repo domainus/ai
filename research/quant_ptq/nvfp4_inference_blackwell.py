@@ -430,11 +430,11 @@ def launch_quant(x: Tensor, packed: Tensor, scale: Tensor, global_scale: Tensor,
     * ``scale``: ``pr * pc`` elements, ``torch.uint8`` or ``torch.float8_e4m3fn`` (swizzled, padding written);
     * ``global_scale``: one ``torch.float32`` element.
 
-    Dynamic (``workspace`` given): ``workspace`` is the 1-D contiguous ``torch.float32`` tensor that
-    ``launch_amax`` filled, and ``n_part`` must be the count that ``launch_amax`` returned
-    (``1 <= n_part <= min(MAX_PARTIALS, workspace.numel())``); the kernel reduces ``workspace[:n_part]``
-    and writes the tensor scale to ``global_scale``. The default ``n_part = 0`` is refused here: it would
-    reduce no partial and silently give a global scale of 1.
+    Dynamic (``workspace`` given): ``workspace`` is a 1-D contiguous ``torch.float32`` tensor with at
+    least ``n = _n_partials(M, K, rotation)`` elements that ``launch_amax`` filled, and ``n_part`` must
+    equal the exact count ``n`` returned by ``launch_amax`` for ``(M, K, rotation)`` (any other count,
+    including ``0``, ``n - 1``, or ``n + 1``, raises ``ValueError``); the kernel reduces ``workspace[:n_part]``
+    and writes the tensor scale to ``global_scale``.
     Static (``workspace`` None): ``global_scale`` is read, and ``n_part`` must stay 0.
     This public entry point launches without PDL (the caller may write ``x`` between the two passes).
     """
@@ -446,10 +446,13 @@ def launch_quant(x: Tensor, packed: Tensor, scale: Tensor, global_scale: Tensor,
     if type(n_part) is not int:
         raise ValueError(f"n_part must be an int, not {type(n_part).__name__}")
     if workspace is not None:
-        _check_buffer(workspace, "workspace", x, (torch.float32,), flat=True)
-        if not 1 <= n_part <= min(MAX_PARTIALS, workspace.numel()):
-            raise ValueError(f"dynamic launch_quant needs n_part = the count returned by launch_amax "
-                             f"(1..{min(MAX_PARTIALS, workspace.numel())}), not {n_part}")
+        expected_n = _n_partials(M, K, rotation)
+        _check_buffer(workspace, "workspace", x, (torch.float32,), flat=True, min_numel=expected_n)
+        if n_part != expected_n:
+            raise ValueError(
+                f"dynamic launch_quant needs n_part == {expected_n} "
+                f"(the count returned by launch_amax for ({M}, {K}, {rotation!r})), not {n_part}"
+            )
     elif n_part != 0:
         raise ValueError(f"static launch_quant (no workspace) takes n_part = 0, not {n_part}")
     _quant(x, M, K, packed.view(torch.uint8), scale.view(torch.float8_e4m3fn), global_scale, workspace, n_part,

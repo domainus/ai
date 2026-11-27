@@ -406,8 +406,33 @@ def test_quick_run_is_valid_and_complete(quick):
                                                                                      row["cuda_graph_williams_orders"])
     for model in quick["part_b"]["models"].values():
         assert all(v for k, v in model["checks"].items() if k.endswith("bitwise"))
+    notes = "\n".join(quick["caveats"])
+    assert "8 train.bin sequences" in notes
+    assert "tiny model trained 8 steps" in notes
+    assert "evaluation limited to 16 windows per split" in notes
+    assert "means of 3 flushed calls" in notes
+    for forbidden in ("128 train.bin sequences", "640 steps", "120m", "38cef48", "4736807"):
+        assert forbidden not in notes
     with pytest.raises(ValueError, match="canonical"):
         b.validate_results(quick, canonical=True)
+
+
+@needs_cuda
+def test_caveats_bind_study_history_to_actual_source_and_producer():
+    fresh = {
+        "canonical": True,
+        "postprocess": None,
+        "meta": {"git_sha": "a" * 40, "environment": {"device": "NVIDIA GeForce RTX 5080", "capability": [12, 0]}},
+        "protocol": b.CANONICAL,
+        "data": {"source": {"name": "fineweb-edu"}, "encoding": "gpt2"},
+        "part_a": None,
+        "part_b": None,
+        "part_c": None,
+    }
+    history = next(n for n in b.caveats(fresh) if n.startswith("Study history:"))
+    assert "aaaaaaa" in history
+    assert "rerun committed at 726b20c" not in history
+    assert "measured by 38cef48" not in history
 
 
 @needs_fp4
@@ -483,6 +508,31 @@ def test_validator_rejects_tampering(quick):
                     return
     _rejects(p, tamper_inherited, "twin|inherited|alpha")
 
+    qprof = ["part_a", "shapes", 0, "cuda_graph_kernel_profile_us"]
+
+    def qgemm(x, method):
+        return next(k for k in _get(x, [*qprof, method]) if b._is_fp4_gemm_kernel(k))
+
+    def replace_kernel(x, method, old, new):
+        k = _get(x, [*qprof, method])
+        k[new] = k.pop(old)
+
+    _rejects(p, lambda x: replace_kernel(x, "c5_03_had_b16", qgemm(x, "c5_03_had_b16"),
+                                         "nvjet_tst_128x128_64x5_2x1_v_bz_TNT"), "no FP4 GEMM")
+    _rejects(p, lambda x: replace_kernel(x, "nvfp4_gemm_only", qgemm(x, "nvfp4_gemm_only"),
+                                         "cutlass3x_sm120_tensorop_s16816gemm_bf16_bf16_f32_128x128x64_0_tnn"),
+             "no FP4 GEMM")
+    _rejects(p, lambda x: _get(x, [*qprof, "c5_03_had_b16"]).__setitem__(
+        "nvjet_tst_128x128_64x5_2x1_v_bz_TNT", 1.0), "non-FP4 GEMM")
+    _rejects(p, lambda x: replace_kernel(x, "c5_03_had_b16", "_amax_kernel", "other_amax_kernel"), "exact quantizer")
+    _rejects(p, lambda x: replace_kernel(x, "c5_03_had_b16", "_amax_kernel", "unrelated_kernel"), "exact quantizer")
+    _rejects(p, lambda x: replace_kernel(x, "c5_03_had_b16", "_quant_kernel", "other_quant_kernel"), "exact quantizer")
+    _rejects(p, lambda x: replace_kernel(x, "c5_03_had_b16", "_quant_kernel", "unrelated_kernel"), "exact quantizer")
+    _rejects(p, lambda x: replace_kernel(x, "c4_02_had_b16", "_c4_02_amax_kernel", "other_c4_02_amax_kernel"),
+             "exact quantizer")
+    _rejects(p, lambda x: _get(x, [*qprof, "nvfp4_gemm_only"]).__setitem__("other_quant_kernel", 1.0),
+             "runs no quantizer")
+
 
 # ------------------------------------------------------------------ finding 3: public launcher buffer contracts
 def _launch_buffers(M, K, dynamic=True):
@@ -518,13 +568,13 @@ def test_launch_quant_refuses_a_dynamic_call_without_its_partial_count():
         with pytest.raises(ValueError, match="n_part"):
             nb.launch_quant(x, buf["packed"], buf["scale"], buf["global_scale"], rotation=rotation, tables=tables,
                             workspace=buf["workspace"])
-        for bad in (-1, nb.MAX_PARTIALS + 1):
+        for bad in (-1, 0, n - 1, n + 1, nb.MAX_PARTIALS + 1):
             with pytest.raises(ValueError, match="n_part"):
                 nb.launch_quant(x, buf["packed"], buf["scale"], buf["global_scale"], rotation=rotation,
                                 tables=tables, workspace=buf["workspace"], n_part=bad)
-        with pytest.raises(ValueError, match="n_part"):  # more partials than the workspace holds
+        with pytest.raises(ValueError, match="at least"):  # workspace shorter than pass-1 partials
             nb.launch_quant(x, buf["packed"], buf["scale"], buf["global_scale"], rotation=rotation, tables=tables,
-                            workspace=buf["workspace"][:n], n_part=n + 1)
+                            workspace=buf["workspace"][: n - 1], n_part=n)
         for bad in (True, 1.0, torch.tensor(n)):
             with pytest.raises(ValueError, match="n_part must be an int"):
                 nb.launch_quant(x, buf["packed"], buf["scale"], buf["global_scale"], rotation=rotation,
@@ -536,6 +586,26 @@ def test_launch_quant_refuses_a_dynamic_call_without_its_partial_count():
         assert torch.equal(buf["scale"], ref.scale.view(torch.uint8))
         assert torch.equal(buf["global_scale"].view(torch.int32), ref.global_scale.view(torch.int32))
         assert buf["global_scale"].item() != 1.0
+
+
+@needs_cuda
+def test_launch_quant_rejects_off_by_one_partial_counts_for_129x768_identity():
+    """Astra v2 probe: at 129x768 identity, launch_amax returns 27; 26 and 28 must raise ValueError."""
+    x = torch.ones((129, 768), device="cuda", dtype=torch.bfloat16)
+    x[-1, -1] = 256
+    buf = _launch_buffers(129, 768)
+    buf["workspace"].fill_(65536.0)
+    n = nb.launch_amax(x, buf["workspace"])
+    assert n == 27
+    for bad in (26, 28):
+        with pytest.raises(ValueError, match="n_part"):
+            nb.launch_quant(x, buf["packed"], buf["scale"], buf["global_scale"],
+                            workspace=buf["workspace"], n_part=bad)
+    nb.launch_quant(x, buf["packed"], buf["scale"], buf["global_scale"], workspace=buf["workspace"], n_part=n)
+    ref = nb.quantize_activation_ref(x)
+    assert torch.equal(buf["packed"], ref.packed.view(torch.uint8))
+    assert torch.equal(buf["scale"], ref.scale.view(torch.uint8))
+    assert torch.equal(buf["global_scale"].view(torch.int32), ref.global_scale.view(torch.int32))
 
 
 @needs_cuda
@@ -708,22 +778,62 @@ def test_atomic_writer_keeps_the_old_file_and_no_temp_file_on_failure(sandbox, m
 
 @needs_cuda
 def test_atomic_writer_creates_its_temp_file_exclusively(sandbox, monkeypatch):
-    """The temp file is created with O_EXCL: a pre-existing (attacker-placed) name is never reused."""
-    import tempfile
-    seen = []
-    original = tempfile.NamedTemporaryFile
+    """The temp file is created with O_EXCL | O_NOFOLLOW inside one verified dir_fd."""
+    import os
+    opens, replaces = [], []
+    real_open, real_replace = os.open, os.replace
 
-    def spy(*args, **kwargs):
-        handle = original(*args, **kwargs)
-        seen.append((kwargs, Path(handle.name)))
-        return handle
+    def spy_open(path, flags, mode=0o777, *, dir_fd=None):
+        fd = real_open(path, flags, mode, dir_fd=dir_fd)
+        opens.append((path, flags, mode, dir_fd, fd))
+        return fd
 
-    monkeypatch.setattr(b.tempfile, "NamedTemporaryFile", spy)
+    def spy_replace(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+        replaces.append((src, dst, src_dir_fd, dst_dir_fd))
+        return real_replace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(b.os, "open", spy_open)
+    monkeypatch.setattr(b.os, "replace", spy_replace)
     b._write_json_atomic(b.CANONICAL_OUTPUT, {"x": 1}, canonical_dest=True)
-    (kwargs, name), = seen
-    assert kwargs["dir"] == b.CANONICAL_OUTPUT.parent and kwargs["delete"] is False
-    assert name.parent == b.CANONICAL_OUTPUT.parent and name.name.startswith(f".{b.CANONICAL_OUTPUT.name}.")
-    assert not name.exists()
+    tmp_create = [o for o in opens if (o[1] & os.O_CREAT) and (o[1] & os.O_EXCL)]
+    assert len(tmp_create) == 1
+    tmp_name, flags, mode, create_dir_fd, _ = tmp_create[0]
+    assert (flags & os.O_NOFOLLOW) and mode == 0o600 and create_dir_fd is not None
+    assert tmp_name.startswith(f".{b.CANONICAL_OUTPUT.name}.") and tmp_name.endswith(".tmp")
+    reread = [o for o in opens if o[0] == tmp_name and o[3] == create_dir_fd and not (o[1] & os.O_CREAT)]
+    assert len(reread) == 1 and (reread[0][1] & os.O_NOFOLLOW)
+    assert replaces == [(tmp_name, b.CANONICAL_OUTPUT.name, create_dir_fd, create_dir_fd)]
+    assert not (b.CANONICAL_OUTPUT.parent / tmp_name).exists()
+    assert _leftovers(b.CANONICAL_OUTPUT.parent) == []
+
+
+@needs_cuda
+def test_atomic_writer_rejects_parent_traversal_and_preserves_old_on_fs_errors(sandbox, tmp_path, monkeypatch):
+    (sandbox / "results" / "sub").mkdir()
+    (sandbox / "results" / "link_sub").symlink_to(tmp_path, target_is_directory=True)
+    for bad in (
+        sandbox / "results" / ".." / "results" / b.CANONICAL_OUTPUT.name,
+        sandbox / "results" / "sub" / ".." / b.CANONICAL_OUTPUT.name,
+        sandbox / "results" / "link_sub" / ".." / b.CANONICAL_OUTPUT.name,
+        Path("results/../results") / b.CANONICAL_OUTPUT.name,
+    ):
+        with pytest.raises(ValueError, match="parent traversal"):
+            b._write_json_atomic(bad, {"x": 1}, canonical_dest=True)
+        with pytest.raises(ValueError, match="parent traversal"):
+            b._write_json_atomic(bad, {"x": 1})
+
+    out = b.CANONICAL_OUTPUT
+    b._write_json_atomic(out, {"old": 1}, canonical_dest=True)
+    with monkeypatch.context() as m:
+        m.setattr(b.os, "fsync", lambda fd: (_ for _ in ()).throw(OSError("fsync boom")))
+        with pytest.raises(OSError, match="fsync boom"):
+            b._write_json_atomic(out, {"new": 2}, canonical_dest=True)
+    assert json.loads(out.read_text()) == {"old": 1} and _leftovers(out.parent) == []
+    with monkeypatch.context() as m:
+        m.setattr(b.os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError("replace boom")))
+        with pytest.raises(OSError, match="replace boom"):
+            b._write_json_atomic(out, {"new": 3}, canonical_dest=True)
+    assert json.loads(out.read_text()) == {"old": 1} and _leftovers(out.parent) == []
 
 
 # ------------------------------------------------------------------ CLI of --postprocess-from-git
@@ -740,7 +850,7 @@ def test_cli_postprocess_mode_measures_nothing(tmp_path, capsys):
     assert args.postprocess_from_git == SOURCE_COMMIT and args.output == b.CANONICAL_OUTPUT
     assert args.protocol is None and args.canonical is False
     assert b.parse_args([]).postprocess_from_git is None
-    free = b.parse_args(["--postprocess-from-git", SOURCE_COMMIT, "--output", str(tmp_path / "copy.json")])
+    free = b.parse_args(["--postprocess-from-git", PRODUCER_COMMIT, "--output", str(tmp_path / "copy.json")])
     assert free.output == tmp_path / "copy.json"
     for short in ("726b20c", SOURCE_COMMIT.upper(), "HEAD"):
         assert "full 40-hex SHA" in _error(capsys, ["--postprocess-from-git", short])
@@ -751,7 +861,8 @@ def test_cli_postprocess_mode_measures_nothing(tmp_path, capsys):
     other = tmp_path / "other" / "results" / b.CANONICAL_OUTPUT.name
     alias = tmp_path / "alias_cycle5_c5_03.json"
     alias.symlink_to(b.CANONICAL_OUTPUT)
-    for out in (other, alias, tmp_path / "cycle5_c5_03_copy.json"):
+    traversal = ROOT / "results" / ".." / "results" / b.CANONICAL_OUTPUT.name
+    for out in (other, alias, tmp_path / "cycle5_c5_03_copy.json", tmp_path / "copy.json", traversal):
         assert "A postprocess writes" in _error(capsys, ["--postprocess-from-git", SOURCE_COMMIT, "--output", str(out)])
 
 
@@ -774,9 +885,9 @@ def test_postprocess_into_the_reserved_file_needs_a_clean_tree_and_the_pinned_so
 @needs_cuda
 def test_postprocess_refuses_a_source_that_is_not_a_committed_v1_result():
     with pytest.raises(ValueError, match="not a commit object"):
-        b.postprocess_from_git("0" * 40, ["python", b.SCRIPT_NAME])
+        b.postprocess_from_git("0" * 40, ["python", b.SCRIPT_REPO_PATH])
     with pytest.raises(ValueError, match="cannot read"):  # the producer commit holds no result file
-        b.postprocess_from_git(PRODUCER_COMMIT, ["python", b.SCRIPT_NAME])
+        b.postprocess_from_git(PRODUCER_COMMIT, ["python", b.SCRIPT_REPO_PATH])
 
 
 @needs_cuda
@@ -979,6 +1090,18 @@ def test_canonical_validator_rejects_postprocess_provenance_tampering(canonical,
     _rejects_canonical(canonical, lambda p: _set(p, [*post, "postprocess_timestamp"], "today"), "timestamp")
     _rejects_canonical(canonical, lambda p: _set(p, [*post, "postprocess_timestamp"], p["meta"]["timestamp_start"]),
                        "before the end of the measuring run")
+    _rejects_canonical(canonical, lambda p: _set(p, [*post, "postprocess_timestamp"], p["meta"]["timestamp_end"]),
+                       "before the source result commit")
+    _rejects_canonical(canonical, lambda p: _set(p, [*post, "postprocess_timestamp"], "2026-11-27T11:30:16-0700"),
+                       "before the postprocessing commit")
+    _rejects_canonical(
+        canonical,
+        lambda p: (
+            _set(p, ["meta", "timestamp_start"], "2026-11-27T10:30:28-0700"),
+            _set(p, ["meta", "timestamp_end"], "2026-11-27T11:28:48-0700"),
+        ),
+        "before the producer commit",
+    )
     # Postprocessing code.
     _rejects_canonical(canonical, lambda p: _set(p, [*post, "postprocess_git_sha"], "HEAD"), "40-hex")
     _rejects_canonical(canonical, lambda p: _set(p, [*post, "postprocess_git_sha"], "0" * 40), "not a commit object")
@@ -1013,12 +1136,18 @@ def test_canonical_validator_rejects_postprocess_provenance_tampering(canonical,
                        ([*command, "--quick"], "valid runnable invocation"),
                        ([*command, "--data-dir", "/x"], "valid runnable invocation"),
                        ([command[0], command[1], "--postprocess-f", SOURCE_COMMIT], "valid runnable invocation"),
-                       ([*command, "--output", "/tmp/copy.json"], "must target the canonical output path"),
+                       ([*command, "--output", "/tmp/copy.json"],
+                        "valid runnable invocation|must target the canonical output path"),
+                       ([command[0], b.SCRIPT_NAME, *command[2:]], "not an invocation"),
+                       ([command[0], f"fake/{b.SCRIPT_REPO_PATH}", *command[2:]], "not an invocation"),
                        (["bash", *command[1:]], "Python invocation"),
                        ([command[0], "other.py", *command[2:]], "not an invocation"),
                        ("python", "Python invocation")):
         _rejects_canonical(canonical, lambda p, c=bad: _set(p, [*post, "postprocess_command"], c), match)
     _rejects_canonical(canonical, lambda p: _set(p, ["meta", "command"], command), "argv|measuring invocation")
+    _rejects_canonical(canonical, lambda p: _set(p, ["meta", "command"],
+                                               [p["meta"]["command"][0], b.SCRIPT_NAME, *p["meta"]["argv"]]),
+                       "not an invocation")
     # Retained run evidence.
     evidence = [*post, "retained_evidence_sha256"]
     _rejects_canonical(canonical, lambda p: _set(p, [*evidence, "canonical_38cef48.log"], "0" * 64), "pinned digests")

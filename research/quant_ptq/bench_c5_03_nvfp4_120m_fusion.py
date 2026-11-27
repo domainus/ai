@@ -51,6 +51,7 @@ from __future__ import annotations
 import argparse
 import ast
 import copy
+import errno
 import fnmatch
 import functools
 import hashlib
@@ -58,13 +59,15 @@ import io
 import json
 import math
 import os
+import secrets
+import stat
 import subprocess
 import sys
-import tempfile
 import time
 from collections import defaultdict
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -95,6 +98,8 @@ SCRIPT_NAME = "bench_c5_03_nvfp4_120m_fusion.py"
 RESULT_REPO_PATH = "results/cycle5_c5_03_nvfp4_120m_fusion.json"
 CANONICAL_OUTPUT = ROOT / RESULT_REPO_PATH
 DRIVER_MODULE = "research.quant_ptq.bench_c5_03_nvfp4_120m_fusion"
+SCRIPT_REPO_PATH = "/".join(DRIVER_MODULE.split(".")) + ".py"
+CANONICAL_PRODUCER_SHA = "38cef483071d649fc74161b5d00359c7c5ad0927"
 # The modules that compute ``part_c.analysis``, ``summary``, ``caveats`` and the validator. The credited
 # commit (``meta.git_sha`` of a measuring run, ``postprocess_git_sha`` of a postprocess) must hold these bytes.
 SUMMARY_MODULES = (
@@ -133,13 +138,15 @@ RETAINED_EVIDENCE_SHA256 = {
     "superseded_result_4736807.json": "aafd8ebe571bb512ac02e5c20403ac900e930cd11e4a74c5c5152a3e3b2f9c5a",
 }
 POSTPROCESS_REASON = (
-    "Remediation of the C5-03 audit (audits/AUDIT_cycle5_c5_03_gpt62_astra.md, findings 1-5): the raw "
-    "measurements of the canonical result 726b20c (measured by the clean commit 38cef48) are preserved "
-    "unchanged, so test.bin is not scored a third time. part_c.analysis, summary and caveats are recomputed "
-    "(the caveats now state the superseded 4736807 run and the measurement limits), and the result is checked "
-    "by the hardened validator (calibration draw, linear parameter counts, kernel profiles, cooperative launch "
-    "record, AWQ fields). The public launcher contract and the integer-view bitwise checks are verified live "
-    "by the test suite and the audit replay. Nothing was retrained or re-measured.")
+    "Remediation of the C5-03 audit and post-remediation re-check (audits/AUDIT_cycle5_c5_03_gpt62_astra.md, "
+    "findings 1-5 and v2 closures): the raw measurements of the canonical result 726b20c (measured by the clean "
+    "commit 38cef48) are preserved unchanged, so test.bin is not scored a third time. part_c.analysis, summary "
+    "and caveats are recomputed (the caveats bind to the actual protocol/source and record the superseded 4736807 "
+    "run and measurement limits), and the result is checked by the hardened validator (calibration draw, linear "
+    "parameter counts, FP4-specific GEMM and exact quantizer kernel profiles, cooperative launch record, AWQ "
+    "fields, exact script path and commit chronology). The exact n_part public launcher contract, verified "
+    "dir_fd atomic writer, and integer-view bitwise checks are verified by the test suite and audit replay. "
+    "Nothing was retrained or re-measured.")
 
 VARIANTS = ("none", "had_b16", "bfly_b16", "had_b16_static_gs")
 VARIANT_ROTATION = {"none": "none", "had_b16": "hadamard_b16", "bfly_b16": "adaptive_butterfly_b16",
@@ -1546,38 +1553,102 @@ def summarize(payload: dict) -> dict:
 
 
 def caveats(payload: dict) -> list[str]:
-    notes = [
-        "Part C statistics have df = 2 (three paired seeds): the two-sided t-test has little power, and the exact "
-        "sign-flip p-value cannot fall below 0.25 for any contrast, so no sign-flip result can be significant.",
-        "Part C uses one corpus (FineWeb-Edu sample-10BT shards, GPT-2 BPE), one calibration draw of 128 train.bin "
-        "sequences (seed 20261126) and one model size: the 120m model trained 640 steps with muon_ps3_blackwell on "
-        "one RTX 5080 (sm_120). Deltas may differ for longer training, other optimizers or larger models.",
-        "GPU training is seeded (initial state, batch stream) but not claimed to be bit-reproducible; the three "
-        "checkpoints are retained outside git with their tensor and file SHA-256 values.",
-        "test.bin is held out from every selection rule of this run (Phase 2 maps it after the freeze), but the same "
-        "test.bin was scored by earlier cycles on other checkpoints; it is not a study-level unseen holdout.",
-        "AWQ alpha is chosen per seed on val.bin with live hardware W4A4 dynamic scoring; an alpha = 0 choice makes the "
-        "AWQ rows copies of the plain rotation + GPTQ rows (counted as inherited, not as measurements).",
-        "Part A/B weights and activations are random; latency does not depend on values. A 4x L2 flush before every "
-        "sample makes the activation come from DRAM, which is pessimistic for a layer whose input was just written "
-        "by the previous kernel.",
-        "CUDA-event resolution on this GPU is about 2 us; per-round values are means of `iters` flushed calls and "
-        "the reported value is the median over Williams rounds.",
-        "bf16_compiled is torch.compile(default); NVFP4 models run eager or as CUDA graphs, not compiled.",
-        "The cooperative single-launch quantizer (ablation) is bit-exact and survives repeated graph replays but is "
-        "slower than the two-pass PDL quantizer, so it is not enabled; a single-program fused quantizer was measured "
-        "during development at 10-25x slower and dropped.",
-        "Static-scale (had_b16_static_gs) differences against C4-02 are near parity: their sign changes between "
-        "shapes and between sessions, so no static-scale speedup is claimed. Eager full-forward (Part B) times vary "
-        "more between sessions than the CUDA-graph ratios do; the graph ratios are the reproducible latency result.",
-    ]
-    if payload.get("canonical"):
+    protocol = payload["protocol"]
+    parts = protocol["parts"]
+    timing = protocol["timing"]
+    spec = protocol["part_c"]
+    env = (payload.get("meta") or {}).get("environment") or {}
+    dev_name = env.get("device") or protocol["device"]
+    cap = env.get("capability")
+    dev_label = f"{dev_name} (sm_{cap[0]}{cap[1]})" if cap else str(dev_name)
+    notes = []
+    if "C" in parts:
+        n_seeds = len(spec["seeds"])
+        if n_seeds >= 2:
+            min_p = 2 / (2 ** n_seeds)
+            notes.append(
+                f"Part C statistics have df = {n_seeds - 1} ({n_seeds} paired seeds): the two-sided t-test has "
+                f"little power, and the exact sign-flip p-value cannot fall below {min_p:g} for any contrast, "
+                "so no sign-flip result can be significant."
+            )
+        else:
+            notes.append("Part C ran 1 seed; paired statistics require multiple seeds.")
+        data_rec = payload.get("data") or {}
+        src_info = data_rec.get("source") or {}
+        enc = data_rec.get("encoding") or "unknown"
+        if src_info.get("name") == "fineweb-edu" and enc == "gpt2":
+            corpus = "FineWeb-Edu sample-10BT shards, GPT-2 BPE"
+        else:
+            corpus = f"{src_info.get('name') or src_info.get('dataset') or 'local shards'}, {enc}"
+        window_note = (f" (evaluation limited to {spec['max_eval_windows']} windows per split)"
+                       if spec["max_eval_windows"] is not None else "")
         notes.append(
-            "Study history: a superseded canonical run at commit 4736807 scored the same test.bin before host "
-            "launch-plan caching was added at 38cef48; this result is the complete rerun at 38cef48. Both runs "
-            "(logs and the superseded JSON) are retained in artifacts/c5_03_run_evidence/ with pinned SHA-256 "
-            "values, and test.bin was also scored by earlier cycles, so the test scores here are not a first look "
-            "at an unseen holdout.")
+            f"Part C uses one corpus ({corpus}), one calibration draw of {spec['calibration_sequences']} "
+            f"train.bin sequences (seed {spec['calibration_seed']}) and one model size: the {spec['preset']} "
+            f"model trained {spec['steps']} steps with {spec['optimizer']} on one {dev_label}{window_note}. "
+            "Deltas may differ for longer training, other optimizers or larger models."
+        )
+        ckpt_phrase = "1 checkpoint is" if n_seeds == 1 else f"{n_seeds} checkpoints are"
+        notes.append(
+            f"GPU training is seeded (initial state, batch stream) but not claimed to be bit-reproducible; "
+            f"the {ckpt_phrase} retained outside git with their tensor and file SHA-256 values."
+        )
+        notes.append(
+            "test.bin is held out from every selection rule of this run (Phase 2 maps it after the freeze), "
+            "but the same test.bin was scored by earlier cycles on other checkpoints; it is not a study-level "
+            "unseen holdout."
+        )
+        notes.append(
+            "AWQ alpha is chosen per seed on val.bin with live hardware W4A4 dynamic scoring; an alpha = 0 choice "
+            "makes the AWQ rows copies of the plain rotation + GPTQ rows (counted as inherited, not as measurements)."
+        )
+    if "A" in parts or "B" in parts:
+        notes.append(
+            f"Part A/B weights and activations are random; latency does not depend on values. A "
+            f"{timing['l2_flush_multiple']}x L2 flush before every sample makes the activation come from DRAM, "
+            "which is pessimistic for a layer whose input was just written by the previous kernel."
+        )
+        notes.append(
+            f"CUDA-event resolution on this GPU is about 2 us; per-round values are means of {timing['iters']} "
+            "flushed calls and the reported value is the median over Williams rounds."
+        )
+        if "B" in parts:
+            notes.append(
+                "bf16_compiled is torch.compile(default); NVFP4 models run eager or as CUDA graphs, not compiled."
+            )
+        if "A" in parts:
+            notes.append(
+                "The cooperative single-launch quantizer (ablation) is bit-exact and survives repeated graph replays "
+                "but is slower than the two-pass PDL quantizer, so it is not enabled; a single-program fused "
+                "quantizer was measured during development at 10-25x slower and dropped."
+            )
+        notes.append(
+            "Static-scale (had_b16_static_gs) differences against C4-02 are near parity: their sign changes between "
+            "shapes and between sessions, so no static-scale speedup is claimed. Eager full-forward (Part B) times "
+            "vary more between sessions than the CUDA-graph ratios do; the graph ratios are the reproducible "
+            "latency result."
+        )
+    if payload.get("canonical"):
+        post = payload.get("postprocess")
+        meta_sha = (payload.get("meta") or {}).get("git_sha")
+        if (isinstance(post, dict) and post.get("source_result_git_sha") in CANONICAL_SOURCE_ARTIFACTS
+                and meta_sha == CANONICAL_PRODUCER_SHA):
+            src_short = post["source_result_git_sha"][:7]
+            prod_short = meta_sha[:7]
+            notes.append(
+                f"Study history: a superseded canonical run at commit 4736807 scored the same test.bin before host "
+                f"launch-plan caching was added at {prod_short}; this result is postprocessed from the complete "
+                f"rerun committed at {src_short} (measured by {prod_short}). Both runs (logs and the superseded "
+                f"JSON) are retained in artifacts/c5_03_run_evidence/ with pinned SHA-256 values, and test.bin was "
+                f"also scored by earlier cycles, so the test scores here are not a first look at an unseen holdout."
+            )
+        else:
+            producer_short = meta_sha[:7] if isinstance(meta_sha, str) and meta_sha else "uncommitted"
+            notes.append(
+                f"Study history: earlier C5-03 canonical runs (4736807 and 38cef48) and prior cycles scored the same "
+                f"test.bin; this canonical measurement was produced at commit {producer_short}, so its test scores "
+                f"are not a first look at an unseen holdout."
+            )
     rows = payload.get("part_a", {}).get("shapes", []) if payload.get("part_a") else []
     trailing = [f"{v} at ({r['m']},{r['n']},{r['k']}) {r['summary']['cuda_graph']['variants'][v]['c5_03_ms']:.4f} ms "
                 f"vs bf16 {r['summary']['cuda_graph']['methods']['bf16_cublas']['ms']:.4f} ms"
@@ -1686,6 +1757,19 @@ def _require_git_commit(sha: str, label: str) -> None:
 
 
 @functools.cache
+def _commit_timestamp_cached(root: str, git_sha: str) -> datetime:
+    _require_git_commit(git_sha, "git_sha")
+    res = subprocess.run(["git", "-C", root, "show", "-s", "--format=%cI", git_sha], capture_output=True)
+    if res.returncode != 0:
+        raise ValueError(f"cannot read commit timestamp of {git_sha}")
+    return datetime.fromisoformat(res.stdout.decode().strip())
+
+
+def _commit_timestamp(git_sha: str) -> datetime:
+    return _commit_timestamp_cached(str(ROOT), git_sha)
+
+
+@functools.cache
 def _code_modules_at_commit(git_sha: str) -> tuple[str, ...]:
     listing = _git("ls-tree", "-r", "--name-only", git_sha, "--", "research")
     if listing.returncode != 0:
@@ -1760,77 +1844,176 @@ def raw_measurements_sha256(payload: dict) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def _require_no_symlink_chain(path: Path) -> None:
-    """``path`` lies under ``ROOT`` and neither it nor a directory between ``ROOT`` and it is a symlink."""
-    absolute = Path(os.path.abspath(path))
+_DIR_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+_NOFOLLOW_FLAGS = os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def _relative_under_root(path: Path) -> Path:
+    """Path relative to ``ROOT`` without resolving components below ``ROOT``; rejects ``..`` traversal."""
+    if ".." in path.parts:
+        raise ValueError(f"Refusing to write {path}: parent traversal ('..') is not allowed")
+    root_resolved = ROOT.resolve()
+    if not path.is_absolute():
+        return (Path.cwd().resolve() / path).relative_to(root_resolved)
+    for base in (ROOT, root_resolved):
+        try:
+            return path.relative_to(base)
+        except ValueError:
+            pass
+    root_str = str(root_resolved)
+    for ancestor in reversed((path, *path.parents)):
+        if os.path.realpath(ancestor) == root_str:
+            return path.relative_to(ancestor)
+    raise ValueError(f"{path} is outside {ROOT}")
+
+
+def _guarded_relative(path: Path, *, canonical_dest: bool = False) -> Path:
+    """Validate ``path`` against ``ROOT``, ``CANONICAL_OUTPUT``, and parent traversal."""
+    if ".." in path.parts:
+        raise ValueError(f"Refusing to write {path}: parent traversal ('..') is not allowed")
+    canonical_rel = CANONICAL_OUTPUT.relative_to(ROOT)
     try:
-        relative = absolute.relative_to(ROOT)
-    except ValueError:
+        relative = _relative_under_root(path)
+    except ValueError as exc:
+        if "parent traversal" in str(exc):
+            raise
+        if canonical_dest:
+            raise ValueError(f"The canonical result goes to {CANONICAL_OUTPUT}, not {path}") from None
         raise ValueError(f"{path} is a reserved result path outside {ROOT}") from None
-    node = ROOT
-    for part in relative.parts:
-        node = node / part
-        if node.is_symlink():
-            raise ValueError(f"Refusing to write {path}: {node} is a symlink")
+    if canonical_dest and relative != canonical_rel:
+        raise ValueError(f"The canonical result goes to {CANONICAL_OUTPUT}, not {path}")
+    if not relative.parts or relative.name in ("", ".", ".."):
+        raise ValueError(f"Refusing to write invalid path {path}")
+    return relative
+
+
+def _check_not_symlink(name: str, dir_fd: int, full_path: Path, node: Path) -> None:
+    try:
+        st = os.lstat(name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(st.st_mode):
+        raise ValueError(f"Refusing to write {full_path}: {node} is a symlink")
+
+
+def _open_verified_parent_fd(path: Path, relative: Path, *, create: bool) -> tuple[int, str] | None:
+    """Walk ``relative`` from ``ROOT`` with ``O_NOFOLLOW`` and return ``(dir_fd, filename)``."""
+    dir_fd = os.open(ROOT.resolve(), _DIR_OPEN_FLAGS)
+    cur = ROOT
+    try:
+        for part in relative.parts[:-1]:
+            cur = cur / part
+            try:
+                next_fd = os.open(part, _DIR_OPEN_FLAGS | os.O_NOFOLLOW, dir_fd=dir_fd)
+            except FileNotFoundError:
+                if not create:
+                    os.close(dir_fd)
+                    dir_fd = -1
+                    return None
+                try:
+                    os.mkdir(part, 0o777, dir_fd=dir_fd)
+                except FileExistsError:
+                    pass
+                try:
+                    next_fd = os.open(part, _DIR_OPEN_FLAGS | os.O_NOFOLLOW, dir_fd=dir_fd)
+                except OSError as exc:
+                    if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                        _check_not_symlink(part, dir_fd, path, cur)
+                        raise ValueError(f"Refusing to write {path}: {cur} is not a directory") from None
+                    raise
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    _check_not_symlink(part, dir_fd, path, cur)
+                    raise ValueError(f"Refusing to write {path}: {cur} is not a directory") from None
+                raise
+            os.close(dir_fd)
+            dir_fd = next_fd
+        filename = relative.parts[-1]
+        _check_not_symlink(filename, dir_fd, path, cur / filename)
+        result = (dir_fd, filename)
+        dir_fd = -1
+        return result
+    finally:
+        if dir_fd >= 0:
+            os.close(dir_fd)
+
+
+def _create_temp_at(dir_fd: int, filename: str) -> tuple[int, str]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW_FLAGS
+    for _ in range(128):
+        candidate = f".{filename}.{secrets.token_hex(8)}.tmp"
+        try:
+            return os.open(candidate, flags, 0o600, dir_fd=dir_fd), candidate
+        except FileExistsError:
+            continue
+    raise FileExistsError(f"Could not allocate unique temporary file for {filename}")
 
 
 def _write_json_atomic(path: Path, payload: dict, *, canonical_dest: bool = False) -> dict:
-    """Lossless atomic write through an exclusively created same-directory temp file. Returns the reloaded JSON.
+    """Lossless atomic write through one verified ``dir_fd`` and an ``O_EXCL`` same-directory temp file.
 
-    A canonical or reserved destination must be under ``ROOT`` with no symlink at the path or its parents
-    below ``ROOT``; ``canonical_dest`` also binds it to ``CANONICAL_OUTPUT`` of this checkout.
+    A canonical or reserved destination must lie under ``ROOT`` without parent traversal (``..``) or any
+    symlink along the path or its parents below ``ROOT``; ``canonical_dest`` also binds it to
+    ``CANONICAL_OUTPUT`` of this checkout.
     """
     path = Path(path)
     guarded = canonical_dest or reserved(path)
-    if canonical_dest and Path(os.path.abspath(path)) != CANONICAL_OUTPUT:
-        raise ValueError(f"The canonical result goes to {CANONICAL_OUTPUT}, not {path}")
+    relative = None
     if guarded:
-        _require_no_symlink_chain(path)
+        relative = _guarded_relative(path, canonical_dest=canonical_dest)
+        pre = _open_verified_parent_fd(path, relative, create=False)
+        if pre is not None:
+            os.close(pre[0])
     text = e2e._dumps_json(payload) + "\n"
     expected = json.loads(json.dumps(payload, allow_nan=False))
-    path.parent.mkdir(parents=True, exist_ok=True)
     if guarded:
-        _require_no_symlink_chain(path)
-    tmp = None
+        dir_fd, filename = _open_verified_parent_fd(path, relative, create=True)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        dir_fd = os.open(path.parent, _DIR_OPEN_FLAGS)
+        filename = path.name
+    tmp_name = None
     try:
-        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
-                                         delete=False) as handle:  # O_CREAT | O_EXCL, mode 0600
-            tmp = Path(handle.name)
+        fd, tmp_name = _create_temp_at(dir_fd, filename)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        reloaded = json.loads(tmp.read_text())
+        rfd = os.open(tmp_name, os.O_RDONLY | _NOFOLLOW_FLAGS, dir_fd=dir_fd)
+        with os.fdopen(rfd, "r", encoding="utf-8") as handle:
+            reloaded = json.load(handle)
         if reloaded != expected:
             raise ValueError("JSON round trip is not lossless")
         if guarded:
-            _require_no_symlink_chain(path)
-        os.replace(tmp, path)
-        tmp = None
+            _check_not_symlink(filename, dir_fd, path, path)
+        os.replace(tmp_name, filename, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        tmp_name = None
+        os.fsync(dir_fd)
     finally:
-        if tmp is not None:
-            tmp.unlink(missing_ok=True)
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            except FileNotFoundError:
+                pass
+        os.close(dir_fd)
     return reloaded
 
 
-SCRIPT_REPO_PARTS = ("research", "quant_ptq", SCRIPT_NAME)
-
-
 def _is_driver_script(arg: str) -> bool:
-    parts = Path(arg).parts
-    return parts == (SCRIPT_NAME,) or (len(parts) >= len(SCRIPT_REPO_PARTS)
-                                       and parts[-len(SCRIPT_REPO_PARTS):] == SCRIPT_REPO_PARTS)
+    return arg == SCRIPT_REPO_PATH
 
 
 def _parsed_command(command, label: str) -> argparse.Namespace:
     """``command`` as a runnable invocation of this script, parsed by its own CLI (no abbreviations)."""
     _require(isinstance(command, list) and len(command) >= 2 and all(isinstance(x, str) and x for x in command)
              and c502._is_python_executable(command[0]), f"{label} must be a Python invocation")
-    _require(_is_driver_script(command[1]), f"{label} is not an invocation of {SCRIPT_NAME}")
+    _require(_is_driver_script(command[1]), f"{label} is not an invocation of {SCRIPT_REPO_PATH}")
+    err = io.StringIO()
     try:
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
             return parse_args(command[2:])
     except SystemExit as exc:
-        raise ValueError(f"{label} is not a valid runnable invocation") from exc
+        raise ValueError(f"{label} is not a valid runnable invocation: {err.getvalue().strip()}") from exc
 
 
 NUMERICS = {"allow_tf32": False, "cudnn_allow_tf32": False, "allow_fp16_reduced_precision_reduction": False,
@@ -2072,6 +2255,9 @@ def _validate_meta(payload: dict, canonical: bool, schema: str) -> None:
     end = c502._timestamp(meta["timestamp_end"], "meta.timestamp_end")
     _require(end >= start and abs((end - start).total_seconds() - meta["total_seconds"]) <= 5.0,
              "meta timestamps are inconsistent with meta.total_seconds")
+    if meta["git_sha"] is not None:
+        _require(start >= _commit_timestamp(meta["git_sha"]),
+                 "meta.timestamp_start is before the producer commit meta.git_sha")
     for field in ("loadavg_start", "loadavg_end"):
         _require(isinstance(meta[field], list) and len(meta[field]) == 3 and all(_nonneg(x) for x in meta[field]),
                  f"meta.{field} invalid")
@@ -2135,30 +2321,45 @@ def _validate_timing(timing: dict, orders, methods, squares: int, iters: int, wa
 COOP_KEYS = {"grid", "graph_replays", "graph_replays_bitwise_exact", "sync_counter_after_replays",
              "launch_cooperative_grid", "enabled_in_nvfp4_inference_blackwell"}
 COOP_GRID_KEYS = {"programs", "max_active_blocks_per_sm", "sms", "resident_capacity"}
-GEMM_KERNEL_MARKERS = ("gemm", "cutlass", "nvjet")
+GEMM_KERNEL_MARKERS = ("gemm", "cutlass", "nvjet", "cublas")
+FP4_KERNEL_MARKERS = ("e2m1", "nvfp4", "fp4")
+QUANT_KERNEL_NAMES = {
+    "c4_02": (_c4_02_amax_kernel.fn.__name__, _c4_02_quant_kernel.fn.__name__),
+    "c5_03": (nb._amax_kernel.fn.__name__, nb._quant_kernel.fn.__name__),
+}
+QUANT_ROLE_MARKERS = ("amax", "quant", "_c4_02_", "_coop_")
+
+
+def _is_gemm_kernel(name: str) -> bool:
+    low = name.lower()
+    return any(m in low for m in GEMM_KERNEL_MARKERS)
+
+
+def _is_fp4_gemm_kernel(name: str) -> bool:
+    low = name.lower()
+    return _is_gemm_kernel(name) and any(m in low for m in FP4_KERNEL_MARKERS)
 
 
 def _validate_kernel_profile(method: str, kernels, where: str) -> None:
-    """CUPTI kernels of one graph replay: finite nonnegative durations, an FP4 GEMM and the quantizer roles.
-
-    nvfp4_gemm_only runs no quantizer; a C4-02 method runs the embedded ``_c4_02_*`` kernels, a C5-03 method
-    the module's; a dynamic variant runs one amax and one quant kernel, a static one a single quant kernel.
-    """
+    """CUPTI kernels of one graph replay: finite nonnegative durations, FP4-specific GEMM and exact quantizer names."""
     _require(isinstance(kernels, dict) and kernels and all(isinstance(k, str) and k and _nonneg(us)
                                                            for k, us in kernels.items()),
              f"{where}: kernel durations must be finite nonnegative microseconds per named kernel")
-    _require(any(m in k.lower() for k in kernels for m in GEMM_KERNEL_MARKERS), f"{where}: no FP4 GEMM kernel")
-    amax = [k for k in kernels if "_amax_kernel" in k]
-    quant = [k for k in kernels if "_quant_kernel" in k]
+    fp4_gemms = [k for k in kernels if _is_fp4_gemm_kernel(k)]
+    non_fp4_gemms = [k for k in kernels if _is_gemm_kernel(k) and not _is_fp4_gemm_kernel(k)]
+    _require(bool(fp4_gemms), f"{where}: no FP4 GEMM kernel")
+    _require(not non_fp4_gemms, f"{where}: unexpected non-FP4 GEMM kernel {non_fp4_gemms}")
+    quant_like = {k for k in kernels if any(m in k.lower() for m in QUANT_ROLE_MARKERS)}
     if method == "nvfp4_gemm_only":
-        _require(not amax and not quant, f"{where}: the GEMM ceiling runs no quantizer kernel")
+        _require(not quant_like, f"{where}: the GEMM ceiling runs no quantizer kernel, found {sorted(quant_like)}")
         return
     impl = next(i for i in IMPLS if method.startswith(f"{i}_"))
     static = method.endswith("static_gs")
-    own = (lambda k: "_c4_02_" in k) if impl == "c4_02" else (lambda k: "_c4_02_" not in k)
-    _require(len(amax) == (0 if static else 1) and len(quant) == 1 and all(own(k) for k in amax + quant),
-             f"{where}: a {'static' if static else 'dynamic'} {impl} graph runs {0 if static else 1} amax and 1 "
-             f"quant kernel of its own implementation, found {amax + quant}")
+    amax_name, quant_name = QUANT_KERNEL_NAMES[impl]
+    expected = {quant_name} if static else {amax_name, quant_name}
+    _require(quant_like == expected,
+             f"{where}: a {'static' if static else 'dynamic'} {impl} graph must run exact quantizer "
+             f"kernel(s) {sorted(expected)} of its own implementation, found {sorted(quant_like)}")
 
 
 def _validate_part_a(payload: dict) -> None:
@@ -2460,11 +2661,18 @@ def _validate_postprocess_provenance(payload: dict, canonical: bool) -> None:
     parsed = _parsed_command(post["postprocess_command"], "postprocess.postprocess_command")
     _require(parsed.postprocess_from_git == source_sha,
              "postprocess.postprocess_command must pass --postprocess-from-git with the source result commit")
-    _require(c502._timestamp(post["postprocess_timestamp"], "postprocess.postprocess_timestamp")
-             >= c502._timestamp(meta["timestamp_end"], "meta.timestamp_end"),
-             "postprocess.postprocess_timestamp is before the end of the measuring run")
+    post_ts = c502._timestamp(post["postprocess_timestamp"], "postprocess.postprocess_timestamp")
+    end_ts = c502._timestamp(meta["timestamp_end"], "meta.timestamp_end")
+    source_commit_ts = _commit_timestamp(source_sha)
+    post_commit_ts = _commit_timestamp(post_sha)
+    _require(post_ts >= end_ts, "postprocess.postprocess_timestamp is before the end of the measuring run")
+    _require(source_commit_ts >= end_ts,
+             "postprocess.source_result_git_sha commit predates the end of the measuring run")
+    _require(post_ts >= source_commit_ts, "postprocess.postprocess_timestamp is before the source result commit")
+    _require(post_ts >= post_commit_ts, "postprocess.postprocess_timestamp is before the postprocessing commit")
     if canonical:
-        _require(reserved(parsed.output) and Path(parsed.output).name == CANONICAL_OUTPUT.name,
+        _require(reserved(parsed.output) and ".." not in parsed.output.parts
+                 and parsed.output.resolve() == CANONICAL_OUTPUT.resolve(),
                  "postprocess.postprocess_command of a canonical result must target the canonical output path")
         _require(post["postprocess_git_dirty"] is False, "a canonical postprocess needs a clean tree")
         _require(CANONICAL_SOURCE_ARTIFACTS.get(source_sha) == post["source_artifact_sha256"],
@@ -2524,9 +2732,9 @@ def _validate_payload(payload: dict, canonical: bool | None) -> dict:
         else:
             _require(payload[key] is None, f"{key} present but not in protocol.parts")
     _assert_close(payload["summary"], summarize(payload), "summary")
-    _require(payload["caveats"] == caveats(payload), "caveats differ from the recomputed caveats")
     if post is not None:
         _validate_postprocess_provenance(payload, canonical)
+    _require(payload["caveats"] == caveats(payload), "caveats differ from the recomputed caveats")
     return {"certified_canonical": canonical, "parts": protocol["parts"], "postprocessed": post is not None}
 
 
@@ -2574,10 +2782,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if not _is_hex(args.postprocess_from_git, 40):
             parser.error("--postprocess-from-git needs the full 40-hex SHA of the result commit")
         args.output = CANONICAL_OUTPUT if args.output is None else args.output
-        if reserved(args.output) and (args.output.is_symlink()
-                                      or args.output.resolve() != CANONICAL_OUTPUT.resolve()):
-            parser.error(f"A postprocess writes {CANONICAL_OUTPUT} of this checkout (no symlink, no other "
-                         f"checkout) or a path outside {RESERVED_PATTERN}")
+        pinned = args.postprocess_from_git in CANONICAL_SOURCE_ARTIFACTS
+        if (pinned or reserved(args.output)) and (
+            ".." in args.output.parts or args.output.is_symlink()
+            or args.output.resolve() != CANONICAL_OUTPUT.resolve()
+        ):
+            parser.error(
+                f"A postprocess writes {CANONICAL_OUTPUT} of this checkout (no symlink, no parent traversal, "
+                f"no other checkout)" + ("" if pinned else f" or a path outside {RESERVED_PATTERN}")
+            )
         args.protocol, args.canonical = None, False  # not a measuring run: it selects no protocol
         args.explicit_data_dir = args.explicit_checkpoint_dir = None
         return args
@@ -2612,6 +2825,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if reserved(args.output) and not args.canonical:
         parser.error(f"Refusing to write the reserved {args.output.name} from a --quick or non-canonical run; "
                      f"choose a path outside {RESERVED_PATTERN}")
+    if (args.canonical or reserved(args.output)) and ".." in args.output.parts:
+        parser.error(f"Refusing parent traversal ('..') in canonical/reserved output path {args.output}")
     if args.canonical and (args.output.is_symlink() or args.output.resolve() != CANONICAL_OUTPUT.resolve()):
         parser.error(f"The canonical protocol writes {CANONICAL_OUTPUT} of this checkout (no symlink, no other "
                      "checkout); change the protocol or use --quick for other paths")
