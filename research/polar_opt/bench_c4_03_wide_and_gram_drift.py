@@ -746,11 +746,11 @@ class ChunkedGram:
     def gram(self, view: Tensor) -> Tensor:
         """FP64 Gram matrices (batch, n, n) of the rows of ``view`` (batch, n, K), any strides."""
         from research.polar_opt import polar_switch_blackwell as psb
-        from research.polar_opt.kernels_blackwell import _syrk_kernel
+        from research.polar_opt.kernels_blackwell import _MAX_GRID_Y, _syrk_kernel
 
         batch, n, k = view.shape
         out = torch.zeros(batch, n, n, dtype=torch.float64, device=view.device)
-        step = max(1, self.max_bytes // (4 * n * n))  # chunk Gram matrices per launch
+        step = min(_MAX_GRID_Y, max(1, self.max_bytes // (4 * n * n)))  # chunk Gram matrices per launch (grid y)
         for index in range(batch):
             chunks = chunk_view(view[index], self.chunk)
             pieces = [chunks[i:i + step] for i in range(0, len(chunks), step)]
@@ -768,25 +768,27 @@ class ChunkedGram:
     def patched(self):
         from research.polar_opt import polar_switch_blackwell as psb
         from research.polar_opt import schatten_switch_blackwell as ssb
+        from research.polar_opt.kernels_blackwell import _store_fp64_single_round as store
 
         gram, launch, fold = psb._gram, ssb._launch, ssb._fold_segment1
+        gates = psb.SYRK_CHUNK_GATE, ssb.SYRK_CHUNK_GATE
 
         def patched_gram(X, out, sketch_norm=None):
             view = X.mT if X.shape[-2] > X.shape[-1] else X
             if sketch_norm is not None or view.shape[-1] <= self.gate:
                 return gram(X, out, sketch_norm)
-            out.copy_(self.gram(view))
+            store(self.gram(view), out)
 
         def patched_launch(kernel, grid, *args):
             if kernel is ssb._syrk_norm_kernel and args[4] > self.gate:
                 view, out, scratch, n, _, _, _, _, off_r, _ = args
-                out.copy_(self.gram(view))
+                store(self.gram(view), out)
                 capacity = ssb._scratch_layout(n, 1)[1] - off_r
                 scratch[:, off_r:off_r + capacity] = 0.0  # one partial holds ||R_h||_F^2 of the stored R_h
                 scratch[:, off_r] = out.double().square().sum((-2, -1))
                 return {"BLOCK": ssb._MIN_BLOCK}
             if kernel is ssb._syrk_kernel and args[3] > self.gate:
-                args[1].copy_(self.gram(args[0]))
+                store(self.gram(args[0]), args[1])
                 return {"BLOCK": ssb._MIN_BLOCK}
             return launch(kernel, grid, *args)
 
@@ -794,11 +796,17 @@ class ChunkedGram:
             return fold(circuit, R, S, scratch, tiles_r, tiles_s, k=self.chunk if k > self.gate else k,
                         use_frobenius=use_frobenius)
 
+        # C5-01: the native chunked paths of ``psb`` and ``ssb`` are switched off, so this hook's
+        # own gate decides: the historical hook above sees the long-K ``_syrk_norm_kernel`` /
+        # ``_syrk_kernel`` launches, and ``K <= self.gate`` runs the single launch even above 65,536.
+        # The FP64 sums are rounded once (``store``), like the native ``_syrk_chunked``.
         psb._gram, ssb._launch, ssb._fold_segment1 = patched_gram, patched_launch, patched_fold
+        psb.SYRK_CHUNK_GATE = ssb.SYRK_CHUNK_GATE = 1 << 60
         try:
             yield self
         finally:
             psb._gram, ssb._launch, ssb._fold_segment1 = gram, launch, fold
+            psb.SYRK_CHUNK_GATE, ssb.SYRK_CHUNK_GATE = gates
 
 
 @contextmanager
