@@ -857,22 +857,50 @@ def run(args) -> dict:
 # ======================================================================================
 # Validation
 # ======================================================================================
+def _is_int(x) -> bool:
+    return type(x) is int
+
+
+def _is_number(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def _exact_equal(a, b) -> bool:
+    """Recursive equality enforcing exact Python types (rejects ``bool == int`` or ``int == float``)."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict):
+        return a.keys() == b.keys() and all(_exact_equal(a[k], b[k]) for k in a)
+    if isinstance(a, (list, tuple)):
+        return len(a) == len(b) and all(_exact_equal(x, y) for x, y in zip(a, b))
+    if isinstance(a, float):
+        return not math.isnan(a) and not math.isnan(b) and a == b and math.copysign(1.0, a) == math.copysign(1.0, b)
+    return a == b
+
+
 def _validate_timing(payload: dict) -> None:
     spec = payload["protocol"]["timing"]
-    cells = payload["timing"]["cells"]
+    tm = payload["timing"]
+    cells = tm["cells"]
     expected = [(s, k, m) for s in spec["shapes"] for k in spec["kernels"] for m in spec["modes"]]
-    _require([(c["shape"], c["kernel"], c["mode"]) for c in cells] == expected, "timing cells differ from the protocol")
-    _require(payload["timing"]["flush_bytes"] == spec["flush_l2_multiple"] * payload["timing"]["l2_cache_bytes"],
+    _require(_exact_equal([(c["shape"], c["kernel"], c["mode"]) for c in cells], expected),
+             "timing cells differ from the protocol")
+    _require(_is_int(tm["l2_cache_bytes"]) and tm["l2_cache_bytes"] > 0
+             and _is_int(tm["flush_bytes"])
+             and tm["flush_bytes"] == spec["flush_l2_multiple"] * tm["l2_cache_bytes"],
              "the L2 flush must be flush_l2_multiple x L2")
     for c in cells:
         where = f"timing {c['mode']} {c['kernel']} {c['shape']}"
-        _require(c["dtype"] == spec["dtype"], f"{where}: dtype differs from the protocol")
+        _require(_exact_equal(c["dtype"], spec["dtype"]), f"{where}: dtype differs from the protocol")
         _require(isinstance(c["outputs_bitwise_equal"], bool), f"{where}: outputs_bitwise_equal must be a bool")
         _require(len(c["rounds"]) == spec["rounds"], f"{where}: round count differs")
         for i, r in enumerate(c["rounds"]):
-            _require(r["round"] == i and r["order"] == williams_order(i), f"{where}: round {i} order differs")
+            _require(_exact_equal(r["round"], i) and _exact_equal(r["order"], williams_order(i)),
+                     f"{where}: round {i} order differs")
             for v in VARIANTS:
-                _require(r[v]["gpu_ms"] > 0 and r[v]["wall_ms"] > 0, f"{where}: non-positive sample")
+                _require(_is_number(r[v]["gpu_ms"]) and r[v]["gpu_ms"] > 0
+                         and _is_number(r[v]["wall_ms"]) and r[v]["wall_ms"] > 0,
+                         f"{where}: non-positive sample")
         _assert_close(c["summary"], timing_summary(c["rounds"]), f"{where}.summary", 1e-9)
 
 
@@ -882,6 +910,13 @@ def _validate_long_k(payload: dict) -> None:
     design = c3.design_ceilings(list(protocol["kernels"]))
     kernels, dtypes = protocol["kernels"], protocol["dtypes"]
     out_dtypes = {d: str(mm.DTYPES[d]).replace("torch.", "") for d in dtypes}
+    lgs = lk["launches_at_graph_shape"]
+    _require(_exact_equal(lgs["shape"], spec["graph_shapes"][0])
+             and set(lgs["native"]) == set(kernels)
+             and all(_is_int(v) and v > 0 for v in lgs["native"].values())
+             and set(lgs["sync_free"]) == set(kernels)
+             and all(isinstance(v, bool) for v in lgs["sync_free"].values()),
+             "launches_at_graph_shape differs from the protocol")
     identities = {
         "syrk": ([(r["shape"], r["dtype"], r["out_dtype"]) for r in lk["syrk"]],
                  [(s, d, o) for s in spec["symmetry_shapes"] for d in dtypes for o in (out_dtypes[d], "float32")]),
@@ -898,35 +933,142 @@ def _validate_long_k(payload: dict) -> None:
                     [(s, kn, d) for s in spec["opus_shapes"] for kn in kernels for d in dtypes]),
     }
     for name, (recorded, expected) in identities.items():
-        _require(recorded == expected, f"long_k {name} rows differ from the protocol")
+        _require(_exact_equal(recorded, expected), f"long_k {name} rows differ from the protocol")
+    for r in lk["syrk"]:
+        _require(_is_int(r["k"]) and r["k"] == max(r["shape"][-2:])
+                 and isinstance(r["symmetric"], bool) and isinstance(r["api_equals_helper"], bool)
+                 and isinstance(r["sync_free"], bool)
+                 and _is_number(r["diag_bias_max"]) and r["diag_bias_max"] >= 0,
+                 f"long_k syrk {r['shape']} {r['dtype']}: invalid fields")
+    for r in lk["boundaries"]:
+        _require(isinstance(r["bitwise_equal_reference"], bool) and isinstance(r["bitwise_equal_control"], bool),
+                 f"long_k boundaries k={r['k']}: flags must be bool")
+    for r in lk["inputs"]:
+        _require(isinstance(r["bitwise_equal_c4_03"], bool)
+                 and (r["sync_free"] is None or isinstance(r["sync_free"], bool))
+                 and isinstance(r["finite_per_matrix"], list)
+                 and all(isinstance(x, bool) for x in r["finite_per_matrix"]),
+                 f"long_k inputs {r['case']}: invalid fields")
+    for r in lk["graphs"]:
+        _require(isinstance(r["bitwise_equal"], bool) and isinstance(r["finite"], bool)
+                 and _is_number(r["max_abs_diff"]) and r["max_abs_diff"] >= 0,
+                 f"long_k graphs {r['shape']} {r['kernel']}: invalid fields")
     for r in lk["opus_l6"]:
         where = f"opus_l6 {r['shape']} {r['kernel']} {r['dtype']}"
+        _require(isinstance(r["bitwise_equal_c4_03"], bool), f"{where}: bitwise_equal_c4_03 must be bool")
         _require(len(r["samples"]) == spec["opus_reps"], f"{where}: sample count differs")
         for i, s in enumerate(r["samples"]):
-            _require(s["round"] == i and s["order"] == williams_order(i), f"{where}: sample order differs")
-            _require(all(s[v]["wall_ms"] > 0 for v in VARIANTS), f"{where}: non-positive sample")
+            _require(_exact_equal(s["round"], i) and _exact_equal(s["order"], williams_order(i)),
+                     f"{where}: sample order differs")
+            _require(all(_is_number(s[v]["wall_ms"]) and s[v]["wall_ms"] > 0 for v in VARIANTS),
+                     f"{where}: non-positive sample")
         _assert_close(r["speedup"], speedup(r["samples"]), f"{where}.speedup", 1e-9)
         _assert_close(r["speedup_paired"], paired_speedup(r["samples"]), f"{where}.speedup_paired", 1e-9)
         _assert_close(r["design_ceiling"], design[r["kernel"]], f"{where}.design_ceiling", 1e-12)
     expected = [(f, e, s) for f, fam in spec["grid_families"].items() for e in fam["k_exponents"] for s in fam["seeds"]]
-    _require([(r["family"], r["k_exponent"], r["seed"]) for r in lk["grid"]] == expected,
+    _require(_exact_equal([(r["family"], r["k_exponent"], r["seed"]) for r in lk["grid"]], expected),
              "grid rows differ from the protocol families")
     names = {f"{k}_{d}" for k in protocol["kernels"] for d in protocol["dtypes"]}
     for r in lk["grid"]:
         fam = spec["grid_families"][r["family"]]
         shape = [fam["n"], r["k"]] if fam["orientation"] == "wide" else [r["k"], fam["n"]]
-        _require(r["n"] == fam["n"] and r["shape"] == shape, f"grid {r['family']} 2^{r['k_exponent']}: shape differs")
+        _require(_exact_equal(r["n"], fam["n"]) and _exact_equal(r["shape"], shape),
+                 f"grid {r['family']} 2^{r['k_exponent']}: shape differs")
         _require(set(r["cells"]) == names, f"grid {r['family']} 2^{r['k_exponent']}: kernel cells differ")
-        _require(r["chunked"] == (r["k"] > protocol["gate"]) and r["k"] == 1 << r["k_exponent"], "grid chunk flag")
+        _require(_exact_equal(r["chunked"], r["k"] > protocol["gate"])
+                 and _exact_equal(r["k"], 1 << r["k_exponent"]), "grid chunk flag")
         for name, c in r["cells"].items():
+            _require(isinstance(c["finite"], bool) and isinstance(c["bitwise_equal_c4_03"], bool),
+                     f"grid {name}: flags must be bool")
             _assert_close(c["design_ceiling"], design[name.rsplit("_", 1)[0]], f"grid {name}.design_ceiling", 1e-12)
             if c["finite"]:
-                _require(0 <= c["sigma_min"] <= c["sigma_max"] and c["rel_fro_err"] >= 0,
+                _require(_is_number(c["sigma_min"]) and _is_number(c["sigma_max"])
+                         and _is_number(c["rel_fro_err"])
+                         and 0 <= c["sigma_min"] <= c["sigma_max"] and c["rel_fro_err"] >= 0,
                          f"grid {name}: singular values out of order")
 
 
-def _is_int(x) -> bool:
-    return type(x) is int
+def _digest_words(x: Tensor) -> str:
+    return hashlib.sha256(mm._bits(x).numpy().tobytes()).hexdigest()
+
+
+@functools.cache
+def _expected_audit_seed_digests() -> dict[str, str]:
+    """Deterministic CPU ``sm120_mma_batched`` digests for the fixed ``audit_seeds`` inputs."""
+    digests = {}
+    with torch.no_grad():
+        for dt in mm.DTYPES:
+            work = mm.DTYPES[dt]
+            gen = mm._generator(419)
+            X = torch.randn(9, 2033, generator=gen, dtype=torch.float64) * torch.exp2(
+                torch.randint(-6, 7, (9, 2033), generator=gen).double())
+            i, j = torch.triu_indices(9, 9)
+            for label, matrix in (("seed419_9x2033", X), ("seed419_9x2033_unit_frobenius", X / X.norm())):
+                rows = matrix.to(work).double()
+                digests[f"{label}/{dt}"] = _digest_words(mm.sm120_mma_batched(rows[i], rows[j], dtype=dt))
+            for seed, count in ((927, 4096), (719, 32768)):
+                gen = mm._generator(seed)
+                rows = mm.normal_mantissa((count, 2, mm.GROUP), gen).to(work).double()
+                off = mm.sm120_mma_batched(rows[:, 0], rows[:, 1], dtype=dt)
+                if seed == 927:
+                    diag = mm.sm120_mma_batched(rows[:, 0], rows[:, 0], dtype=dt)
+                    digests[f"seed927_{count}x2x16_offdiag/{dt}"] = _digest_words(off)
+                    digests[f"seed927_{count}x2x16_diag0/{dt}"] = _digest_words(diag)
+                else:
+                    digests[f"seed719_{count}x2x16_offdiag/{dt}"] = _digest_words(off)
+    return digests
+
+
+@functools.cache
+def _expected_mma_digests(stress_seed: int, stress_dots: int, chain_dots: int,
+                          chains: tuple[tuple[int, int], ...],
+                          syrk_shapes: tuple[tuple[int, int], ...]) -> dict[str, str]:
+    """Deterministic CPU ``sm120_mma_batched`` digests for all ``stress``, ``syrk_configs``, and ``audit_seeds``."""
+    digests = dict(_expected_audit_seed_digests())
+    with torch.no_grad():
+        for dt in mm.DTYPES:
+            work = mm.DTYPES[dt]
+            for c_index, category in enumerate(mm.STRESS_CATEGORIES):
+                gen = mm._generator(stress_seed + 100 * c_index + (dt == "bf16"))
+                a, b, acc = mm._stress_inputs(category, dt, stress_dots, mm.GROUP, gen)
+                digests[f"{category}/{dt}"] = _digest_words(mm.sm120_mma_batched(a, b, acc, dtype=dt))
+            for k, bk in chains:
+                gen = mm._generator(stress_seed + 7 * k + bk + (dt == "bf16"))
+                a = mm.normal_mantissa((chain_dots, k), gen, -9, -3).to(work).double()
+                b = torch.where(torch.rand(chain_dots, 1, generator=gen) < 0.25, a.abs(),
+                                mm.normal_mantissa((chain_dots, k), gen, -9, -3).to(work).double())
+                digests[f"chain_k{k}_bk{bk}/{dt}"] = _digest_words(mm.sm120_mma_batched(a, b, dtype=dt))
+            for n, k in syrk_shapes:
+                gen = mm._generator(stress_seed + n * 131 + k + (dt == "bf16"))
+                X = (mm.normal_mantissa((n, k), gen, -9, -1)
+                     * torch.where(torch.rand(n, k, generator=gen) < 0.1, 0.0, 1.0)).to(work)
+                i, j = torch.triu_indices(n, n)
+                rows = X.double()
+                digests[f"syrk_{n}x{k}/{dt}"] = _digest_words(mm.sm120_mma_batched(rows[i], rows[j], dtype=dt))
+    return digests
+
+
+@functools.cache
+def _hypothesis_agreement_matrix(stress_seed: int, hypothesis_dots: int) -> dict[str, dict[tuple[str, str], int]]:
+    """Pairwise exact-prediction agreement counts across ``HYPOTHESES`` on CPU."""
+    agree = {}
+    with torch.no_grad():
+        for dt in mm.DTYPES:
+            gen = mm._generator(stress_seed + 99 + (dt == "bf16"))
+            a, b, acc = mm._stress_inputs("random_mantissa", dt, hypothesis_dots, mm.GROUP, gen)
+            base_bits = mm._bits(mm.sm120_mma_batched(a, b, acc, dtype=dt))
+            a_list, b_list, acc_list = a.tolist(), b.tolist(), acc.tolist()
+            preds = {}
+            for name, opts in mm.HYPOTHESES.items():
+                if opts == {}:
+                    preds[name] = base_bits
+                else:
+                    pred = torch.tensor([mm.variant_accumulate(a_list[i], b_list[i], acc_list[i], dtype=dt, **opts)
+                                         for i in range(len(a_list))])
+                    preds[name] = mm._bits(pred)
+            agree[dt] = {(n1, n2): int((preds[n1] == preds[n2]).sum())
+                         for n1 in mm.HYPOTHESES for n2 in mm.HYPOTHESES}
+    return agree
 
 
 def _fp32_word(text: str, *, allow_short: bool = False) -> int:
@@ -954,40 +1096,58 @@ def _validate_mma(payload: dict) -> None:
     from research.polar_opt.kernels_blackwell import _CONFIGS
 
     mma, spec = payload["mma"], payload["protocol"]["mma"]
+    _require(isinstance(mma, dict)
+             and set(mma.keys()) == {"ptx_mma", "model", "witnesses", "exponent_table", "edge_cases",
+                                     "hypotheses", "stress", "syrk_configs", "audit_seeds"},
+             "mma sections differ from schema")
     expected_ptx = {
         dt: [f"mma.sync.aligned.m16n8k16.row.col.f32.{dt.replace('fp', 'f')}.{dt.replace('fp', 'f')}.f32"]
         for dt in mm.DTYPES
     }
-    _require(mma.get("ptx_mma") == expected_ptx, "ptx_mma differs from sm_120 expectation")
-    model_meta = mma.get("model")
-    _require(isinstance(model_meta, dict)
-             and model_meta.get("name") == "sm120_mma_accumulate"
-             and model_meta.get("group") == mm.GROUP
-             and model_meta.get("guard_bits") == mm.GUARD
-             and model_meta.get("nan_bits") == f"0x{mm.NAN_BITS:08x}",
-             "mma model metadata differs")
+    _require(_exact_equal(mma.get("ptx_mma"), expected_ptx), "ptx_mma differs from sm_120 expectation")
+    expected_model = {
+        "name": "sm120_mma_accumulate",
+        "group": mm.GROUP,
+        "guard_bits": mm.GUARD,
+        "alignment": "max(e(C), e(a_k) + e(b_k)); e = field exponent (subnormal at emin)",
+        "addend_rounding": "toward zero at 2^(E-25)",
+        "sum": "exact, one 17-term adder, lane-order free",
+        "normalization": "toward zero to 24 bits, FP32 subnormals at 2^-149, |x| >= 2^128 -> inf",
+        "zero": "+0",
+        "nan_bits": f"0x{mm.NAN_BITS:08x}",
+        "chain": "ascending k16 slices, FP32 D feeds the next C",
+    }
+    _require(_exact_equal(mma.get("model"), expected_model), "mma model metadata differs")
 
     expected_witnesses = [
         ("Astra FP16 4-term diagonal", "fp16", mm.ASTRA_FP16_WITNESS, mm.ASTRA_FP16_HARDWARE, mm.ASTRA_FP16_C4_03),
         ("BF16 5-term diagonal (reconstructed)", "bf16", mm.BF16_WITNESS, mm.ASTRA_BF16_HARDWARE, mm.ASTRA_BF16_C4_03),
     ]
-    _require([(w["name"], w["dtype"], w["permutations"]) for w in mma["witnesses"]]
-             == [(n, dt, math.perm(mm.GROUP, len(vals))) for n, dt, vals, _, _ in expected_witnesses],
+    witness_keys = {"name", "dtype", "row", "ptx_mma", "audit_hardware", "audit_c4_03_model", "probe_hardware",
+                    "syrk_configs_hardware", "sm120_model", "c4_03_model", "model_equals_hardware",
+                    "configs_equal_hardware", "permutations", "permutations_equal_hardware"}
+    _require(_exact_equal([(w["name"], w["dtype"], w["permutations"]) for w in mma["witnesses"]],
+                          [(n, dt, math.perm(mm.GROUP, len(vals))) for n, dt, vals, _, _ in expected_witnesses]),
              "witnesses differ from the protocol")
     for w, (_, dt, vals, expected_audit, expected_c4) in zip(mma["witnesses"], expected_witnesses):
+        _require(set(w.keys()) == witness_keys, f"witness {w['name']}: unexpected keys")
         expected_row = [mm._rounded(vals[i], dt) if i in vals else 0.0 for i in range(mm.GROUP)]
-        _require(w["row"] == expected_row, f"witness {w['name']}: row differs")
-        _require(w["ptx_mma"] == expected_ptx[dt], f"witness {w['name']}: ptx_mma differs")
-        _require(w["audit_hardware"] == expected_audit, f"witness {w['name']}: audit_hardware differs")
-        _require(w["audit_c4_03_model"] == expected_c4, f"witness {w['name']}: audit_c4_03_model differs")
-        _require(w["sm120_model"] == mm._hex(mm.sm120_mma_accumulate(expected_row, expected_row, dtype=dt)),
+        _require(_exact_equal(w["row"], expected_row), f"witness {w['name']}: row differs")
+        _require(_exact_equal(w["ptx_mma"], expected_ptx[dt]), f"witness {w['name']}: ptx_mma differs")
+        _require(_exact_equal(w["audit_hardware"], expected_audit), f"witness {w['name']}: audit_hardware differs")
+        _require(_exact_equal(w["audit_c4_03_model"], expected_c4),
+                 f"witness {w['name']}: audit_c4_03_model differs")
+        _require(_exact_equal(w["sm120_model"],
+                              mm._hex(mm.sm120_mma_accumulate(expected_row, expected_row, dtype=dt))),
                  f"witness {w['name']}: sm120_model differs")
-        _require(w["c4_03_model"] == mm._hex(mm.c4_03_accumulate(expected_row, expected_row)),
+        _require(_exact_equal(w["c4_03_model"], mm._hex(mm.c4_03_accumulate(expected_row, expected_row))),
                  f"witness {w['name']}: c4_03_model differs")
         audit_word = _fp32_word(w["audit_hardware"], allow_short=True)
         probe_word = _fp32_word(w["probe_hardware"])
         model_word = _fp32_word(w["sm120_model"])
-        _require(len(w["syrk_configs_hardware"]) == len(_CONFIGS), f"witness {w['name']}: config count differs")
+        _require(isinstance(w["syrk_configs_hardware"], list)
+                 and len(w["syrk_configs_hardware"]) == len(_CONFIGS),
+                 f"witness {w['name']}: config count differs")
         cfg_words = [_fp32_word(v) for v in w["syrk_configs_hardware"]]
         _require(w["model_equals_hardware"] is (model_word == probe_word == audit_word),
                  f"witness {w['name']}: model_equals_hardware differs from recorded words")
@@ -996,39 +1156,46 @@ def _validate_mma(payload: dict) -> None:
         _require(_is_int(w["permutations_equal_hardware"]) and 0 <= w["permutations_equal_hardware"] <= w["permutations"],
                  f"witness {w['name']}: permutation count")
 
-    _require([r["name"] for r in mma["exponent_table"]] == [c["name"] for c in mm.ASTRA_EXPONENT_TABLE],
+    exp_table_keys = {"name", "a", "b", "count", "audit_hardware", "probe_hardware", "sm120_model",
+                      "c4_03_model", "fused_bf16_store", "model_equals_hardware"}
+    _require(_exact_equal([r["name"] for r in mma["exponent_table"]], [c["name"] for c in mm.ASTRA_EXPONENT_TABLE]),
              "exponent_table rows differ from the protocol")
     for r, case in zip(mma["exponent_table"], mm.ASTRA_EXPONENT_TABLE):
-        _require(r["a"] == case["a"] and r["b"] == case["b"]
-                 and _is_int(r["count"]) and r["count"] == case["count"],
+        _require(set(r.keys()) == exp_table_keys, f"exponent_table {r['name']}: unexpected keys")
+        _require(_exact_equal(r["a"], case["a"]) and _exact_equal(r["b"], case["b"])
+                 and _exact_equal(r["count"], case["count"]),
                  f"exponent_table {r['name']}: inputs differ")
-        _require(r["audit_hardware"] == mm._hex(case["hardware"]),
+        _require(_exact_equal(r["audit_hardware"], mm._hex(case["hardware"])),
                  f"exponent_table {r['name']}: audit_hardware differs")
         a_vec, b_vec = [case["a"]] * case["count"], [case["b"]] * case["count"]
-        _require(r["sm120_model"] == mm._hex(mm.sm120_mma_accumulate(a_vec, b_vec, dtype="bf16")),
+        _require(_exact_equal(r["sm120_model"], mm._hex(mm.sm120_mma_accumulate(a_vec, b_vec, dtype="bf16"))),
                  f"exponent_table {r['name']}: sm120_model differs")
-        _require(r["c4_03_model"] == mm._hex(mm.c4_03_accumulate(a_vec, b_vec)),
+        _require(_exact_equal(r["c4_03_model"], mm._hex(mm.c4_03_accumulate(a_vec, b_vec))),
                  f"exponent_table {r['name']}: c4_03_model differs")
         audit_word = _fp32_word(r["audit_hardware"])
         probe_word = _fp32_word(r["probe_hardware"])
         probe_val = struct.unpack("<f", struct.pack("<I", probe_word))[0]
-        _require(r["fused_bf16_store"] == mm._hex(mm._rounded(probe_val, "bf16")),
+        _require(_exact_equal(r["fused_bf16_store"], mm._hex(mm._rounded(probe_val, "bf16"))),
                  f"exponent_table {r['name']}: fused_bf16_store differs")
         _require(r["model_equals_hardware"] is (_fp32_word(r["sm120_model"]) == probe_word == audit_word),
                  f"exponent_table {r['name']}: model_equals_hardware differs from recorded words")
 
-    _require([(r["name"], r["dtype"]) for r in mma["edge_cases"]]
-             == [(name, dtype) for name, dtype, *_ in mm.EDGE_CASES],
+    edge_keys = {"name", "dtype", "acc", "hardware", "hardware_bits", "sm120_model",
+                 "model_equals_hardware", "vectorized_equals_hardware"}
+    _require(_exact_equal([(r["name"], r["dtype"]) for r in mma["edge_cases"]],
+                          [(name, dtype) for name, dtype, *_ in mm.EDGE_CASES]),
              "edge_cases differ from the protocol")
     for r, (name, dt, a_in, b_in, acc) in zip(mma["edge_cases"], mm.EDGE_CASES):
-        _require(r["acc"] == mm._hex(acc), f"edge_case {name}: acc differs")
-        expected_model = mm._hex(mm.sm120_mma_accumulate(
-            [mm._rounded(x, dt) for x in a_in], [mm._rounded(y, dt) for y in b_in], acc, dtype=dt))
-        _require(r["sm120_model"] == expected_model, f"edge_case {name}: sm120_model differs")
+        _require(set(r.keys()) == edge_keys, f"edge_case {name}: unexpected keys")
+        _require(_exact_equal(r["acc"], mm._hex(acc)), f"edge_case {name}: acc differs")
+        a_r, b_r = [mm._rounded(x, dt) for x in a_in], [mm._rounded(y, dt) for y in b_in]
+        expected_model = mm._hex(mm.sm120_mma_accumulate(a_r, b_r, acc, dtype=dt))
+        _require(_exact_equal(r["sm120_model"], expected_model), f"edge_case {name}: sm120_model differs")
         bits_text = r.get("hardware_bits")
         _require(isinstance(bits_text, str) and bits_text.startswith("0x") and _is_hex(bits_text[2:], 8),
                  f"edge_case {name}: hardware_bits format")
         hw_word = int(bits_text, 16)
+        _require(bits_text == f"0x{hw_word:08x}", f"edge_case {name}: hardware_bits format")
         if r["hardware"] == "nan":
             _require((hw_word & 0x7F800000) == 0x7F800000 and (hw_word & 0x007FFFFF) != 0,
                      f"edge_case {name}: non-NaN hardware_bits")
@@ -1039,24 +1206,30 @@ def _validate_mma(payload: dict) -> None:
             expected_eq = (r["sm120_model"] != "nan" and _fp32_word(r["sm120_model"]) == hw_word)
         _require(r["model_equals_hardware"] is expected_eq,
                  f"edge_case {name}: model_equals_hardware differs from recorded words")
-        _require(isinstance(r.get("vectorized_equals_hardware"), bool),
-                 f"edge_case {name}: vectorized_equals_hardware must be bool")
+        vec_word = int(mm._bits(mm.sm120_mma_batched(torch.tensor([a_r]), torch.tensor([b_r]),
+                                                      torch.tensor([acc]), dtype=dt))[0]) & 0xFFFFFFFF
+        _require(r["vectorized_equals_hardware"] is (hw_word == vec_word),
+                 f"edge_case {name}: vectorized_equals_hardware differs from recorded words")
 
     for r in [*mma["stress"], *mma["syrk_configs"], *mma["audit_seeds"]]:
         _require(_is_int(r["bit_matches"]) and _is_int(r["cases"])
-                 and 0 <= r["bit_matches"] <= r["cases"] and _is_hex(r["hardware_sha256"], 64),
+                 and 0 <= r["bit_matches"] <= r["cases"] and _is_hex(r["hardware_sha256"], 64)
+                 and isinstance(r["mismatches"], list),
                  f"{r['category']}: counts")
         _require(len(r["mismatches"]) == min(4, r["cases"] - r["bit_matches"]), f"{r['category']}: mismatch records")
 
+    stress_keys = {"category", "cases", "bit_matches", "hardware_sha256", "mismatches",
+                   "dtype", "k", "bk", "kind", "scalar_crosscheck"}
     expected_stress = []
     for dt in mm.DTYPES:
         for cat in mm.STRESS_CATEGORIES:
             expected_stress.append((f"{cat}/{dt}", dt, "single", mm.GROUP, mm.GROUP, spec["stress_dots"]))
         for k, bk in spec["chains"]:
             expected_stress.append((f"chain_k{k}_bk{bk}/{dt}", dt, "chain", k, bk, spec["chain_dots"]))
-    _require([(r["category"], r["dtype"], r["kind"], r["k"], r["bk"], r["cases"]) for r in mma["stress"]]
-             == expected_stress, "stress rows differ from the protocol")
+    _require(_exact_equal([(r["category"], r["dtype"], r["kind"], r["k"], r["bk"], r["cases"]) for r in mma["stress"]],
+                          expected_stress), "stress rows differ from the protocol")
     for r in mma["stress"]:
+        _require(set(r.keys()) == stress_keys, f"{r['category']}: unexpected keys")
         sc = r.get("scalar_crosscheck")
         if r["kind"] == "single":
             _require(isinstance(sc, list) and len(sc) == 2 and _is_int(sc[0]) and _is_int(sc[1])
@@ -1064,38 +1237,49 @@ def _validate_mma(payload: dict) -> None:
         else:
             _require(sc is None, "chain scalar_crosscheck must be None")
 
+    syrk_keys = {"category", "cases", "bit_matches", "hardware_sha256", "mismatches",
+                 "dtype", "shape", "config", "ptx_mma", "kind", "fused_store_matches", "symmetric"}
     cfg_records = [mm.config_record(c) for c in _CONFIGS]
-    expected_syrk = [(f"syrk_{n}x{k}/{dt}", dt, [n, k], cfg, n * (n + 1) // 2)
+    expected_syrk = [(f"syrk_{n}x{k}/{dt}", dt, "syrk", [n, k], cfg, n * (n + 1) // 2)
                      for dt in mm.DTYPES for n, k in spec["syrk_shapes"] for cfg in cfg_records]
-    _require([(r["category"], r["dtype"], r["shape"], r["config"], r["cases"]) for r in mma["syrk_configs"]]
-             == expected_syrk, "syrk_configs differ from the protocol")
+    _require(_exact_equal([(r["category"], r["dtype"], r["kind"], r["shape"], r["config"], r["cases"])
+                           for r in mma["syrk_configs"]],
+                          expected_syrk), "syrk_configs differ from the protocol")
     for r in mma["syrk_configs"]:
-        _require(r["ptx_mma"] == expected_ptx[r["dtype"]], f"{r['category']}: ptx_mma differs")
+        _require(set(r.keys()) == syrk_keys, f"{r['category']}: unexpected keys")
+        _require(_exact_equal(r["ptx_mma"], expected_ptx[r["dtype"]]), f"{r['category']}: ptx_mma differs")
         _require(isinstance(r["symmetric"], bool), f"{r['category']}: symmetric must be bool")
         _require(_is_int(r["fused_store_matches"]) and 0 <= r["fused_store_matches"] <= r["cases"],
                  "syrk_configs fused_store_matches")
 
+    audit_base_keys = {"category", "cases", "bit_matches", "hardware_sha256", "mismatches",
+                       "dtype", "config", "kind"}
     expected_audit = []
     for dt in mm.DTYPES:
         for label in ("seed419_9x2033", "seed419_9x2033_unit_frobenius"):
             for cfg in cfg_records:
-                expected_audit.append((f"{label}/{dt}", dt, cfg, 45))
+                expected_audit.append((f"{label}/{dt}", dt, "audit_seed", cfg, 45))
         for cfg in cfg_records:
             for part in ("offdiag", "diag0"):
-                expected_audit.append((f"seed927_4096x2x16_{part}/{dt}", dt, cfg, 4096))
+                expected_audit.append((f"seed927_4096x2x16_{part}/{dt}", dt, "audit_seed", cfg, 4096))
         for cfg in cfg_records:
-            expected_audit.append((f"seed719_32768x2x16_offdiag/{dt}", dt, cfg, 32768))
-    _require([(r["category"], r["dtype"], r["config"], r["cases"]) for r in mma["audit_seeds"]]
-             == expected_audit, "audit_seeds differ from the protocol")
+            expected_audit.append((f"seed719_32768x2x16_offdiag/{dt}", dt, "audit_seed", cfg, 32768))
+    _require(_exact_equal([(r["category"], r["dtype"], r["kind"], r["config"], r["cases"]) for r in mma["audit_seeds"]],
+                          expected_audit), "audit_seeds differ from the protocol")
     for r in mma["audit_seeds"]:
         if r["category"].startswith("seed719_"):
-            _require("fused_store_matches" in r and _is_int(r["fused_store_matches"])
-                     and 0 <= r["fused_store_matches"] <= r["cases"], "audit_seeds fused_store_matches")
+            _require(set(r.keys()) == (audit_base_keys | {"fused_store_matches"}),
+                     f"{r['category']}: unexpected keys")
+            _require(_is_int(r["fused_store_matches"]) and 0 <= r["fused_store_matches"] <= r["cases"],
+                     "audit_seeds fused_store_matches")
         else:
             _require("fused_store_matches" not in r, "unexpected fused_store_matches on non-seed719 audit row")
+            _require(set(r.keys()) == audit_base_keys, f"{r['category']}: unexpected keys")
 
-    _require([(r["hypothesis"], r["options"], r["dtype"], r["cases"]) for r in mma["hypotheses"]]
-             == [(name, opts, dt, spec["hypothesis_dots"]) for dt in mm.DTYPES for name, opts in mm.HYPOTHESES.items()],
+    hyp_keys = {"hypothesis", "options", "dtype", "cases", "bit_matches", "witness", "witness_equals_hardware"}
+    _require(_exact_equal([(r["hypothesis"], r["options"], r["dtype"], r["cases"]) for r in mma["hypotheses"]],
+                          [(name, opts, dt, spec["hypothesis_dots"])
+                           for dt in mm.DTYPES for name, opts in mm.HYPOTHESES.items()]),
              "hypotheses differ")
     witness_rows = {
         dt: [mm._rounded(vals[i], dt) if i in vals else 0.0 for i in range(mm.GROUP)]
@@ -1106,19 +1290,52 @@ def _validate_mma(payload: dict) -> None:
         "bf16": _fp32_word(mm.ASTRA_BF16_HARDWARE, allow_short=True),
     }
     for r in mma["hypotheses"]:
+        _require(set(r.keys()) == hyp_keys, f"hypothesis {r['hypothesis']}: unexpected keys")
         _require(_is_int(r["bit_matches"]) and 0 <= r["bit_matches"] <= r["cases"],
                  f"hypothesis {r['hypothesis']}: bit_matches")
         expected_w = mm._hex(mm.variant_accumulate(witness_rows[r["dtype"]], witness_rows[r["dtype"]],
                                                    dtype=r["dtype"], **r["options"]))
-        _require(r["witness"] == expected_w, f"hypothesis {r['hypothesis']}: witness differs")
+        _require(_exact_equal(r["witness"], expected_w), f"hypothesis {r['hypothesis']}: witness differs")
         _require(r["witness_equals_hardware"] is (_fp32_word(r["witness"]) == witness_targets[r["dtype"]]),
                  f"hypothesis {r['hypothesis']}: witness_equals_hardware differs")
+
+    digests = _expected_mma_digests(
+        spec["stress_seed"],
+        spec["stress_dots"],
+        spec["chain_dots"],
+        tuple((int(k), int(bk)) for k, bk in spec["chains"]),
+        tuple((int(n), int(k)) for n, k in spec["syrk_shapes"]),
+    )
+    for r in [*mma["stress"], *mma["syrk_configs"], *mma["audit_seeds"]]:
+        expected_digest = digests[r["category"]]
+        if r["bit_matches"] == r["cases"]:
+            _require(r["hardware_sha256"] == expected_digest,
+                     f"{r['category']}: hardware_sha256 differs from deterministic model digest")
+        else:
+            _require(r["hardware_sha256"] != expected_digest,
+                     f"{r['category']}: hardware_sha256 equals model digest despite mismatches")
+
+    agree = _hypothesis_agreement_matrix(spec["stress_seed"], spec["hypothesis_dots"])
+    names = list(mm.HYPOTHESES)
+    n_cases = spec["hypothesis_dots"]
+    for dt in mm.DTYPES:
+        by_name = {r["hypothesis"]: r["bit_matches"] for r in mma["hypotheses"] if r["dtype"] == dt}
+        for i, n1 in enumerate(names):
+            for n2 in names[i + 1:]:
+                eq = agree[dt][(n1, n2)]
+                diff = n_cases - eq
+                _require(by_name[n1] + by_name[n2] <= n_cases + eq
+                         and abs(by_name[n1] - by_name[n2]) <= diff,
+                         f"hypothesis {n1} vs {n2} ({dt}): bit_matches inconsistent with deterministic model predictions")
 
 
 def validate_results(payload: dict, *, canonical: bool | None = None) -> None:
     """Raise ValueError unless ``payload`` is a complete, internally consistent C5-01 result."""
     canonical = payload.get("canonical") if canonical is None else canonical
     _require(payload.get("schema_version") == SCHEMA_VERSION, "schema_version differs")
+    _require(payload.get("task") == TASK, "task differs")
+    _require(isinstance(payload.get("quick"), bool) and isinstance(payload.get("canonical"), bool),
+             "quick/canonical flags must be bool")
     meta, protocol = payload["meta"], payload["protocol"]
     _require(isinstance(meta.get("git_dirty"), bool), "git_dirty must be recorded")
     _require(_is_hex(meta.get("code_sha256"), 64), "code_sha256 must be 64-hex")
@@ -1131,27 +1348,46 @@ def validate_results(payload: dict, *, canonical: bool | None = None) -> None:
                                                                meta["git_sha"], env),
              "run_config_hash differs from the recomputed digest")
     numerics = meta["numerics"]
-    _require(numerics["allow_tf32"] is False and numerics["allow_fp16_reduced_precision_reduction"] is False
+    _require(numerics["allow_tf32"] is False and numerics["cudnn_allow_tf32"] is False
+             and numerics["float32_matmul_precision"] == "highest"
+             and numerics["allow_fp16_reduced_precision_reduction"] is False
              and numerics["allow_bf16_reduced_precision_reduction"] is False, "full-precision numerics are required")
-    _require(protocol["gate"] == kbw.SYRK_CHUNK_GATE and protocol["chunk"] == kbw.SYRK_CHUNK_SIZE
-             and protocol["max_bytes"] == kbw.SYRK_CHUNK_MAX_BYTES, "gate constants differ from kernels_blackwell")
+    _require(_exact_equal(protocol["gate"], kbw.SYRK_CHUNK_GATE)
+             and _exact_equal(protocol["chunk"], kbw.SYRK_CHUNK_SIZE)
+             and _exact_equal(protocol["max_bytes"], kbw.SYRK_CHUNK_MAX_BYTES),
+             "gate constants differ from kernels_blackwell")
     _require(protocol["legacy_base"] == LEGACY_BASE == payload["zero_regression"]["legacy_base"], "legacy base differs")
     if canonical:
         _require(payload["canonical"] is True and payload["quick"] is False, "a canonical result cannot be --quick")
         _require(_is_hex(meta.get("git_sha"), 40) and meta["git_dirty"] is False,
                  "canonical results need a 40-hex git_sha and a clean tree")
-        _require(list(env["capability"]) >= [12, 0], "a canonical result needs an sm_120+ CUDA device")
-        _require(protocol == CANONICAL, "protocol differs from the canonical protocol")
+        cap = env["capability"]
+        _require(isinstance(cap, list) and len(cap) == 2 and all(_is_int(x) for x in cap) and cap >= [12, 0],
+                 "a canonical result needs an sm_120+ CUDA device")
+        _require(_exact_equal(protocol, CANONICAL), "protocol differs from the canonical protocol")
         modules = meta["code_modules"]
         _require(len(set(modules)) == len(modules) and all(m.startswith("research.") for m in modules)
-                 and modules == list(code_modules()), "code_modules differ from the static import closure")
+                 and _exact_equal(modules, list(code_modules())), "code_modules differ from the static import closure")
     zr = payload["zero_regression"]
     spec = protocol["zero_regression"]
+    _require(isinstance(zr["legacy_blobs"], dict) and set(zr["legacy_blobs"]) == set(LEGACY_MODULES)
+             and all(_is_hex(v, 40) for v in zr["legacy_blobs"].values()),
+             "zero_regression legacy_blobs differ")
     expected = [(s, seed, k, d) for s in spec["shapes"] for seed in spec["seeds"]
                 for k in (*protocol["kernels"], "gram_ns", "triton_syrk") for d in protocol["dtypes"]]
-    _require([(r["shape"], r["seed"], r["kernel"], r["dtype"]) for r in zr["rows"]] == expected,
+    _require(_exact_equal([(r["shape"], r["seed"], r["kernel"], r["dtype"]) for r in zr["rows"]], expected),
              "zero_regression rows differ from the protocol")
-    _require(all(r["k"] <= protocol["gate"] for r in zr["rows"]), "zero_regression covers K <= gate only")
+    _require(all(_is_int(r["k"]) and r["k"] == max(r["shape"][-2:]) and r["k"] <= protocol["gate"]
+                 and isinstance(r["bitwise_equal"], bool) and isinstance(r["finite"], bool)
+                 for r in zr["rows"]),
+             "zero_regression covers K <= gate only")
+    expected_launches = [(s, k) for s in spec["launch_shapes"] for k in protocol["kernels"]]
+    _require(_exact_equal([(r["shape"], r["kernel"]) for r in zr["launches"]], expected_launches),
+             "zero_regression launches differ from the protocol")
+    _require(all(_is_int(r["native"]) and r["native"] > 0 and _is_int(r["legacy"]) and r["legacy"] > 0
+                 and isinstance(r["native_sync_free"], bool) and isinstance(r["legacy_sync_free"], bool)
+                 for r in zr["launches"]),
+             "zero_regression launches invalid fields")
     _validate_timing(payload)
     _validate_long_k(payload)
     _validate_mma(payload)
@@ -1159,11 +1395,25 @@ def validate_results(payload: dict, *, canonical: bool | None = None) -> None:
     if canonical:
         d = payload["derived"]
         _require(d["zero_regression"]["bitwise_equal"] == d["zero_regression"]["cells"] > 0, "a K <= gate cell differs")
+        _require(all(r["finite"] for r in zr["rows"]), "a K <= gate cell is non-finite")
         _require(d["zero_regression"]["launches_equal"] == d["zero_regression"]["launch_cells"]
-                 and d["zero_regression"]["launches_at_512x2048"] == spec["launch_expected"], "launch counts differ")
+                 and _exact_equal(d["zero_regression"]["launches_at_512x2048"], spec["launch_expected"])
+                 and d["zero_regression"]["sync_free"] == d["zero_regression"]["launch_cells"],
+                 "launch counts differ")
         _require(d["long_k"]["grid_above_design_ceiling"] == 0, "a chunked cell exceeds its own design ceiling")
+        _require(d["long_k"]["grid_bitwise_c4_03"] == d["long_k"]["grid_cells"], "grid C4-03 mismatch")
         _require(d["timing"]["outputs_bitwise_equal"] == d["timing"]["cells"], "a timing cell's outputs differ")
         _require(d["long_k"]["opus_l6_native_above_design"] == 0, "an Opus L6 cell exceeds its own design ceiling")
+        _require(all(payload["long_k"]["launches_at_graph_shape"]["sync_free"].values()),
+                 "launches_at_graph_shape sync_free failed")
+        _require(all(r["api_equals_helper"] for r in payload["long_k"]["syrk"]),
+                 "promotion: long_k syrk api_equals_helper")
+        _require(d["long_k"]["boundaries_unchunked_equal_control"][0]
+                 == d["long_k"]["boundaries_unchunked_equal_control"][1],
+                 "promotion: long_k boundaries_unchunked_equal_control")
+        _require(d["long_k"]["inputs_sync_free"][0] == d["long_k"]["inputs_sync_free"][1],
+                 "promotion: long_k inputs_sync_free")
+        _require(all(r["finite"] for r in payload["long_k"]["graphs"]), "promotion: long_k graphs finite")
         m = d["mma"]
         _require(m["all_dot_products"][0] == m["all_dot_products"][1] > 0, "promotion: mma all_dot_products")
         for key in ("witnesses", "witness_permutations", "exponent_table", "edge_cases", "syrk_fused_store",

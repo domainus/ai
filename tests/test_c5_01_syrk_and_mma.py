@@ -632,6 +632,7 @@ def _set(path, value):
 def _mma_mismatch(payload):
     record = next(r for r in payload["mma"]["stress"] if r["bit_matches"] == r["cases"])
     record["bit_matches"] -= 1
+    record["hardware_sha256"] = "1" * 64
     record["mismatches"] = [{"index": 0, "hardware": "0x1.0p+0", "model": "0x1.000002p+0"}]
 
 
@@ -644,6 +645,26 @@ def _edge_consistent_fail(payload):
     payload["mma"]["edge_cases"][0]["hardware"] = "0x1.0000000000000p+0"
     payload["mma"]["edge_cases"][0]["hardware_bits"] = "0x3f800000"
     payload["mma"]["edge_cases"][0]["model_equals_hardware"] = False
+    payload["mma"]["edge_cases"][0]["vectorized_equals_hardware"] = False
+
+
+def _sm120_hyp_consistent_fail(payload):
+    payload["mma"]["hypotheses"][0]["bit_matches"] -= 1
+
+
+def _hyp_c4_claims_full(payload):
+    payload["mma"]["hypotheses"][1]["bit_matches"] = payload["mma"]["hypotheses"][1]["cases"]
+
+
+def _hyp_c4_off_by_one(payload):
+    payload["mma"]["hypotheses"][1]["bit_matches"] -= 1
+
+
+def _syrk_group_fake_sha(payload):
+    first = payload["mma"]["syrk_configs"][0]["category"]
+    for record in payload["mma"]["syrk_configs"]:
+        if record["category"] == first:
+            record["hardware_sha256"] = "0" * 64
 
 
 def _duplicate_stress(payload):
@@ -667,7 +688,7 @@ def _hyp_overcount(payload):
 
 
 def _structural_probes(canonical):
-    """Astra's validator bypasses (C5-01 audit + re-audit v2 & v3): each must be rejected."""
+    """Astra's validator bypasses (C5-01 audit + re-audit v2, v3, v4): each must be rejected."""
     probes = [
         (_set(["timing", "cells", 0, "dtype"], "fp64"), "dtype differs"),
         (lambda p: p["long_k"]["opus_l6"].pop(), "opus_l6 rows"),
@@ -678,6 +699,7 @@ def _structural_probes(canonical):
         (lambda p: p["long_k"]["boundaries"].pop(0), "boundaries rows"),
         (lambda p: p["long_k"]["inputs"].pop(), "inputs rows"),
         (_set(["long_k", "graphs", 0, "shape"], [2, 16]), "graphs rows"),
+        (_set(["mma", "model", "zero"], "-0"), "mma model metadata differs"),
         (_set(["mma", "witnesses", 0, "sm120_model"], "0x1.2c63f60000000p-5"), "sm120_model differs"),
         (_set(["mma", "witnesses", 0, "sm120_model"], "0x1.2c63f40000000001p-5"), "sm120_model differs"),
         (_set(["mma", "witnesses", 0, "probe_hardware"], "0x1.2c63f40000000001p-5"),
@@ -685,6 +707,7 @@ def _structural_probes(canonical):
         (_set(["mma", "witnesses", 0, "probe_hardware"], "0x1.2c63f60000000p-5"),
          "model_equals_hardware differs from recorded words"),
         (_set(["mma", "witnesses", 0, "row"], [0.0] * 16), "row differs"),
+        (_set(["mma", "witnesses", 0, "row", 0], False), "row differs"),
         (_set(["mma", "witnesses", 0, "syrk_configs_hardware", 0], "0x1.2c63f60000000p-5"),
          "configs_equal_hardware differs from recorded words"),
         (_set(["mma", "witnesses", 0, "configs_equal_hardware"], False),
@@ -695,6 +718,8 @@ def _structural_probes(canonical):
         (_set(["mma", "exponent_table", 0, "b"], 0.0), "inputs differ"),
         (_set(["mma", "edge_cases", 0, "model_equals_hardware"], False),
          "model_equals_hardware differs from recorded words"),
+        (_set(["mma", "edge_cases", 0, "vectorized_equals_hardware"], False),
+         "vectorized_equals_hardware differs"),
         (lambda p: _set(["mma", "edge_cases", next(i for i, r in enumerate(p["mma"]["edge_cases"])
                                                    if r["hardware"] == "nan"), "hardware_bits"],
                         "0x7ffffffe")(p), "model_equals_hardware differs from recorded words"),
@@ -703,21 +728,31 @@ def _structural_probes(canonical):
         (_duplicate_stress, "stress rows differ"),
         (_scalar_crosscheck_cancel, "chain scalar_crosscheck must be None"),
         (_audit_fused_cancel, "unexpected fused_store_matches"),
+        (_set(["mma", "syrk_configs", 0, "kind"], "chain"), "syrk_configs differ"),
+        (_set(["mma", "audit_seeds", 0, "kind"], "syrk"), "audit_seeds differ"),
+        (lambda p: p["zero_regression"]["launches"].pop(), "launches differ"),
         (lambda p: p["mma"]["syrk_configs"].pop(), "syrk_configs differ"),
         (lambda p: p["mma"]["hypotheses"].pop(), "hypotheses differ"),
         (_set(["mma", "hypotheses", 0, "witness"], "0x1.2c63f60000000p-5"), "witness differs"),
         (_set(["mma", "hypotheses", 0, "witness_equals_hardware"], False), "witness_equals_hardware differs"),
+        (_set(["mma", "hypotheses", 2, "options", "guard"], True), "hypotheses differ"),
         (_hyp_overcount, "bit_matches"),
+        (_set(["mma", "hypotheses", 0, "bit_matches"], 0), "inconsistent with deterministic model"),
+        (_hyp_c4_claims_full, "inconsistent with deterministic model"),
+        (_hyp_c4_off_by_one, "inconsistent with deterministic model"),
+        (_set(["mma", "syrk_configs", 0, "hardware_sha256"], "0" * 64), "hardware_sha256 differs"),
+        (_syrk_group_fake_sha, "hardware_sha256 differs"),
+        (_set(["mma", "audit_seeds", 0, "hardware_sha256"], "0" * 64), "hardware_sha256 differs"),
+        (_set(["mma", "stress", 0, "hardware_sha256"], "0" * 64), "hardware_sha256 differs"),
     ]
     if canonical:
         probes += [
             (_mma_mismatch, "promotion: mma all_dot_products"),
             (_edge_consistent_fail, "promotion: mma edge_cases"),
-            (_set(["mma", "edge_cases", 0, "vectorized_equals_hardware"], False), "promotion: mma edge_cases"),
             (_witness_consistent_fail, "promotion: mma witnesses"),
             (_set(["mma", "syrk_configs", 0, "fused_store_matches"], 0), "promotion: mma syrk_fused_store"),
             (_set(["mma", "syrk_configs", 0, "symmetric"], False), "promotion: mma syrk_configs symmetric"),
-            (_set(["mma", "hypotheses", 0, "bit_matches"], 1), "promotion: mma sm120 hypothesis"),
+            (_sm120_hyp_consistent_fail, "promotion: mma sm120 hypothesis"),
             (lambda p: p["meta"]["code_modules"].append("research.polar_opt.bogus"), "code_modules"),
             (lambda p: p["meta"]["code_modules"].append(p["meta"]["code_modules"][0]), "code_modules"),
             (_set(["timing", "cells", 0, "outputs_bitwise_equal"], False), "timing cell's outputs"),
