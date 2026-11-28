@@ -233,3 +233,137 @@ Exact pytest footer: `729 passed, 85 warnings in 1161.72s (0:19:21)`. Zero failu
 - Compiled BF16 comparator in the previous study. [C5-03 Part B](../research/quant_ptq/bench_c5_03_nvfp4_120m_fusion.py#L873)
 - Trained GPTQ reconstruction and reference hardware wrapper. [C6-01 study](../research/quant_ptq/bench_c6_01_wide_rotated_qat.py#L683)
 - Offline consistency checks. [C6-02 validator](../research/quant_ptq/bench_c6_02_nvfp4_small_shape_fusion.py#L1201)
+
+## Post-Remediation v2 Re-Check
+
+**Verdict: FAIL.** The compiled BF16 baseline, model-specific Pareto conclusions and trained scores are supported on the RTX 5080. The concurrency, state-loading, FP32 conversion, workspace and publication fixes passed their live checks. Three residual findings remain.
+
+1. **Material timing caveat.** Two fresh sessions measured a 1.154× dynamic Hadamard speedup over C5 at `(1024, 512, 1408)`. The canonical 1.846× comes from long events concentrated in the C5 rounds. The artifact should identify that cell and the elevated 50m absolute latencies explicitly.
+2. **Offline evidence checks.** All five original probes now fail validation. Fresh records with incomplete timing means, negative launch counts, contradictory logits errors or a Boolean seed still pass. Require consistency at those fields before lifting the validator hold.
+3. **Exact-wrapper compatibility.** Exact mode passes for the two complete wide NVFP4 models. It changes the autocast context of a general inner module, which can change its output dtype and values.
+
+### Provenance and scope
+
+The canonical file at result commit `3e461419518b30781056d597ac56dd814cc5d91d` has SHA-256 `91deb1d2adc3eab3d26bf848ec4c6193a54178bfb145b92770264113d348583d`. It records schema `cycle6_c6_02.v2`, producer `411eaf01381c83115887c910d267cd560859ed90`, and `git_dirty=false`. All seven `SUMMARY_MODULES` have identical bytes at both commits and in this checkout. The producer’s 20-module import closure exactly matches the payload. Hashing the ordered module names, NUL separators and producer blobs gives `e101bd74f5417a070c786bc58f29d30e07da2b0e32a0fcee770f26a0c39abd12`. The result commit adds the result and changes its test pins.
+
+| Pinned input | SHA-256 verified in the checkout and in all three Git trees¹ |
+|---|---|
+| `nvfp4_inference_blackwell.py` | `2b3a2af2615061d952216fa1691fdbd2f659961a5706f555c76bf35593053192` |
+| `cycle5_c5_03_nvfp4_120m_fusion.json` | `e0e435ef2ea8598df22bace95ab76fd10c43b2ff394bf635ab8d1548d8bcad82` |
+| `cycle6_c6_01_wide_rotated_qat.json` | `c490a415568244bd1e2489d0004adc025d856e92452cb976c05efc2dcdf66bf9` |
+
+¹ The v1 result commit `a716333`, v2 producer, and v2 result. I also compared their bytes directly. In the remediation worktree’s `artifacts/c6_02_run_evidence`, `verify_superseded_receipts()` verified the rejected v1 JSON, superseded v1 JSON, and both corresponding logs. The fifth check verified the superseded result blob in Git. All five returned `verified`.
+
+### Finding 1 · Compiled BF16 and the desktop-load burst
+
+The canonical comparison includes default Inductor BF16 in the same 19-method Williams design as the graphed methods. I verified the orders, all 76 round means, 760 flushed CUDA events and 152 wall observations **per method per preset**. The graph path replays an eager BF16 forward. The compiled path also fuses elementwise operations. The profile runs separately from timing.
+
+At the target Part A shape `(1024, 512, 1408)`, the choice of baseline changes the speedup. The canonical dynamic C6 Hadamard time of **20.635 µs** gives **1.122× versus BF16** at 23.150 µs, and **1.846× versus C5 Hadamard** at 38.086 µs. The second comparison is materially distorted. The C5 round means span 23.110–59.696 µs, with an IQR of 20.601 µs. Of 440 individual C5 events, 25 exceeded 100 µs, one in each of 25 distinct rounds. The largest event took 380.384 µs. Those 25 rounds form a majority of the 44 observations used for the median. C6 had six such rounds, BF16 had 18. Median individual event times were 24.544 µs for C5 and 20.480 µs for C6. These event medians diagnose the stalls. The published estimator remains the median of round means.
+
+| Same target, dynamic Hadamard | C5 µs | C6 µs | C5 / C6 |
+|---|---:|---:|---:|
+| Canonical v2 main grid | 38.086 | 20.635 | 1.846× |
+| Canonical v2 separate ablation | 24.318 | 20.686 | 1.176× |
+| Retained first attempt | 23.968 | 20.744 | 1.155× |
+| Retained v1 | 23.931 | 20.592 | 1.162× |
+| Original independent ten-method session | 24.71 | 21.92 | 1.127× |
+| Fresh v2 session 1, canonical target protocol | 23.770 | 20.594 | 1.154× |
+| Fresh v2 session 2, canonical target protocol | 23.760 | 20.590 | 1.154× |
+
+Both fresh sessions passed all operand and output checks. Each repeated the 11-method Williams protocol with 44 rounds and 440 events per method. Their C5 Hadamard IQRs were 0.482 and 0.398 µs. The corresponding fresh C6 speedups against BF16 both rounded to 1.114×. Thus the comparison near 1.11× depends on the chosen baseline.
+
+The canonical start snapshot showed 22% utilization, P8 and 405 MHz memory. Telemetry has no timestamped samples at the individual stalls. Attributing them to a particular desktop process would need another measurement. The raw events establish the asymmetric slowdown without that attribution. The artifact’s generic 1–2% spread caveat understates it. Preserve the raw measurements and label the 1.846× ratio as an affected session. Use the separately measured ratio and its protocol when describing expected speed. The in-session count of 31/32 wins against BF16 and the identity of the trailing butterfly cell are correctly reported.
+
+At 50m the canonical compiled BF16, dynamic Hadamard and fused full butterfly medians were 12.626, 11.499 and 14.219 ms. These exceed the original independent medians by 7.31%, 7.90% and 7.38%, respectively. Their canonical minimum round means were 11.711, 10.681 and 13.236 ms. The shift affects absolute latency. The dominance comparison survives it. Compiled BF16 has lower latency and lower measured NLL than each of the three wide 50m methods. At 120m full Kron and full butterfly stay on the primary frontier, with a latency–quality tradeoff. Full butterfly takes 10.100 ms versus 10.775 ms for compiled BF16, a 6.26% latency reduction. The 120m C6-01 grid has no trained b64 quality point.
+
+The 50m graph-only frontier includes full butterfly. The primary frontier excludes it and includes both BF16 methods because their recorded NLLs differ by only 0.00000161 in favor of the slower graph point. Treat that membership as exact arithmetic on recorded means. The data support no practical quality distinction at that scale.
+
+#### Independent model timings and profiles
+
+I repeated the six-method protocol in the original audit using v2 code, seed 1 and the three canonical batches. The methods shared one Williams session per preset with 12 balanced rounds, 120 flushed CUDA events and 24 wall observations each. Compilation and CUPTI collection were outside timing. Values below are fresh median round means in milliseconds.
+
+| Forward | 50m | 120m | w2048_6l |
+|---|---:|---:|---:|
+| Compiled BF16 | 11.726 | 10.777 | 16.538 |
+| BF16 CUDA graph | 14.492 | 12.871 | 17.522 |
+| C6 dynamic Hadamard b16 | 10.675 | 8.299 | 8.031 |
+| C6 fused Hadamard b64 | 12.681 | 9.265 | 9.016 |
+| C6 fused full Kron | 12.554 | 9.422 | 9.512 |
+| C6 fused full butterfly | 13.350 | 10.067 | 10.034 |
+
+At 50m the compiled round means ranged from 11.718 to 11.829 ms, full Kron from 12.544 to 12.639 ms and full butterfly from 13.337 to 13.440 ms. At 120m compiled BF16 ranged from 10.759 to 11.265 ms and full butterfly from 10.032 to 10.483 ms. Wall medians preserve the same wide-versus-compiled ordering. The fresh six-method run and the canonical 19-method run answer the same dominance question with different session lengths.
+
+| Preset | CUPTI launches, compiled / graph | GEMMs per forward on each | Compiled vs graph logits, relative L2 | Max absolute error |
+|---|---:|---:|---:|---:|
+| 50m | 134 / 375 | 73 | 0.01136806 | 0.033203125 |
+| 120m | 134 / 375 | 73 | 0.01328954 | 0.046875 |
+| w2048_6l | 68 / 189 | 37 | 0.02006280 | 0.119140625 |
+
+The independently profiled launch counts and freshly computed errors match all three canonical records.
+
+#### Six trained checkpoints
+
+I rescored the three C6-01 50m Muon checkpoints and the three C5-03 120m baseline checkpoints via the v2 compiled BF16 evaluation path. The loader checked each checkpoint’s file and tensor hashes. Each forward used the complete SHA-256-verified test split, 3,906 windows and 1,999,872 targets per seed. Each of the six live NLLs matched the corresponding canonical float exactly.
+
+| Preset | Seed 1 | Seed 2 | Seed 3 | Live mean |
+|---|---:|---:|---:|---:|
+| 50m | 5.3936286222 | 5.3765366057 | 5.3759370624 | **5.3820340967** |
+| 120m | 4.6334629811 | 4.6264842420 | 4.6128800969 | **4.6242757733** |
+
+### Findings 2, 3, 5, 7 and 8 · Runtime contracts
+
+**2. Concurrent direct GEMM.** I ran two Python threads at M=32, N=128, K=256, with separate CUDA streams, distinct activation and weight scale buffers, one warmed plan and a barrier immediately before every call. I retained each output through stream completion and compared its BF16 bits with a serial public-API reference. Both 500-call repeats returned 500/500 correct on each thread. No external submission lock was used. The plan’s own lock covers both pointer updates and host submission.
+
+**2 and 7. Eviction and teardown.** Eviction drops the cache’s reference. A worker retained the oldest plan while another worker inserted 256 new, real cuBLASLt shapes. The cache stayed within its normal 256-entry bound. The second worker then cleared all 256 resident plans. The evicted plan stayed open and produced 500/500 exact outputs after the clear. Explicit clearing closes the plans still resident in the cache and shares the submission lock. All 100 simultaneous clear/submit trials happened to submit first and returned the correct output. I then forced both orders. Clearing between lookup and submission gave the documented closed-plan exception. Clearing while submission held the lock waited until release, and the submitted matrix was bit-exact. Callers that require uninterrupted service should clear the cache after their submitters stop.
+
+**3. State loading and captured graphs.** I used two butterfly checkpoints with different weights and angles, saved a nested state dict to an in-memory file, then loaded it with `torch.load(weights_only=True)` and the default `load_state_dict`. Each graph captured the old layer and first replayed against its old reference. After the load, I replayed each captured graph and compared its output with the new C5 reference. The packed FP32 buffer kept its address. All four comparisons had zero bit mismatches. The count of output elements that changed from the old replay confirms that the graph read new state.
+
+| K | M | Dispatch | Changed BF16 outputs |
+|---:|---:|---|---:|
+| 2048 | 1023 | native | 130,815 |
+| 2048 | 1024 | delegated | 130,963 |
+| 256 | 6 | native | 768 |
+| 256 | 37 | native | 4,733 |
+
+These results cover a same-device, same-shape, in-place load with `assign=False`.
+
+**5. FP32 mix constants.** At K=1408 I exercised `.bfloat16()`, `.half()`, `.to(dtype=torch.float16)`, and a CPU/CUDA round trip on both sides of wrapper construction. In all eight cases the values and FP32 dtype of `h` and `mix` were preserved, and mixed tensors and layer outputs matched bitwise. The suite also covered `.to("cuda", torch.float16)` and inspected CPU placement. Substituting an FP16 buffer for either matrix made fused `mixed()` raise the intended error. Exact mode uses the reference matrices directly.
+
+**7. Workspace and partial initialization.** The suite checked that index-less `torch.device("cuda")` and explicit `cuda:0` return the same plan. With a simulated 4,096-byte requirement, the direct plan rejected a missing workspace, 4,095 bytes, the wrong dtype, a strided view and a CPU buffer. A valid contiguous CUDA byte buffer succeeded. The public helper allocated a suitable workspace and matched the public GEMM reference bitwise. The real selected algorithms required zero bytes. I independently injected failures at the third layout creation and at heuristic selection, tracing native create and destroy calls by pointer. Cleanup released exactly one descriptor and two layouts in the first case, and one descriptor, four layouts and one preference in the second. Repeated close was idempotent, and the suite confirmed that a later call to a closed plan raises.
+
+**8. Tuning and publication.** The live tests changed pass-1 and pass-2 tile overrides after warming the original shape, checked that the resolved plans changed immediately, verified bit-exact quantization, then restored the original plans. Opposite `pdl` choices in simultaneous threads and nested `vector_io` overrides remained independent and restored their defaults. In a private mock results directory, the first canonical write succeeded. The second raised `FileExistsError`. The original contents survived and the test found no temporary file. These checks close the original tuning and write-once findings.
+
+### Finding 4 · Exact mode and w2048_6l
+
+The live suite verified both the mixed FP32 values and the wrapped NVFP4 output bitwise for the w2048_6l down projection at K=5632, M=2048, N=2048, for full Kron and full butterfly. I also evaluated both complete six-block models at batch 4 and sequence length 512 using the producer’s random weights, tokens and angles. Switching all full-mix wrappers to `exact=True` gave **zero differences across 103,022,592 logits per family** against their C6-01 hardware wrappers. In the default fused mode, full Kron differed at 102,127,503 logits (relative L2 0.209078) and full butterfly at 102,294,865 (0.253306). The v2 result calls these paths latency-only and assigns neither a trained NLL nor a Pareto cell. The “near-0 parity” phrase is gone from the result and its driver. An old test comment still uses it for small-input mixed values.
+
+A separate compatibility issue remains for callers that pass an autocast-sensitive inner module. The reference `CrossInput.forward` disables autocast only for the mix, then calls the layer in its caller’s precision context. `FastCrossInput.forward(exact=True)` disables autocast for both. Under CUDA BF16 autocast at K=1408, the same FP32 `nn.Linear` returned BF16 through the reference and FP32 through the exact wrapper, with a maximum absolute output difference of 0.0095694. The NVFP4 hardware and repository emulation controls both returned bitwise-equal BF16. To preserve the public wrapper’s behavior, compute the mix inside the disabled-autocast block and call the inner module after leaving it.
+
+### Finding 6 · Offline validation
+
+The original five contradictory records now fail full canonical validation on separate in-memory copies. They were the failed heuristic equality with negative time, the empty direct kernel trace with a CPU scale multiply, the empty large-ablation delegation map, impossible wide logits counts with negative error, and the source-identical result commit substituted for its producer. For the last check I supplied `3e46141` and recomputed the run configuration hash. The validator rejected the commit because its tree already contains the result.
+
+Fresh controls also rejected a wrong trained token count, substitution of another seed’s checkpoint file, a negative compiled raw event, swapped primary and graph-only frontiers, an omitted study history, and a changed receipt digest in the published history. I independently recomputed both frontiers with pairwise dominance. Both match the canonical lists for both presets.
+
+The following contradictions still passed the full validator. These tests used copies in memory. The original canonical file passed independently.
+
+| Accepted evidence | Consequence and required check |
+|---|---|
+| The 50m compiled GPU record retained 76 ten-event rows but only its first round mean. Updating statistics and dependent summaries yielded a one-round median of 12.652883 ms. The measured 76-round median is 12.625928 ms. | The validator compares means with `zip` and checks the reported length against itself. Require the protocol round count for raw rows, GPU means and the stored count. Derive statistics from the complete raw array. |
+| The compiled CUPTI profile recorded −1 launch of kind `other`. | The compiled-profile rules check GEMMs and excluded kinds. Validate every launch count as finite and nonnegative, and compatible with the three profiled repetitions. |
+| The compiled logits record reported zero maximum absolute error and positive relative L2 error on the same logits. A separate probe gave the compiled entry in `logits_rel_diff_vs_bf16` a negative relative error. | Enforce the zero-error relationship on the same tensor pair. Validate the keys and finite nonnegative values of the full relative-error table. |
+| The trained row identified the first seed with JSON `true`. | Python compares `True` equal to `1`. Require integer seed identifiers before looking up checkpoint records. |
+
+All 277 timing records in the pinned result have matching raw and reported round counts. I recomputed their means and medians from the events. The canonical logits and launch records pass the additional checks above. The SHA-256 identifies this file. It does not validate a new measurement submitted to the same scientific checks.
+
+### Verification environment
+
+2026-11-28, NVIDIA GeForce RTX 5080, compute capability 12.0. All audit GPU jobs ran serially. I used the supplied project venv, `PYTHONPATH=.`, the isolated checkout and a read-only mount of the main project for checkpoint, data and evidence access. Pytest, captures, scratch files and benchmark outputs used private temporary storage. The timing repetitions covered the affected target shape and six full-model methods on each preset. The complete archived grid was checked offline.
+
+```bash
+PYTHONPATH=. /home/ryan/Documents/projects/ai/.venv/bin/pytest tests/test_c6_02_nvfp4_small_shape_fusion.py tests/test_nvfp4_inference.py tests/test_c5_03_nvfp4_120m_fusion.py tests/test_c5_02_isoloss_ptq_mitigation.py tests/test_c6_01_wide_rotated_qat.py -q
+```
+
+Exact live footer: `780 passed, 85 warnings in 905.83s (0:15:05)`. **780 passed, 0 failed, 0 skipped.** Warnings cover PyTorch sync-debug limits, deliberately empty graphs in capture-refusal tests, and a Triton AST deprecation.
+
+Implementation references include the [timing validator](../research/quant_ptq/bench_c6_02_nvfp4_small_shape_fusion.py#L1412), [Part C evidence checks](../research/quant_ptq/bench_c6_02_nvfp4_small_shape_fusion.py#L1554), [plan ownership and cache teardown](../research/quant_ptq/nvfp4_small_shape_blackwell.py#L980), [exact wrapper](../research/quant_ptq/nvfp4_small_shape_blackwell.py#L1229) and [reference wrapper](../research/quant_ptq/rotated_qat.py#L273).
