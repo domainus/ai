@@ -102,6 +102,12 @@ SCHEMA_VERSION = "cycle6_c6_01.v2"
 # The preserved canonical result of producer 1b4ea1c. It stays valid, with every check that its records allow.
 HISTORICAL_SCHEMA_V1 = "cycle6_c6_01.v1"
 SCHEMAS = (HISTORICAL_SCHEMA_V1, SCHEMA_VERSION)
+# Independently approved historical producer commit and driver blob digest for v1 cross-checking.
+HISTORICAL_V1_PRODUCER_SHA = "1b4ea1c17ecc3f6b0e1232693a13ccca25ad4d5d"
+HISTORICAL_V1_DRIVER_BLOB_SHA256 = "3c33d9a092116823b95a5a8e52e91c8d447effcec8c5f185beda8cf3e4eaddd1"
+APPROVED_PRODUCER_DRIVER_BLOBS = {
+    HISTORICAL_V1_PRODUCER_SHA: HISTORICAL_V1_DRIVER_BLOB_SHA256,
+}
 # SHA-256 of ``awq_freeze`` of the v1 result (alpha, val.bin scores and effective-weight digest of all 36 AWQ
 # selections). The v1 freeze digest did not cover them; this pin was computed after the run.
 HISTORICAL_V1_AWQ_SELECTIONS_SHA256 = "2b8a654c4a356c90e151f439ae3134051d2929c213cce8cce19d636338a43347"
@@ -1668,11 +1674,15 @@ class _GitSourceLoader(SourceLoader):
 
 @functools.cache
 def _producer_namespace(git_sha: str) -> dict:
-    """Load the committed driver Git blob at ``git_sha`` into an isolated module namespace."""
+    """Load an independently pinned producer driver Git blob into an isolated module namespace."""
+    expected_blob = APPROVED_PRODUCER_DRIVER_BLOBS.get(git_sha)
+    _require(expected_blob is not None, f"refusing to execute unapproved producer commit {git_sha}")
     for module in SUMMARY_MODULES:
         if module != DRIVER_MODULE and c503._git_blob(git_sha, c503._module_repo_path(module)) != _module_path(module).read_bytes():
             raise ValueError(f"summary module {module} differs from producer commit {git_sha}")
     blob = c503._git_blob(git_sha, SCRIPT_REPO_PATH)
+    _require(hashlib.sha256(blob).hexdigest() == expected_blob,
+             f"producer driver blob at {git_sha} differs from pinned SHA-256")
     name = f"_c6_01_producer_{git_sha[:12]}"
     spec = spec_from_loader(name, _GitSourceLoader(blob, f"<git:{git_sha}:{SCRIPT_REPO_PATH}>"))
     mod = module_from_spec(spec)
@@ -2031,6 +2041,9 @@ def _validate_meta(payload: dict, canonical: bool) -> None:
                  "meta.git_sha declares another schema than the payload")
         _require(_matches_current_summary_code(meta["git_sha"]),
                  "meta.git_sha summary code differs from the validating checkout")
+        if payload["schema_version"] == HISTORICAL_SCHEMA_V1:
+            _require(meta["git_sha"] == HISTORICAL_V1_PRODUCER_SHA,
+                     f"{HISTORICAL_SCHEMA_V1} is valid for producer {HISTORICAL_V1_PRODUCER_SHA} only")
     else:
         _require(modules == list(code_modules()), "meta.code_modules differ from the import closure of this driver")
         _require(meta["code_sha256"] == code_sha256(), "meta.code_sha256 differs from this checkout")
@@ -2116,8 +2129,9 @@ def _expected_stream_fingerprint(train_tokens: int, preset: str, seed: int) -> s
 
 @functools.cache
 def _expected_init_fingerprint(preset: str, seed: int) -> str:
-    """``h.state_fingerprint`` of the initial weights of ``preset`` and ``seed`` (CPU, RNG-isolated)."""
-    with torch.random.fork_rng(devices=[]):
+    """``h.state_fingerprint`` of the initial weights of ``preset`` and ``seed`` (CPU and CUDA RNG-isolated)."""
+    devices = range(torch.cuda.device_count()) if torch.cuda.is_available() else []
+    with torch.random.fork_rng(devices=devices):
         return h.state_fingerprint(h.initial_state(PRESETS[preset], seed))
 
 
@@ -2329,6 +2343,13 @@ def _validate_unit(u: dict, payload: dict, coverage: dict) -> tuple[int, int]:
                      and _is_hex(r["effective_weights_sha256"], 64)
                      and r["effective_weights_sha256_test"] == r["effective_weights_sha256"],
                      f"{rw}: weights must decode exactly ({n_layers}/{n_layers}, int32) and be rebuilt identically")
+            _require(_nonneg(r["quantize_seconds"]), f"{rw}: quantize_seconds invalid")
+            _require(_nonneg(r["gptq_damping_max"]) if rounding == "gptq" else r["gptq_damping_max"] is None,
+                     f"{rw}: gptq_damping_max invalid")
+        if r["mode"] != "w4a16_fakequant":
+            _require(r["quantize_seconds"] is None and r["gptq_damping_max"] is None
+                     and r["effective_weights_sha256"] is None and r["effective_weights_sha256_test"] is None,
+                     f"{rw}: only W4A16 rows carry candidate quantize_seconds, damping or weight digests")
         static = r["mode"] == "w4a4_hw_static"
         _require((isinstance(r["static_global_scale_range"], list) and len(r["static_global_scale_range"]) == 2
                   and 0 < r["static_global_scale_range"][0] <= r["static_global_scale_range"][1])
@@ -2349,20 +2370,29 @@ def _validate_unit(u: dict, payload: dict, coverage: dict) -> tuple[int, int]:
                  and r["val_nll"] == a["val_nll_hw_dynamic"][a["alphas"].index(a["selected_alpha"])]
                  and all(rows[(a["method"], m)]["awq_alpha"] == a["selected_alpha"] for m in MODES),
                  f"{where}: the AWQ rows are not the selected candidate")
+        _require(a["seconds"] >= rows[(a["method"], "w4a16_fakequant")]["quantize_seconds"] - 1e-3,
+                 f"{where}: AWQ selection seconds for {a['method']} is below the winning candidate's quantize_seconds")
     fitted = {m for m in methods if "butterfly" in m}
     _require(set(u["butterfly_fits"]) == fitted, f"{where}: butterfly fits differ from the fitted methods")
     for key, kinds in u["butterfly_fits"].items():
         _require(list(kinds) == list(q.LINEAR_KINDS), f"{where}: one butterfly fit per projection kind")
         for kind, fit in kinds.items():
             _require(set(fit) == c503.BUTTERFLY_FIT_KEYS and fit["steps"] == protocol["butterfly_steps"]
-                     and fit["layers"] == config.layers and 0 <= fit["weight_sq_error_fitted"]
-                     <= fit["weight_sq_error_hadamard_start"], f"{where}.butterfly_fits[{key}].{kind}: fit record")
+                     and fit["layers"] == config.layers and _is_int(fit["layers_improved"])
+                     and 0 <= fit["layers_improved"] <= config.layers and _is_number(fit["lr"]) and fit["lr"] > 0
+                     and 0 <= fit["weight_sq_error_fitted"] <= fit["weight_sq_error_hadamard_start"],
+                     f"{where}.butterfly_fits[{key}].{kind}: fit record")
+            exp_red = ((fit["weight_sq_error_hadamard_start"] - fit["weight_sq_error_fitted"])
+                       / fit["weight_sq_error_hadamard_start"] if fit["weight_sq_error_hadamard_start"] > 0 else 0.0)
+            _assert_close(fit["relative_error_reduction"], exp_red,
+                          f"{where}.butterfly_fits[{key}].{kind}.relative_error_reduction")
     _require(isinstance(u["geometry"], dict) and list(u["geometry"]) == ["weight_stable_rank", "signal_alignment"],
              f"{where}: geometry metrics differ")
     max_stable_rank = float(min(config.width, config.hidden))
+    max_alignment = float(max(config.width, config.hidden))
     for metric, summary in u["geometry"].items():
         _validate_layer_summary(summary, metric, f"{where}: geometry.{metric}",
-                                upper_bound=max_stable_rank if metric == "weight_stable_rank" else None)
+                                upper_bound=max_stable_rank if metric == "weight_stable_rank" else max_alignment)
     if part == "ab" and arm == MUON:
         stats = u["activation_statistics"]
         _require(isinstance(stats, dict) and list(stats) == list(PROBE_FAMILIES)
@@ -2371,14 +2401,27 @@ def _validate_unit(u: dict, payload: dict, coverage: dict) -> tuple[int, int]:
         for family, metrics in stats.items():
             for metric, summary in metrics.items():
                 _validate_layer_summary(summary, metric, f"{where}: activation_statistics.{family}.{metric}")
+            crest, share = metrics["group16_max_over_rms"], metrics["group16_outlier_share"]
+            for stat in ("min", "median", "mean", "max"):
+                c, f = crest["all"][stat], share["all"][stat]
+                _require(rq.OUTLIER_CREST * f - 1e-6 <= c <= rq.OUTLIER_CREST + f + 1e-6,
+                         f"{where}: activation_statistics.{family}.group16_max_over_rms.all.{stat} "
+                         "contradicts group16_outlier_share")
+            for kind in q.LINEAR_KINDS:
+                c, f = crest["by_kind"][kind], share["by_kind"][kind]
+                _require(rq.OUTLIER_CREST * f - 1e-6 <= c <= rq.OUTLIER_CREST + f + 1e-6,
+                         f"{where}: activation_statistics.{family}.group16_max_over_rms.by_kind.{kind} "
+                         "contradicts group16_outlier_share")
     else:
         _require(u["activation_statistics"] is None, f"{where}: only the probe checkpoints have activation statistics")
     sec = u["seconds"]
     _require(isinstance(sec, dict) and set(sec) == {"phase1", "phase2"} and all(_nonneg(v) for v in sec.values()),
              f"{where}: unit.seconds invalid")
+    non_awq_quantize = math.fsum(
+        r["quantize_seconds"] for r in grid if r["mode"] == "w4a16_fakequant" and not r["awq"])
     _require(sec["phase1"] >= math.fsum(r["seconds_val"] for r in grid)
-             + math.fsum(a["seconds"] for a in u["awq_selection"]) - 1e-3,
-             f"{where}: seconds.phase1 is below the recorded validation and AWQ times")
+             + math.fsum(a["seconds"] for a in u["awq_selection"]) + non_awq_quantize - 1e-3,
+             f"{where}: seconds.phase1 is below the recorded validation, AWQ and quantization times")
     _require(sec["phase2"] >= math.fsum(r["seconds_test"] for r in grid) - 1e-3,
              f"{where}: seconds.phase2 is below the recorded test scoring times")
     plain = sum(not rq.parse_method(m)[2] for m in methods)
@@ -2509,30 +2552,45 @@ def _validate_study(payload: dict, canonical: bool) -> None:
              "hardware evidence incomplete: FP4 GEMM counts, fallback count or int32 decode checks")
 
 
-def verify_external_evidence(payload: dict, *, checkpoint_dir: Path | None = None, baseline_dir: Path | None = None,
-                             evidence_dir: Path | None = None) -> dict:
-    """Check a result against the files that its JSON cannot hold. Raises ``ValueError`` on any difference.
+def _resolve_evidence_dir(payload: dict, evidence_dir: Path | None) -> Path:
+    if evidence_dir is not None:
+        return Path(evidence_dir)
+    if payload["shakedown"]:
+        return shakedown_evidence_dir(_parsed_command(payload["meta"]["command"], "meta.command").work_dir)
+    return _artifact_dir(TEST_ACCESS_LOG.parent.name)
 
-    * Every checkpoint: the SHA-256 of the file (streamed) and the tensor SHA-256 of its state dict (sorted
-      names, shapes and FP32 bytes) against ``training.checkpoint_file_sha256`` and ``checkpoint_sha256``.
-      Checkpoints trained in the run are in ``checkpoint_dir`` (24 in the canonical study); the preserved
-      C5-03 checkpoints are in ``baseline_dir`` (3).
-    * The test-access log in ``evidence_dir``: its first lines are ``data.test_access.prior_openings`` and
-      then ``this_opening``. For a v2 result, that line holds the freeze digest that the run logged before
-      it mapped test.bin.
 
-    A directory that is not given is the one of the recorded command for a shakedown (``<output>.work``),
-    and ``artifacts/`` of this checkout or of its main checkout for a canonical result. The function reads
-    files only. It does not validate the payload: ``validate_results(..., verify_external=True)`` does both.
-    """
+def _resolve_checkpoint_dirs(payload: dict, checkpoint_dir: Path | None,
+                             baseline_dir: Path | None) -> tuple[Path, Path | None]:
     if payload["shakedown"]:
         recorded = _parsed_command(payload["meta"]["command"], "meta.command")
-        checkpoint_dir = recorded.checkpoint_dir if checkpoint_dir is None else checkpoint_dir
-        evidence_dir = shakedown_evidence_dir(recorded.work_dir) if evidence_dir is None else evidence_dir
-    else:
-        checkpoint_dir = _artifact_dir(CANONICAL_CHECKPOINT_DIR.name) if checkpoint_dir is None else checkpoint_dir
-        baseline_dir = default_baseline_dir() if baseline_dir is None else baseline_dir
-        evidence_dir = _artifact_dir(TEST_ACCESS_LOG.parent.name) if evidence_dir is None else evidence_dir
+        return recorded.checkpoint_dir if checkpoint_dir is None else checkpoint_dir, baseline_dir
+    return (_artifact_dir(CANONICAL_CHECKPOINT_DIR.name) if checkpoint_dir is None else checkpoint_dir,
+            default_baseline_dir() if baseline_dir is None else baseline_dir)
+
+
+def _verify_external_log(payload: dict, *, evidence_dir: Path | None = None) -> dict:
+    """Verify ``data.test_access`` against the external JSON-lines log file."""
+    evidence_dir = _resolve_evidence_dir(payload, evidence_dir)
+    access = payload["data"]["test_access"]
+    log_path = evidence_dir / TEST_ACCESS_LOG_NAME
+    _require(log_path.is_file(), f"the external test-access log {log_path} is missing")
+    try:
+        lines = _read_access_log(log_path)
+    except ValueError as exc:
+        raise ValueError(f"the external test-access log {log_path} is not JSON lines") from exc
+    expected = [*access["prior_openings"], access["this_opening"]]
+    _require(len(lines) >= len(expected) and all(_same(line, entry) for line, entry in zip(lines, expected)),
+             f"data.test_access differs from the external test-access log {log_path}: its first {len(expected)} "
+             "line(s) must be the recorded prior openings and this opening")
+    return {"test_access_log": str(log_path), "test_access_log_sha256": c503.file_sha256(log_path),
+            "test_access_log_entries": len(lines), "test_access_log_verified": True}
+
+
+def _verify_external_checkpoints(payload: dict, *, checkpoint_dir: Path | None = None,
+                                 baseline_dir: Path | None = None) -> dict:
+    """Verify every trained and preserved checkpoint file and state-dict tensor digest."""
+    checkpoint_dir, baseline_dir = _resolve_checkpoint_dirs(payload, checkpoint_dir, baseline_dir)
     directories = {"trained_in_run": checkpoint_dir, "c5_03_preserved": baseline_dir}
     verified, recorded_files, size = dict.fromkeys(directories, 0), set(), 0
     for u in payload["units"]:
@@ -2549,24 +2607,44 @@ def verify_external_evidence(payload: dict, *, checkpoint_dir: Path | None = Non
         verified[tr["source"]] += 1
         recorded_files.add(file)
         size += file.stat().st_size
-    access = payload["data"]["test_access"]
-    log_path = Path(evidence_dir) / TEST_ACCESS_LOG_NAME
-    _require(log_path.is_file(), f"the external test-access log {log_path} is missing")
-    try:
-        lines = _read_access_log(log_path)
-    except ValueError as exc:
-        raise ValueError(f"the external test-access log {log_path} is not JSON lines") from exc
-    expected = [*access["prior_openings"], access["this_opening"]]
-    _require(len(lines) >= len(expected) and all(_same(line, entry) for line, entry in zip(lines, expected)),
-             f"data.test_access differs from the external test-access log {log_path}: its first {len(expected)} "
-             "line(s) must be the recorded prior openings and this opening")
     return {"checkpoints_trained_in_run_verified": verified["trained_in_run"],
             "checkpoints_c5_03_preserved_verified": verified["c5_03_preserved"],
             "checkpoint_bytes_hashed": size,
             "unrecorded_checkpoint_files": sorted(str(f) for d in {f.parent for f in recorded_files}
-                                                  for f in d.glob("*.pt") if f not in recorded_files),
-            "test_access_log": str(log_path), "test_access_log_sha256": c503.file_sha256(log_path),
-            "test_access_log_entries": len(lines), "test_access_log_verified": True}
+                                                  for f in d.glob("*.pt") if f not in recorded_files)}
+
+
+def verify_external_evidence(payload: dict, *, checkpoint_dir: Path | None = None, baseline_dir: Path | None = None,
+                             evidence_dir: Path | None = None) -> dict:
+    """Check a result against the files that its JSON cannot hold. Raises ``ValueError`` on any difference.
+
+    * Every checkpoint: the SHA-256 of the file (streamed) and the tensor SHA-256 of its state dict (sorted
+      names, shapes and FP32 bytes) against ``training.checkpoint_file_sha256`` and ``checkpoint_sha256``.
+      Checkpoints trained in the run are in ``checkpoint_dir`` (24 in the canonical study); the preserved
+      C5-03 checkpoints are in ``baseline_dir`` (3).
+    * The test-access log in ``evidence_dir``: its first lines are ``data.test_access.prior_openings`` and
+      then ``this_opening``. For a v2 result, that line holds the freeze digest that the run logged before
+      it mapped test.bin.
+
+    A directory that is not given is the one of the recorded command for a shakedown (``<output>.work``),
+    and ``artifacts/`` of this checkout or of its main checkout for a canonical result. The function reads
+    files only. It does not validate the payload: ``validate_results(..., verify_external=True)`` does both.
+    """
+    log_receipt = _verify_external_log(payload, evidence_dir=evidence_dir)
+    ckpt_receipt = _verify_external_checkpoints(payload, checkpoint_dir=checkpoint_dir, baseline_dir=baseline_dir)
+    return {**ckpt_receipt, **log_receipt}
+
+
+def _verify_approved_producer(payload: dict) -> None:
+    """Cross-check historical v1 derived outputs against the independently byte-pinned producer blob."""
+    pns = _producer_namespace(payload["meta"]["git_sha"])
+    p_analysis = pns["analyze"](payload["units"], payload["selections"], payload["protocol"],
+                                payload["c5_03_reference"])
+    p_summary = pns["summarize"]({**payload, "analysis": p_analysis})
+    p_caveats = pns["caveats"](payload)
+    _assert_close(payload["analysis"], p_analysis, "producer_blob.analysis")
+    _assert_close(payload["summary"], p_summary, "producer_blob.summary")
+    _require(payload["caveats"] == p_caveats, "caveats differ from the producer commit's recomputed caveats")
 
 
 def validate_results(payload: dict, canonical: bool | None = None, *, verify_external: bool = False,
@@ -2592,9 +2670,14 @@ def validate_results(payload: dict, canonical: bool | None = None, *, verify_ext
     """
     try:
         receipt = _validate_payload(payload, canonical)
-        if verify_external or any(d is not None for d in (checkpoint_dir, baseline_dir, evidence_dir)):
-            receipt["external_evidence"] = verify_external_evidence(
-                payload, checkpoint_dir=checkpoint_dir, baseline_dir=baseline_dir, evidence_dir=evidence_dir)
+        external = verify_external or any(d is not None for d in (checkpoint_dir, baseline_dir, evidence_dir))
+        log_receipt = _verify_external_log(payload, evidence_dir=evidence_dir) if external else None
+        if receipt["certified_canonical"] and payload["schema_version"] == HISTORICAL_SCHEMA_V1:
+            _verify_approved_producer(payload)
+        if external:
+            ckpt_receipt = _verify_external_checkpoints(
+                payload, checkpoint_dir=checkpoint_dir, baseline_dir=baseline_dir)
+            receipt["external_evidence"] = {**ckpt_receipt, **log_receipt}
         return receipt
     except (KeyError, TypeError, IndexError, AttributeError, StopIteration) as exc:  # a record of the wrong shape
         raise ValueError(f"malformed payload: {type(exc).__name__}: {exc}") from exc
@@ -2630,14 +2713,6 @@ def _validate_payload(payload: dict, canonical: bool | None) -> dict:
     _require(payload["caveats"] == caveats(payload), "caveats differ from the recomputed caveats")
     if canonical:
         _require(SIGN_FLIP_MIN_P == 2.0 / (2 ** N_SEEDS), "SIGN_FLIP_MIN_P differs from 2 / 2**N_SEEDS")
-        pns = _producer_namespace(payload["meta"]["git_sha"])
-        p_analysis = pns["analyze"](payload["units"], payload["selections"], payload["protocol"],
-                                    payload["c5_03_reference"])
-        p_summary = pns["summarize"]({**payload, "analysis": p_analysis})
-        p_caveats = pns["caveats"](payload)
-        _assert_close(payload["analysis"], p_analysis, "producer_blob.analysis")
-        _assert_close(payload["summary"], p_summary, "producer_blob.summary")
-        _require(payload["caveats"] == p_caveats, "caveats differ from the producer commit's recomputed caveats")
     return {"certified_canonical": canonical, "shakedown": payload["shakedown"], "schema_version": schema,
             "awq_in_contemporaneous_freeze": schema == SCHEMA_VERSION}
 

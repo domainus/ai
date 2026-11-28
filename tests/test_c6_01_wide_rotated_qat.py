@@ -759,6 +759,32 @@ def test_summary_code_of_the_v1_producer_is_the_code_of_this_checkout():
                    "\ndef _evil():\n    global SIGN_FLIP_MIN_P\n    SIGN_FLIP_MIN_P = 0.125\n"):
         assert not b._same_summary_definitions(committed, current + suffix, b.HISTORICAL_SCHEMA_V1), suffix
     assert b._producer_namespace(producer)["SIGN_FLIP_MIN_P"] == 0.25
+    head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    assert head != producer
+    with pytest.raises(ValueError, match="refusing to execute unapproved producer commit"):
+        b._producer_namespace(head)
+
+
+def test_producer_namespace_enforces_pinned_driver_blob_and_rng_isolation(monkeypatch):
+    producer = b.HISTORICAL_V1_PRODUCER_SHA
+    orig_git_blob = c503._git_blob
+    with monkeypatch.context() as m:
+        m.setattr(c503, "_git_blob",
+                  lambda sha, path: b"raise AssertionError('tampered')\n"
+                  if sha == producer and path == b.SCRIPT_REPO_PATH else orig_git_blob(sha, path))
+        with pytest.raises(ValueError, match="differs from pinned SHA-256"):
+            b._producer_namespace.__wrapped__(producer)
+    # _expected_init_fingerprint must preserve both CPU and CUDA RNG state across a cold evaluation.
+    torch.manual_seed(617)
+    if CUDA:
+        torch.cuda.manual_seed_all(617)
+    cpu_before = torch.get_rng_state()
+    cuda_before = torch.cuda.get_rng_state() if CUDA else None
+    b._expected_init_fingerprint.cache_clear()
+    fp = b._expected_init_fingerprint("shakedown", 1)
+    assert len(fp) == 16 and torch.equal(torch.get_rng_state(), cpu_before)
+    if CUDA:
+        assert torch.equal(torch.cuda.get_rng_state(), cuda_before)
 
 
 @pytest.fixture
@@ -1393,6 +1419,56 @@ def test_validator_rejects_impossible_counters_and_summary_bounds(shakedown):
              "outside the range of weight_stable_rank")
     _rejects(shakedown, lambda p: unit(p)["geometry"]["weight_stable_rank"]["all"].update(max=65.0),
              "outside the range of weight_stable_rank")
+    _rejects(shakedown, lambda p: unit(p)["geometry"]["signal_alignment"]["all"].update(max=193.0),
+             "outside the range of signal_alignment")
+    # M1 cross-metric bound: crest <= 3 + outlier_share (v3 Astra 3.99 attack on v2) and crest >= 3 * outlier_share.
+    _rejects(shakedown, lambda p: stat(p, "identity", "group16_max_over_rms")["all"].update(max=3.99),
+             "contradicts group16_outlier_share")
+
+    def self_consistent_median_contradiction(p):
+        st = unit(p)["activation_statistics"]["identity"]
+        st["group16_outlier_share"] = {"all": {"min": 0.0, "median": 0.0, "mean": 0.36, "max": 0.9},
+                                       "by_kind": dict(zip(q.LINEAR_KINDS, (0.9, 0.9, 0.0, 0.0, 0.0)))}
+        st["group16_max_over_rms"] = {"all": {"min": 3.0, "median": 3.2, "mean": 3.2, "max": 3.5},
+                                      "by_kind": dict(zip(q.LINEAR_KINDS, (3.5, 3.5, 3.0, 3.0, 3.0)))}
+
+    def self_consistent_by_kind_contradiction(p):
+        st = unit(p)["activation_statistics"]["identity"]
+        st["group16_outlier_share"] = {"all": {"min": 0.0, "median": 0.0, "mean": 0.18, "max": 0.9},
+                                       "by_kind": dict(zip(q.LINEAR_KINDS, (0.9, 0.0, 0.0, 0.0, 0.0)))}
+        st["group16_max_over_rms"] = {"all": {"min": 2.9, "median": 2.9, "mean": 2.93, "max": 3.05},
+                                      "by_kind": dict(zip(q.LINEAR_KINDS, (2.9, 2.9, 2.9, 2.9, 3.05)))}
+
+    def self_consistent_lower_contradiction(p):
+        st = unit(p)["activation_statistics"]["identity"]
+        st["group16_outlier_share"] = {"all": {"min": 0.9, "median": 0.9, "mean": 0.9, "max": 0.9},
+                                       "by_kind": dict(zip(q.LINEAR_KINDS, (0.9,) * 5))}
+        st["group16_max_over_rms"] = {"all": {"min": 2.5, "median": 2.5, "mean": 2.5, "max": 2.5},
+                                      "by_kind": dict(zip(q.LINEAR_KINDS, (2.5,) * 5))}
+
+    _rejects(shakedown, self_consistent_median_contradiction, "contradicts group16_outlier_share")
+    _rejects(shakedown, self_consistent_by_kind_contradiction, "contradicts group16_outlier_share")
+    _rejects(shakedown, self_consistent_lower_contradiction, "contradicts group16_outlier_share")
+    # H1 quantize_seconds / gptq_damping_max / phase1 non-AWQ quantization bound / AWQ prep bound on v2.
+    _rejects(shakedown, lambda p: w4a16(p).update(quantize_seconds=-0.1), "quantize_seconds invalid")
+    _rejects(shakedown, lambda p: w4a16(p).update(quantize_seconds=None), "quantize_seconds invalid")
+    _rejects(shakedown, lambda p: w4a16(p).update(gptq_damping_max=-1e-4), "gptq_damping_max invalid")
+    _rejects(shakedown, lambda p: row("rtn", "w4a16_fakequant")(p).update(gptq_damping_max=0.01),
+             "gptq_damping_max invalid")
+    _rejects(shakedown, lambda p: hw(p).update(quantize_seconds=0.1), "only W4A16 rows carry")
+    _rejects(shakedown, lambda p: unit(p)["awq_selection"][0].update(
+        seconds=row("awq_w4a4_hadamard_b16_gptq", "w4a16_fakequant")(p)["quantize_seconds"] - 0.05),
+        "below the winning candidate's quantize_seconds")
+
+    def omit_non_awq_quantize(p):
+        u = unit(p)
+        u["seconds"]["phase1"] = (math.fsum(r["seconds_val"] for r in u["grid"])
+                                  + math.fsum(a["seconds"] for a in u["awq_selection"]))
+
+    _rejects(shakedown, omit_non_awq_quantize, "seconds.phase1 is below")
+    first_fit = lambda p: next(iter(unit(p)["butterfly_fits"].values()))["qkv"]  # noqa: E731
+    _rejects(shakedown, lambda p: first_fit(p).update(relative_error_reduction=0.99), "relative_error_reduction")
+    _rejects(shakedown, lambda p: first_fit(p).update(layers_improved=3), "fit record")
     _rejects(shakedown, lambda p: stat(p)["all"].pop("median"), "summary keys or numbers")
     _rejects(shakedown, lambda p: stat(p)["all"].update(max="large"), "summary keys or numbers")
     _rejects(shakedown, lambda p: unit(p)["geometry"].pop("signal_alignment"), "geometry metrics differ")
@@ -1926,7 +2002,66 @@ def test_canonical_validator_rejects_v2_recheck_residuals(canonical, monkeypatch
         b.validate_results(halved, canonical=True)
 
 
-def test_canonical_external_evidence(canonical, tmp_path):
+def test_canonical_validator_rejects_v3_recheck_residuals(canonical, monkeypatch):
+    """All four v3 re-check findings (H1 quantize_seconds & early opening, M1 crest-vs-share & geometry,
+    and producer blob trust) fail canonical validation without touching the pinned v1 measurement file."""
+    def rejects(edit, match):
+        _rejects(canonical, edit, match, canonical=True)
+
+    # 1. H1: omitting non-AWQ quantize_seconds across units (Astra's 502.227s early-opening attack) & AWQ prep.
+    def coordinated_early_opening(p):
+        for u in p["units"]:
+            u["seconds"]["phase1"] = (math.fsum(r["seconds_val"] for r in u["grid"])
+                                      + math.fsum(a["seconds"] for a in u["awq_selection"]))
+        p["stage_seconds"] = {
+            "stage_a": math.fsum(u["training"]["train_seconds"] + u["seconds"]["phase1"]
+                                 for u in p["units"] if u["part"] == "ab" and u["arm"] == b.MUON),
+            "stage_b": math.fsum(u["training"]["train_seconds"] + u["seconds"]["phase1"]
+                                 for u in p["units"] if u["part"] == "ab" and u["arm"] != b.MUON),
+            "stage_c": math.fsum(u["training"].get("train_seconds", 0.0) + u["seconds"]["phase1"]
+                                 for u in p["units"] if u["part"] == "c"),
+            "test_scoring": math.fsum(u["seconds"]["phase2"] for u in p["units"]),
+        }
+        p["seconds"] = math.fsum(p["stage_seconds"].values())
+        p["meta"]["total_seconds"] = p["seconds"] + 1.0
+        end = c502._timestamp(p["meta"]["timestamp_end"], "end")
+        p["meta"]["timestamp_start"] = (end - timedelta(seconds=p["meta"]["total_seconds"])).strftime(
+            "%Y-%m-%dT%H:%M:%S%z")
+
+    rejects(coordinated_early_opening, "seconds.phase1 is below")
+    rejects(lambda p: _unit(p, "ab", 1, b.MUON)["awq_selection"][0].update(
+        seconds=_grid_row(_unit(p, "ab", 1, b.MUON), b.C5_HADAMARD.replace("hadamard_b16_gptq", "awq_w4a4_hadamard_b16_gptq"),
+                          "w4a16_fakequant")["quantize_seconds"] - 0.1),
+        "below the winning candidate's quantize_seconds")
+    # 2. M1: crest=3.99 on v1 seed-1 identity (bound 3 + 0.665792 = 3.665792), by_kind, lower bound, signal_alignment.
+    stats = lambda p: _unit(p, "ab", 1, b.MUON)["activation_statistics"]["identity"]  # noqa: E731
+    rejects(lambda p: stats(p)["group16_max_over_rms"]["all"].update(max=3.99), "contradicts group16_outlier_share")
+
+    def by_kind_contradiction(p):
+        st = stats(p)
+        st["group16_outlier_share"] = {"all": {"min": 0.0, "median": 0.0, "mean": 0.18, "max": 0.9},
+                                       "by_kind": dict(zip(q.LINEAR_KINDS, (0.9, 0.0, 0.0, 0.0, 0.0)))}
+        st["group16_max_over_rms"] = {"all": {"min": 2.9, "median": 2.9, "mean": 2.93, "max": 3.05},
+                                      "by_kind": dict(zip(q.LINEAR_KINDS, (2.9, 2.9, 2.9, 2.9, 3.05)))}
+
+    def lower_contradiction(p):
+        st = stats(p)
+        st["group16_outlier_share"] = {"all": {"min": 0.9, "median": 0.9, "mean": 0.9, "max": 0.9},
+                                       "by_kind": dict(zip(q.LINEAR_KINDS, (0.9,) * 5))}
+        st["group16_max_over_rms"] = {"all": {"min": 2.5, "median": 2.5, "mean": 2.5, "max": 2.5},
+                                      "by_kind": dict(zip(q.LINEAR_KINDS, (2.5,) * 5))}
+
+    rejects(by_kind_contradiction, "contradicts group16_outlier_share")
+    rejects(lower_contradiction, "contradicts group16_outlier_share")
+    rejects(lambda p: _unit(p, "ab", 1, b.MUON)["geometry"]["signal_alignment"]["all"].update(max=1409.0),
+            "outside the range of signal_alignment")
+    # 3. Producer trust: refusing unapproved commit SHA even if meta claims v1, and altered producer blob.
+    other = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    assert other != b.HISTORICAL_V1_PRODUCER_SHA
+    rejects(lambda p: p["meta"].update(git_sha=other), "test_access|declares another schema|producer")
+
+
+def test_canonical_external_evidence(canonical, tmp_path, monkeypatch):
     """The preserved result against the retained files: 24 C6 checkpoints, 3 C5-03 checkpoints, the test-access log."""
     dirs = {"checkpoint_dir": b._artifact_dir("c6_01_checkpoints"), "baseline_dir": b.default_baseline_dir(),
             "evidence_dir": b._artifact_dir("c6_01_run_evidence")}
@@ -1950,10 +2085,15 @@ def test_canonical_external_evidence(canonical, tmp_path):
             b.validate_results(p, canonical=True, **dirs)
         with pytest.raises(ValueError, match=match):
             b.verify_external_evidence(p, **dirs)
-    # The log: the opening in the JSON must be the line on disk.
+    # The log: the opening in the JSON must be the line on disk, and verified BEFORE any producer blob runs.
     p = copy.deepcopy(canonical)
     p["data"]["test_access"]["this_opening"]["timestamp"] = _in_window(p, 9967)  # one second off, inside the run
     assert b.validate_results(p, canonical=True) == CERTIFIED
+    with monkeypatch.context() as m:
+        m.setattr(b, "_producer_namespace",
+                  lambda sha: (_ for _ in ()).throw(AssertionError("must not execute producer before log check")))
+        with pytest.raises(ValueError, match="differs from the external test-access log"):
+            b.validate_results(p, canonical=True, **dirs)
     with pytest.raises(ValueError, match="differs from the external test-access log"):
         b.verify_external_evidence(p, **dirs)
     with pytest.raises(ValueError, match="is missing"):
