@@ -1227,9 +1227,10 @@ class FastCrossInput(nn.Module):
         return out
 
     def forward(self, x: Tensor) -> Tensor:
-        if self.exact:  # the expression of ``rotated_qat.CrossInput.forward``
+        if self.exact:  # ``rotated_qat.CrossInput.forward``: FP32 mix without autocast, layer in the caller's context
             with torch.autocast(device_type=x.device.type, enabled=False):
-                return self.layer(self.cross.forward(x.float()))
+                mixed = self.cross.forward(x.float())
+            return self.layer(mixed)
         return self.layer(self.mixed(x).reshape(*x.shape[:-1], self.n))
 
 

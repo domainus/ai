@@ -72,7 +72,7 @@ from research.quant_ptq import nvfp4_small_shape_blackwell as fs
 from research.quant_ptq import rotated_qat as rq
 
 ROOT = Path(__file__).resolve().parents[2]
-SCHEMA_VERSION = "cycle6_c6_02.v2"
+SCHEMA_VERSION = "cycle6_c6_02.v3"
 TASK = ("Cycle 6 C6-02: Blackwell small-shape NVFP4 quantizer fusion, fused cuBLASLt alpha and wide cross-mix "
         "latency against the C6-01 perplexities")
 DRIVER_MODULE = "research.quant_ptq.bench_c6_02_nvfp4_small_shape_fusion"
@@ -110,6 +110,14 @@ TRAINED_SEEDS = (1, 2, 3)
 COMPILED_BF16_NLL_TOL = 1e-3  # |compiled BF16 - archived C6-01 BF16| test NLL per seed (autocast FP32 weights there)
 PROFILE_REPS_A = 20
 PROFILE_REPS_C = 3
+VALID_KERNEL_KINDS = frozenset({"fp4_gemm", "gemm", "amax", "quant", "scale_product", "cross_mix", "other"})
+# Timing-stall detector (``_timing_anomalies``): a timed cell is stall-affected when its round means spread
+# (IQR / median above the part's limit) or when STALL_MIN_ROUNDS+ rounds hold a CUDA event above
+# STALL_EVENT_FACTOR x the cell's event median and above STALL_EVENT_MIN_MS (desktop or driver stalls).
+STALL_REL_IQR = {"part_a": 0.15, "part_c": 0.05}
+STALL_EVENT_FACTOR = 3.0
+STALL_EVENT_MIN_MS = 0.100
+STALL_MIN_ROUNDS = 5
 
 VARIANTS = ("none", "had_b16", "bfly_b16", "had_b16_static_gs")
 VARIANT_ROTATION = c503.VARIANT_ROTATION
@@ -174,7 +182,7 @@ SHAKEDOWN = {
 }
 CANONICAL_PARITY_MIN_CASES = 279
 # Earlier canonical attempts, newest last. Receipts are SHA-256 values of retained files (outside git, in
-# ``artifacts/c6_02_run_evidence/``) and, for v1, of the committed result blob (``verify_superseded_receipts``).
+# ``artifacts/c6_02_run_evidence/``) and, for v1 and v2, of the committed result blob (``verify_superseded_receipts``).
 SUPERSEDED_ATTEMPTS = (
     {"schema_version": "cycle6_c6_02.v1", "producer_git_sha": "a4ebc54ab67bf32448e076706780377c8bc8915d",
      "result_commit": None,
@@ -190,10 +198,22 @@ SUPERSEDED_ATTEMPTS = (
                 "(audits/AUDIT_cycle6_c6_02_gpt62_astra.md): no compiled BF16 baseline in Part C or the Pareto "
                 "(it reverses the 50m conclusion), a concurrent cuBLASLt scale-pointer race, a stale packed "
                 "butterfly table after load_state_dict, unqualified w2048_6l full-mix fidelity, BF16 casts of "
-                "the cross-mix matrices, and validator gaps; superseded by this v2 result",
+                "the cross-mix matrices, and validator gaps; superseded by the v2 result",
      "receipts": {"superseded_canonical_47cdedd.json":
                   "ceff189c3298905b355705dab89532d3a80bbeaf7343a7d27c804865f83949a2",
                   "canonical_47cdedd.log": "1a232f0c0c3f3898b1927b04556c4854c188c4ee3217d27a687335285cbed4a2"}},
+    {"schema_version": "cycle6_c6_02.v2", "producer_git_sha": "411eaf01381c83115887c910d267cd560859ed90",
+     "result_commit": "3e461419518b30781056d597ac56dd814cc5d91d",
+     "outcome": "accepted by its validator, then failed the GPT 6.2 Astra post-remediation re-check: desktop-load "
+                "stalls in the C5-03 rounds of c5_03_had_b16 at (1024, 512, 1408) gave a 1.846x C6-02/C5-03 "
+                "dynamic Hadamard speedup (two fresh sessions and the same run's ablation measured 1.154x and "
+                "1.176x) and raised the 50m absolute medians by about 7% over independent runs, under a generic "
+                "1-2% spread caveat; validator gaps (truncated round means, negative launch counts, contradictory "
+                "compiled logits errors, a Boolean seed); FastCrossInput(exact=True) ran the inner layer without "
+                "autocast; superseded by this v3 result, which adds a programmatic timing-stall caveat",
+     "receipts": {"superseded_canonical_411eaf0.json":
+                  "91deb1d2adc3eab3d26bf848ec4c6193a54178bfb145b92770264113d348583d",
+                  "canonical_411eaf0.log": "57893b3350a35787dcf9fe02858d9d0eccb8caae411a3af870b62bb078efd13c"}},
 )
 SUPERSEDED_EVIDENCE_DIR = "artifacts/c6_02_run_evidence"
 
@@ -1072,9 +1092,9 @@ def caveats(payload: dict) -> list[str]:
         "fast path is the separate module nvfp4_small_shape_blackwell (drop-in, bit-identical operands and outputs).",
         f"Part A: C6-02 beats BF16 cuBLAS in {beats}/{cells} CUDA-graph cells; trailing cells: "
         f"{s['part_a_cuda_graph_trailing_bf16'] or 'none'}; non-delegated cells slower than C5-03: "
-        f"{s['part_a_cuda_graph_regressions_vs_c5_03'] or 'none'}. Each cell is one Williams-balanced session; "
-        "cell-to-cell differences of about 1-2% are within the session-to-session spread measured while tuning (the "
-        "GPU also drives the desktop).",
+        f"{s['part_a_cuda_graph_regressions_vs_c5_03'] or 'none'}. Each cell is one Williams-balanced session and the "
+        "GPU also drives the desktop: the timing-anomaly caveat lists every cell whose rounds a stall affected.",
+        _timing_caveat(payload),
         "Large inputs use the C5-03 quantizer and torch._scaled_mm_v2 by design (fs.delegated: none from 2^23 "
         "elements, the butterfly from 2^21 elements with K >= 2048, never hadamard_b16): there the DRAM-bound C5-03 "
         "2D tiles match or beat the C6-02 kernels (c6_02_no_delegate ablation at 2048 x 8192; the limits come from "
@@ -1104,6 +1124,49 @@ def caveats(payload: dict) -> list[str]:
           for i, a in enumerate(SUPERSEDED_ATTEMPTS)),
     ]
     return out
+
+
+def _timing_anomalies(payload: dict) -> dict:
+    """Stall-affected timed cells (every Part A CUDA-graph method, every Part C method) from the raw events.
+
+    Per cell: the median and IQR of round means, the median of the individual events, and the number of rounds
+    with an event above max(STALL_EVENT_FACTOR x event median, STALL_EVENT_MIN_MS). Deterministic in the payload.
+    """
+    cells = [("part_a", f"{r['m']}x{r['n']}x{r['k']}", m, rec) for r in payload["part_a"]["shapes"]
+             for m, rec in r["cuda_graph"].items()]
+    cells += [("part_c", name, m, rec) for name, row in payload["part_c"]["models"].items()
+              for m, rec in row["timing"].items()]
+    flagged, max_rel = [], {part: 0.0 for part in STALL_REL_IQR}
+    for part, where, method, rec in cells:
+        gpu = rec["gpu"]
+        events = gpu["event_samples_ms"]
+        event_median = float(np.median([x for row in events for x in row]))
+        limit = max(STALL_EVENT_FACTOR * event_median, STALL_EVENT_MIN_MS)
+        stalls = sum(any(x > limit for x in row) for row in events)
+        rel = gpu["iqr_ms"] / gpu["median_ms"]
+        max_rel[part] = max(max_rel[part], rel)
+        if rel > STALL_REL_IQR[part] or stalls >= STALL_MIN_ROUNDS:
+            flagged.append({"part": part, "cell": where, "method": method, "median_ms": gpu["median_ms"],
+                            "iqr_ms": gpu["iqr_ms"], "rel_iqr": rel, "event_median_ms": event_median,
+                            "stall_rounds": stalls})
+    return {"flagged": flagged, "max_rel_iqr": max_rel}
+
+
+def _timing_caveat(payload: dict) -> str:
+    a = _timing_anomalies(payload)
+    rule = (f"relative IQR of round means above {STALL_REL_IQR['part_a']} in Part A or {STALL_REL_IQR['part_c']} in "
+            f"Part C, or {STALL_MIN_ROUNDS}+ rounds with an event above {STALL_EVENT_FACTOR:g}x the event median and "
+            f"{STALL_EVENT_MIN_MS:.3f} ms")
+    peak = (f"Maximum relative IQR: Part A {a['max_rel_iqr']['part_a']:.4f}, "
+            f"Part C {a['max_rel_iqr']['part_c']:.4f}.")
+    if not a["flagged"]:
+        return f"Timing anomalies: 0 stall-affected cells ({rule}). {peak}"
+    cells = "; ".join(f"{x['part']} {x['cell']} {x['method']}: round-mean median {x['median_ms']:.6f} ms, IQR "
+                      f"{x['iqr_ms']:.6f} ms, event median {x['event_median_ms']:.6f} ms, {x['stall_rounds']} "
+                      "stall rounds" for x in a["flagged"])
+    return (f"Timing anomalies: {len(a['flagged'])} stall-affected cells ({rule}): {cells}. The speedup ratios of "
+            "these cells reflect an affected session; the published estimator stays the median of round means and "
+            f"the raw events are kept. {peak}")
 
 
 def _compiled_caveats(payload: dict) -> list[str]:
@@ -1405,6 +1468,11 @@ META_KEYS = {"git_sha", "git_dirty", "command", "argv", "environment", "numerics
              "timestamp_start", "gpu_telemetry", "part_seconds", "timestamp_end", "total_seconds"}
 
 
+def _strict_equal(a, b) -> bool:
+    """JSON equality that tells ``True`` from ``1`` and ``1`` from ``1.0`` (Python ``==`` does not)."""
+    return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+
+
 def _finite_positive(x) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and x > 0
 
@@ -1421,18 +1489,23 @@ def _validate_timing(t: dict, methods, squares: int, iters: int, wall_iters: int
     for name, v in t.items():
         gpu, wall = v["gpu"], v["wall"]
         samples = gpu["event_samples_ms"]
-        _require(len(samples) == rounds and all(len(s) == iters and all(_finite_positive(x) for x in s)
-                                                for s in samples), f"{where}/{name}: raw event samples invalid")
+        _require(isinstance(samples, list) and len(samples) == rounds
+                 and all(isinstance(s, list) and len(s) == iters and all(_finite_positive(x) for x in s)
+                         for s in samples), f"{where}/{name}: raw event samples invalid")
         means = [sum(s) / iters for s in samples]
-        _require(all(abs(a - b) <= TOL * max(1.0, abs(b)) for a, b in zip(gpu["samples_ms"], means)),
+        _require(isinstance(gpu["samples_ms"], list) and len(gpu["samples_ms"]) == rounds
+                 and type(gpu["rounds"]) is int and gpu["rounds"] == rounds
+                 and all(_finite_positive(x) for x in gpu["samples_ms"]), f"{where}/{name}: GPU round count")
+        _require(all(abs(a - b) <= TOL * max(1.0, abs(b)) for a, b in zip(gpu["samples_ms"], means, strict=True)),
                  f"{where}/{name}: round means differ from the raw samples")
-        for stats, values in ((gpu, gpu["samples_ms"]), (wall, wall["samples_ms"])):
-            _require(stats["rounds"] == len(values) and all(_finite_positive(x) for x in values),
-                     f"{where}/{name}: invalid samples")
+        _require(isinstance(wall["samples_ms"], list) and len(wall["samples_ms"]) == rounds * wall_iters
+                 and type(wall["rounds"]) is int and wall["rounds"] == rounds * wall_iters
+                 and all(_finite_positive(x) for x in wall["samples_ms"]), f"{where}/{name}: wall sample count")
+        # GPU statistics come from the complete raw-event means, not from the stored round means
+        for stats, values in ((gpu, means), (wall, wall["samples_ms"])):
             ref = e2e._stats(values)
             _require(all(abs(stats[k] - ref[k]) <= TOL * max(1.0, abs(ref[k])) for k in
                          ("median_ms", "iqr_ms", "min_ms", "max_ms", "mean_ms")), f"{where}/{name}: statistics differ")
-        _require(len(wall["samples_ms"]) == rounds * wall_iters, f"{where}/{name}: wall sample count")
 
 
 def _close(a, b, where: str) -> None:
@@ -1481,6 +1554,7 @@ def _validate_part_a(payload: dict) -> None:
     a, protocol = payload["part_a"], payload["protocol"]
     t = protocol["timing"]
     _require([[r["m"], r["n"], r["k"]] for r in a["shapes"]] == protocol["part_a"]["shapes"], "part_a shapes differ")
+    _require(all(type(r[k]) is int for r in (*a["shapes"], *a["ablation"]) for k in "mnk"), "part_a: integer shapes")
     for r in a["shapes"]:
         where = f"part_a {r['m']}x{r['n']}x{r['k']}"
         _require(r["delegated_to_c5_03"] == _delegation(r["m"], r["k"]), f"{where}: delegation record")
@@ -1535,14 +1609,17 @@ def _validate_part_b(payload: dict) -> None:
     _require("scale_product" not in tr["c6_02_layer"]["kernel_kinds"]
              and "scale_product" in tr["c5_03_layer"]["kernel_kinds"], "part_b: layer traces")
     combos = [[m, r, d] for m in protocol["part_b"]["shapes"] for r in nb.ROTATIONS for d in protocol["part_b"]["out_dtypes"]]
-    _require([[e["mnk"], e["rotation"], e["out_dtype"]] for e in b["exactness"]] == combos, "part_b: exactness grid")
+    _require(_strict_equal([[e["mnk"], e["rotation"], e["out_dtype"]] for e in b["exactness"]], combos),
+             "part_b: exactness grid")
     _require(all(e["bitwise_equal_public"] is True and e["direct"] is True for e in b["exactness"]),
              "part_b: the direct cuBLASLt output differs from nvfp4_scaled_mm_public")
     hz = b["heuristic"]
-    _require(hz["mnk"] == protocol["part_b"]["algo_shape"] and hz["returned"] == len(hz["algorithms"]) >= 1,
+    _require(_strict_equal(hz["mnk"], protocol["part_b"]["algo_shape"]) and type(hz["returned"]) is int
+             and hz["returned"] == len(hz["algorithms"]) >= 1,
              "part_b: heuristic record")
     _require(hz["algorithms"][0]["config"] == hz["selected"], "part_b: the selected algorithm is heuristic result 0")
-    _require([r["index"] for r in hz["algorithms"]] == list(range(hz["returned"])), "part_b: heuristic indices")
+    _require(all(type(r["index"]) is int for r in hz["algorithms"])
+             and [r["index"] for r in hz["algorithms"]] == list(range(hz["returned"])), "part_b: heuristic indices")
     for r in hz["algorithms"]:
         ws = r["workspace_bytes"]
         _require(r["bitwise_equal_public"] is True and _finite_positive(r["cuda_graph_ms"])
@@ -1558,15 +1635,19 @@ def _validate_part_c(payload: dict) -> None:
     _require(list(c["models"]) == list(protocol["part_c"]["models"]), "part_c models differ")
     for name, row in c["models"].items():
         where = f"part_c {name}"
-        _require(row["batch"] == protocol["part_c"]["models"][name]
-                 and row["config"] == asdict(PART_C_CONFIGS[name])
-                 and row["tokens_per_call"] == row["batch"] * row["config"]["sequence_length"], f"{where}: config")
+        _close(asdict(PART_C_CONFIGS[name]), row["config"], f"{where}.config")
+        cfg = row["config"]
+        _require(all(type(row[k]) is int for k in ("batch", "tokens_per_call", "nvfp4_layers", "linear_parameters"))
+                 and row["batch"] == protocol["part_c"]["models"][name]
+                 and row["tokens_per_call"] == row["batch"] * cfg["sequence_length"]
+                 and row["nvfp4_layers"] == len(q.LINEAR_KINDS) * cfg["layers"]
+                 and row["linear_parameters"] == cfg["layers"] * cfg["width"] * (4 * cfg["width"] + 3 * cfg["hidden"]),
+                 f"{where}: config")
         expected = {*(f"{v}_c6_02_logits_equal_c5_03_bitwise" for v in VARIANTS),
                     *(f"{f}_c6_02_crossinput_logits_equal_c6_01_bitwise" for f in WIDE_FAMILIES)}
         _require(set(row["checks"]) == expected and all(v is True for v in row["checks"].values()),
                  f"{where}: a bitwise logits check failed")
         _require(set(row["fused_cross_mix_parity"]) == set(WIDE_FAMILIES), f"{where}: parity records")
-        cfg = row["config"]
         logits_numel = row["tokens_per_call"] * cfg["vocab_size"]
         mixed_values = row["tokens_per_call"] * (4 * cfg["width"] + cfg["hidden"]) * cfg["layers"]
         for f, p in row["fused_cross_mix_parity"].items():
@@ -1588,15 +1669,32 @@ def _validate_part_c(payload: dict) -> None:
         cp = row["bf16_compiled_parity"]
         _require(set(cp) == {"logits_finite", "logits_numel", "logits_rel_diff_vs_bf16_graph",
                              "logits_max_abs_diff_vs_bf16_graph"} and cp["logits_finite"] is True
-                 and cp["logits_numel"] == logits_numel and _finite_nonneg(cp["logits_rel_diff_vs_bf16_graph"])
-                 and _finite_nonneg(cp["logits_max_abs_diff_vs_bf16_graph"]) and cp["logits_rel_diff_vs_bf16_graph"] < 1.0,
+                 and type(cp["logits_numel"]) is int and cp["logits_numel"] == logits_numel
+                 and _finite_nonneg(cp["logits_rel_diff_vs_bf16_graph"])
+                 and _finite_nonneg(cp["logits_max_abs_diff_vs_bf16_graph"])
+                 and cp["logits_rel_diff_vs_bf16_graph"] < 1.0
+                 and (cp["logits_max_abs_diff_vs_bf16_graph"] == 0.0) == (cp["logits_rel_diff_vs_bf16_graph"] == 0.0),
                  f"{where}: compiled BF16 logits record")
+        rel = row["logits_rel_diff_vs_bf16"]
+        _require(isinstance(rel, dict) and set(rel) == set(PART_C_METHODS) - {"bf16_graph"}
+                 and all(_finite_nonneg(x) for x in rel.values())
+                 and abs(rel["bf16_compiled"] - cp["logits_rel_diff_vs_bf16_graph"]) <= TOL, f"{where}: logits errors")
+        # bit-identical logits have identical errors against the same BF16 reference
+        _require(all(rel[f"c5_03_{v}"] == rel[f"c6_02_{v}"] for v in VARIANTS)
+                 and all(rel[f"c6_01_{f}"] == rel[f"c6_02_crossinput_{f}"] for f in WIDE_FAMILIES)
+                 and all(rel[f"c6_01_{f}"] == rel[f"c6_02_fused_{f}"] for f, p in row["fused_cross_mix_parity"].items()
+                         if p["logits_mismatches"] == 0), f"{where}: logits errors of bit-identical paths differ")
         _require(_finite_positive(row["compile_seconds"]), f"{where}: compile time")
         _validate_timing(row["timing"], PART_C_METHODS, t["squares_c"], t["iters"], t["wall_iters"],
                          row["williams_orders"], where)
         kinds = row["kernel_kinds_per_forward"]
         layers = row["nvfp4_layers"]
         _require(list(kinds) == list(PART_C_PROFILED), f"{where}: profiled methods")
+        for m, kmap in kinds.items():  # launches per forward over PROFILE_REPS_C replays: whole launch counts
+            _require(isinstance(kmap, dict) and kmap and set(kmap) <= VALID_KERNEL_KINDS
+                     and all(_finite_positive(x) and round(x * PROFILE_REPS_C) >= 1
+                             and abs(x * PROFILE_REPS_C - round(x * PROFILE_REPS_C)) <= TOL for x in kmap.values()),
+                     f"{where}: {m} launch counts")
         for m in BF16_METHODS:
             _require(all(kinds[m].get(k, 0) == 0 for k in ("fp4_gemm", "amax", "quant", "cross_mix"))
                      and kinds[m].get("gemm", 0) >= 1 + cfg["layers"] * 4, f"{where}: {m} kernel profile")
@@ -1638,13 +1736,15 @@ def _validate_trained(trained: dict, protocol: dict) -> None:
         where = f"part_c compiled_bf16_trained_eval {preset}"
         seq = PART_C_CONFIGS[preset].sequence_length
         _require(e["c6_01_cell"] == PARETO_CELLS[preset] and e["test_split_sha256"] == C6_01_TEST_SHA256
-                 and e["checkpoint_dir"] == CHECKPOINT_DIRS[preset] and [r["seed"] for r in e["seeds"]] == list(TRAINED_SEEDS),
+                 and e["checkpoint_dir"] == CHECKPOINT_DIRS[preset] and all(type(r["seed"]) is int for r in e["seeds"])
+                 and [r["seed"] for r in e["seeds"]] == list(TRAINED_SEEDS),
                  f"{where}: identity")
         for r in e["seeds"]:
             unit = _c6_01_unit(result, preset, r["seed"])
             rec = unit["training"]
             windows = (split_tokens - 1) // seq
             _require(all(r[k] == rec[k] for k in ("checkpoint_file", "checkpoint_sha256", "checkpoint_file_sha256"))
+                     and all(type(r[k]) is int for k in ("split_tokens", "windows", "tokens"))
                      and r["split_tokens"] == split_tokens and r["windows"] == windows and r["tokens"] == windows * seq
                      and _finite_positive(r["test_nll"]) and _finite_positive(r["seconds"])
                      and r["c6_01_bf16_test_nll"] == unit["baseline_test"]["nll"]
@@ -1668,7 +1768,9 @@ def _validate_sync(payload: dict) -> None:
     s = payload["sync_check"]
     _require(set(s) == {f"{n}_{v}" for n in ("c6_02", "c6_02_fused_cross") for v in VARIANTS}, "sync_check keys")
     for k, v in s.items():
-        _require(v["sync_debug_error_raised"] is False and v["host_syncs_in_region"] == 0 and v["d2h_copies"] == 0
+        _require(all(_is_count(v[k]) for k in ("host_syncs_in_region", "d2h_copies", "graph_replays",
+                                                "graph_replays_bitwise_exact"))
+                 and v["sync_debug_error_raised"] is False and v["host_syncs_in_region"] == 0 and v["d2h_copies"] == 0
                  and v["graph_replays_bitwise_exact"] == v["graph_replays"] == 4, f"sync_check {k}: failed")
 
 
@@ -1732,11 +1834,13 @@ def _validate(payload: dict, canonical: bool | None, output) -> dict:
     if canonical is None:
         canonical = payload["canonical"]
     _require(payload["canonical"] is canonical and payload["shakedown"] is (not canonical), "canonical flags")
-    _require(payload["protocol"] == (CANONICAL if canonical else SHAKEDOWN), "protocol differs from the declared one")
+    _require(_strict_equal(payload["protocol"], CANONICAL if canonical else SHAKEDOWN),
+             "protocol differs from the declared one")
     _require(payload["pinned_inputs"] == PINNED_INPUTS == pinned_inputs(), "pinned inputs differ")
     _validate_meta(payload, canonical, output)
     kp = payload["kernel_parity"]
-    _require(kp["bitwise_failures"] == [] and kp["passed"] is True and kp["cases"] == sum(kp["case_kinds"].values()),
+    _require(kp["bitwise_failures"] == [] and kp["passed"] is True and _is_count(kp["cases"])
+             and all(_is_count(x) for x in kp["case_kinds"].values()) and kp["cases"] == sum(kp["case_kinds"].values()),
              "kernel parity failed")
     if canonical:
         _require(kp["cases"] >= CANONICAL_PARITY_MIN_CASES, f"canonical parity needs {CANONICAL_PARITY_MIN_CASES}+ cases")

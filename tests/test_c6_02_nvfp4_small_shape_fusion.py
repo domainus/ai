@@ -35,10 +35,10 @@ if CUDA:
     from research.quant_ptq import rotated_qat as rq
 
 CANONICAL_RESULT = ROOT / "results" / "cycle6_c6_02_nvfp4_small_shape_fusion.json"
-# The v2 canonical result and its producer commit. ``None`` only in the producer commit itself, before the
+# The v3 canonical result and its producer commit. ``None`` only in the producer commit itself, before the
 # canonical run (the result file does not exist there); the result commit pins both.
-CANONICAL_SHA256 = "91deb1d2adc3eab3d26bf848ec4c6193a54178bfb145b92770264113d348583d"
-CANONICAL_PRODUCER = "411eaf01381c83115887c910d267cd560859ed90"
+CANONICAL_SHA256 = None
+CANONICAL_PRODUCER = None
 ROTS = ("none", "hadamard_b16", "adaptive_butterfly_b16")
 M_SIZES = (1, 37, 128, 129, 256, 512)
 K_SIZES = (64, 80, 512, 768, 1408, 2048)
@@ -531,7 +531,7 @@ def test_fused_cross_mix_matches_crossinput(family, K):
     # The two-half FMA order of cuBLAS gemmSN: bit-exact at this batch (1024 rows).
     assert _bits(got, want)
     assert _bits(fused(x), eager(x))
-    for small in (x[0, :37], x[0, :1].float()):  # other cuBLAS kernels: near-0 parity only
+    for small in (x[0, :37], x[0, :1].float()):  # other cuBLAS kernels: FP32 rounding (1e-6) only
         diff = (fused.mixed(small) - cross.forward(small.float()).reshape(-1, K)).abs().max().item()
         assert diff <= 1e-6 * max(1.0, small.float().abs().max().item())
 
@@ -569,6 +569,24 @@ def test_exact_cross_mix_matches_crossinput_at_the_w2048_down_projection(family)
     assert exact.exact and not fs.FastCrossInput(layer, cross).exact
     assert _bits(exact.mixed(x), cross.forward(x.float()).reshape(-1, K))
     assert _bits(exact(x), eager(x))
+
+
+@needs_fp4
+def test_exact_cross_input_runs_the_inner_layer_under_the_callers_autocast():
+    """exact=True disables autocast for the FP32 mix only, like rotated_qat.CrossInput: under CUDA BF16 autocast
+    an FP32 nn.Linear inner module returns the same BF16 bits through both wrappers (K = 1408)."""
+    K = 1408
+    cross = rq.make_cross("full", K)
+    torch.manual_seed(0)
+    layer = torch.nn.Linear(K, 256, device="cuda")
+    exact, eager = fs.FastCrossInput(layer, cross, exact=True).cuda(), rq.CrossInput(layer, cross)
+    x = torch.randn(4, 64, K, device="cuda")
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        got, want = exact(x), eager(x)
+    assert got.dtype == want.dtype == torch.bfloat16
+    assert _bits(got, want)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16), torch.autocast(device_type="cuda", enabled=False):
+        assert exact(x).dtype == torch.float32  # the inner layer follows its caller's context
 
 
 @needs_fp4
@@ -793,7 +811,66 @@ TAMPERS = {
     "caveats": lambda p: p["caveats"].append("x"),
     "pareto": lambda p: p.__setitem__("pareto", {"50m": {}}),
     "canonical flag": lambda p: p.__setitem__("canonical", True),
+    "sync boolean count": lambda p: next(iter(p["sync_check"].values())).__setitem__("d2h_copies", False),
+    "parity boolean count": lambda p: p["kernel_parity"]["case_kinds"].__setitem__("packed_tables", True)
+    or p["kernel_parity"].__setitem__("cases", sum(p["kernel_parity"]["case_kinds"].values())),
+    "protocol boolean seed": lambda p: p["protocol"].__setitem__("seed", True) or p.__setitem__(
+        "run_config_hash", b.run_config_hash(p["shakedown"], p["protocol"], p["meta"]["code_sha256"],
+                                             p["meta"]["git_sha"], p["meta"]["environment"])),
+    "part c layer count": lambda p: _first_model(p).__setitem__("linear_parameters", 1),
+    "part c logits error keys": lambda p: _first_model(p)["logits_rel_diff_vs_bf16"].pop("c6_02_none"),
 }
+
+
+def _resummarize(p: dict) -> None:
+    """Recompute every derived summary, Pareto and caveat after a raw-record change (so only the raw check fails)."""
+    for row in p["part_c"]["models"].values():
+        row["summary"] = b.summarize_part_c_model(row)
+    p["pareto"] = b.pareto(p["part_c"])
+    p["summary"] = b.summarize(p)
+    p["caveats"] = b.caveats(p)
+
+
+def _truncate_compiled_means(p: dict) -> None:
+    gpu = _first_model(p)["timing"]["bf16_compiled"]["gpu"]
+    gpu.update({k: v for k, v in b.e2e._stats(gpu["samples_ms"][:1]).items()})
+
+
+def _contradictory_compiled_errors(p: dict) -> None:
+    cp = _first_model(p)["bf16_compiled_parity"]
+    cp.update(logits_max_abs_diff_vs_bf16_graph=0.0, logits_rel_diff_vs_bf16_graph=0.01)
+    _first_model(p)["logits_rel_diff_vs_bf16"]["bf16_compiled"] = 0.01
+
+
+# The four contradictions that the v2 validator accepted (audit, "Post-Remediation v2 Re-Check", finding 2), each
+# with its dependent summaries recomputed, and the check that must now reject it.
+ASTRA_V2_PROBES = {
+    "truncated compiled round means": (_truncate_compiled_means, "GPU round count"),
+    "negative compiled launch count": (lambda p: _first_model(p)["kernel_kinds_per_forward"]["bf16_compiled"]
+                                       .__setitem__("other", -1.0), "bf16_compiled launch counts"),
+    "zero max-abs with positive rel-L2": (_contradictory_compiled_errors, "compiled BF16 logits record"),
+    "negative compiled rel error": (lambda p: _first_model(p)["logits_rel_diff_vs_bf16"].__setitem__(
+        "bf16_compiled", -_first_model(p)["logits_rel_diff_vs_bf16"]["bf16_compiled"]), "logits errors"),
+    "boolean seed": (lambda p: _seed0(p).__setitem__("seed", True), "identity"),
+}
+
+
+def _astra_probe(payload, name):
+    fn, match = ASTRA_V2_PROBES[name]
+
+    def mutate(p):
+        fn(p)
+        _resummarize(p)
+
+    return _tamper(payload, mutate), match
+
+
+@needs_fp4
+@pytest.mark.parametrize("name", sorted(set(ASTRA_V2_PROBES) - {"boolean seed"}))  # the shakedown has no trained eval
+def test_validator_rejects_the_astra_v2_probes_on_a_shakedown(shakedown, name):
+    bad, match = _astra_probe(shakedown, name)
+    with pytest.raises(ValueError, match=match):
+        b.validate_results(bad)
 
 
 @needs_fp4
@@ -807,7 +884,7 @@ def test_validator_rejects_tampering_of_a_shakedown(shakedown, name):
 @pytest.fixture(scope="module")
 def canonical():
     if CANONICAL_SHA256 is None:  # the producer commit, before its canonical run
-        pytest.skip("the v2 canonical result is pinned in the commit that adds it")
+        pytest.skip("the v3 canonical result is pinned in the commit that adds it")
     data = CANONICAL_RESULT.read_bytes()
     assert hashlib.sha256(data).hexdigest() == CANONICAL_SHA256
     return json.loads(data)
@@ -823,7 +900,7 @@ def test_committed_canonical_result_is_pinned_and_valid(canonical):
     assert payload["kernel_parity"]["cases"] >= b.CANONICAL_PARITY_MIN_CASES
     assert payload["kernel_parity"]["bitwise_failures"] == []
     assert [r["mnk"] for r in payload["summary"]["part_a"]] == c503.PART_A_SHAPES
-    assert producer == CANONICAL_PRODUCER and payload["schema_version"] == "cycle6_c6_02.v2"
+    assert producer == CANONICAL_PRODUCER and payload["schema_version"] == "cycle6_c6_02.v3"
     assert set(payload["pareto"]) == {"50m", "120m"} and set(payload["part_c"]["models"]) == {"50m", "120m", "w2048_6l"}
     for preset, p in payload["pareto"].items():
         assert "bf16_compiled" in [x["method"] for x in p["points"]] and p["frontier_vs_bf16_graph"]
@@ -832,7 +909,9 @@ def test_committed_canonical_result_is_pinned_and_valid(canonical):
     for name, m in payload["part_c"]["models"].items():
         assert "bf16_compiled" in m["timing"] and m["bf16_compiled_parity"]["logits_finite"] is True
         assert m["summary"]["methods"]["c6_02_had_b16"]["speedup_vs_bf16_compiled"] > 0
-    assert not any("near-0 parity" in c for c in payload["caveats"])
+    assert not any("near-0" in c for c in payload["caveats"])
+    timing = [c for c in payload["caveats"] if c.startswith("Timing anomalies: ")]
+    assert len(timing) == 1 and timing[0] == b._timing_caveat(payload) and "Maximum relative IQR" in timing[0]
     assert any(c.startswith("Fused cross-mix fidelity, w2048_6l") and "latency only" in c for c in payload["caveats"])
 
 
@@ -861,6 +940,14 @@ def test_validator_rejects_canonical_only_tampering(canonical, name):
 
 
 @needs_fp4
+@pytest.mark.parametrize("name", sorted(ASTRA_V2_PROBES))
+def test_validator_rejects_the_astra_v2_probes_on_the_canonical_result(canonical, name):
+    bad, match = _astra_probe(canonical, name)
+    with pytest.raises(ValueError, match=match):
+        b.validate_results(bad, canonical=True)
+
+
+@needs_fp4
 def test_validator_rejects_the_result_commit_as_producer(canonical):
     """The v1 validator accepted the source-identical result commit as producer (with its recomputed config hash)."""
     log = c503._git("log", "-1", "--format=%H", "--", b.RESULT_REPO_PATH)
@@ -880,10 +967,16 @@ def test_validator_rejects_the_result_commit_as_producer(canonical):
 @needs_fp4
 def test_superseded_receipts(tmp_path):
     verified = b.verify_superseded_receipts()
-    assert verified[f"a716333:{b.RESULT_REPO_PATH}"] == "verified"  # the v1 result blob in git history
-    assert len(b.SUPERSEDED_ATTEMPTS) == 2 and b.SUPERSEDED_ATTEMPTS[1]["receipts"][
+    for commit in ("a716333", "3e46141"):  # the v1 and v2 result blobs in git history
+        assert verified[f"{commit}:{b.RESULT_REPO_PATH}"] == "verified"
+    assert [a["producer_git_sha"][:7] for a in b.SUPERSEDED_ATTEMPTS] == ["a4ebc54", "47cdedd", "411eaf0"]
+    assert b.SUPERSEDED_ATTEMPTS[1]["receipts"][
         "superseded_canonical_47cdedd.json"] == "ceff189c3298905b355705dab89532d3a80bbeaf7343a7d27c804865f83949a2"
-    present = [k for k, v in verified.items() if v == "verified" and not k.startswith("a716333")]
+    assert b.SUPERSEDED_ATTEMPTS[2]["receipts"] == {
+        "superseded_canonical_411eaf0.json": "91deb1d2adc3eab3d26bf848ec4c6193a54178bfb145b92770264113d348583d",
+        "canonical_411eaf0.log": "57893b3350a35787dcf9fe02858d9d0eccb8caae411a3af870b62bb078efd13c"}
+    assert "1.846x" in b.SUPERSEDED_ATTEMPTS[2]["outcome"]
+    present = [k for k, v in verified.items() if v == "verified" and ":" not in k]
     assert set(present) <= {n for a in b.SUPERSEDED_ATTEMPTS for n in a["receipts"]}
     (tmp_path / "canonical_a4ebc54.log").write_text("tampered\n")
     with pytest.raises(ValueError, match="receipt"):
