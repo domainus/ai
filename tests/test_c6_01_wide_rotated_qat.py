@@ -695,11 +695,24 @@ def test_layer_summary_bounds_and_metric_ranges():
         with pytest.raises(ValueError, match=match):
             b._validate_layer_summary(summary(**changes), metric, "x")
     low = {"all": {"mean": 0.5, "median": 0.5, "min": 0.5, "max": 0.5}, "by_kind": dict.fromkeys(q.LINEAR_KINDS, 0.5)}
-    for metric in ("group16_outlier_share", "nvfp4_relative_sq_error", "excess_kurtosis", "weight_stable_rank"):
+    for metric in ("group16_outlier_share", "nvfp4_relative_sq_error", "excess_kurtosis"):
         b._validate_layer_summary(low, metric, "x")
-    for metric in ("max_over_rms", "group16_max_over_rms"):  # a maximum is never below the RMS
+    for metric in ("max_over_rms", "group16_max_over_rms", "weight_stable_rank"):  # >= 1 for nonzero matrices / max>=RMS
         with pytest.raises(ValueError, match="range"):
             b._validate_layer_summary(low, metric, "x")
+    high_g16 = {"all": {"mean": 3.0, "median": 3.0, "min": 2.0, "max": 5.0},
+                "by_kind": dict.fromkeys(q.LINEAR_KINDS, 3.0)}
+    with pytest.raises(ValueError, match="range"):
+        b._validate_layer_summary(high_g16, "group16_max_over_rms", "x")
+    high_rank = {"all": {"mean": 100.0, "median": 100.0, "min": 1.0, "max": 513.0},
+                 "by_kind": dict.fromkeys(q.LINEAR_KINDS, 100.0)}
+    b._validate_layer_summary(high_rank, "weight_stable_rank", "x")
+    with pytest.raises(ValueError, match="range"):
+        b._validate_layer_summary(high_rank, "weight_stable_rank", "x", upper_bound=512.0)
+    b._validate_layer_summary(
+        {"all": {"mean": 100.0, "median": 100.0, "min": 1.0, "max": 512.0},
+         "by_kind": dict.fromkeys(q.LINEAR_KINDS, 100.0)},
+        "weight_stable_rank", "x", upper_bound=512.0)
     negative = {"all": dict.fromkeys(("mean", "median", "min", "max"), -2.5), "by_kind": dict.fromkeys(q.LINEAR_KINDS, -2.5)}
     for metric in b.METRIC_LOW:  # below every physical lower bound (kurtosis >= -2, an error or a rank >= 0)
         with pytest.raises(ValueError, match="range"):
@@ -737,9 +750,15 @@ def test_summary_code_of_the_v1_producer_is_the_code_of_this_checkout():
     for old, new in (("def verdict(stats: dict) -> str:", "def verdict(stats: dict) -> str:\n    stats = dict(stats)"),
                      ("N_SEEDS = 3", "N_SEEDS = 4"), ('"dual_bf16_weight": 0.5,', '"dual_bf16_weight": 0.25,'),
                      ("def _caveats_v1(payload: dict)", "def _caveats_v0(payload: dict)"),
-                     ('"Part C cooldowns start Muon momentum', '"Part C cooldowns restart Muon momentum')):
+                     ('"Part C cooldowns start Muon momentum', '"Part C cooldowns restart Muon momentum'),
+                     ("def analyze(", "@(lambda f: f)\ndef analyze(")):
         assert current.count(old) == 1
         assert not b._same_summary_definitions(committed, current.replace(old, new), b.HISTORICAL_SCHEMA_V1), old
+    for suffix in ("\nSIGN_FLIP_MIN_P /= 2\n", "\nSIGN_FLIP_MIN_P: float = 0.125\n",
+                   "\nif True:\n    SIGN_FLIP_MIN_P = 0.125\n", "\nimport math as statistics\n",
+                   "\ndef _evil():\n    global SIGN_FLIP_MIN_P\n    SIGN_FLIP_MIN_P = 0.125\n"):
+        assert not b._same_summary_definitions(committed, current + suffix, b.HISTORICAL_SCHEMA_V1), suffix
+    assert b._producer_namespace(producer)["SIGN_FLIP_MIN_P"] == 0.25
 
 
 @pytest.fixture
@@ -1229,6 +1248,15 @@ def test_validator_rejects_wrong_split_roles_and_test_opening_times(shakedown):
     _rejects(shakedown, lambda p: prior(p).append("earlier"), "keys differ from a test-access log entry")
     _rejects(shakedown, lambda p: p["data"]["test_access"].update(prior_openings=None), "test_access")
 
+    def three_second_opening(p):  # H1 residual: fake stage_seconds=1s so test opens 3s after start
+        p["stage_seconds"].update(stage_a=1.0, stage_b=1.0, stage_c=1.0)
+        p["stage_seconds"]["test_scoring"] = p["seconds"] - 3.0
+        p["data"]["test_access"]["this_opening"]["timestamp"] = _in_window(p, 3.0)
+
+    _rejects(shakedown, three_second_opening, "stage durations invalid or below sequential unit times")
+    _rejects(shakedown, lambda p: _unit(p, "ab", 1, b.MUON)["seconds"].update(phase1=0.01), "seconds.phase1 is below")
+    _rejects(shakedown, lambda p: _unit(p, "ab", 1, b.MUON)["seconds"].update(phase2=0.001), "seconds.phase2 is below")
+
 
 @needs_fp4
 def test_validator_rejects_broken_paired_controls_and_training_curves(shakedown):
@@ -1266,6 +1294,9 @@ def test_validator_rejects_broken_paired_controls_and_training_curves(shakedown)
         return edit
 
     _rejects(shakedown, all_arms("stream_fingerprint", "0" * 16), "stream_fingerprint differs")
+    _rejects(shakedown, all_arms("init_fingerprint", "0" * 16), "init_fingerprint differs from the initial weights")
+    _rejects(shakedown, lambda p: tr(p, b.BASELINE, "c").update(init_fingerprint="0" * 16),
+             "Part C init_fingerprint differs from the initial weights")
     # The training curve: the first step, every tenth step and the last step, each with a positive finite loss.
     curve = lambda p, arm=b.MUON: tr(p, arm)["train_curve"]  # noqa: E731
     assert [pt[0] for pt in curve(shakedown)] == [1, 10, 20, 30, 40]
@@ -1350,13 +1381,17 @@ def test_validator_rejects_impossible_counters_and_summary_bounds(shakedown):
              "outside the range of max_over_rms")
     _rejects(shakedown, lambda p: stat(p, "identity", "group16_max_over_rms")["all"].update(min=0.9),
              "outside the range of group16_max_over_rms")
+    _rejects(shakedown, lambda p: stat(p, "identity", "group16_max_over_rms")["all"].update(max=5.0),
+             "outside the range of group16_max_over_rms")
     _rejects(shakedown, lambda p: stat(p, "identity", "nvfp4_relative_sq_error")["all"].update(min=-1e-3),
              "outside the range of nvfp4_relative_sq_error")
     _rejects(shakedown, lambda p: stat(p, "identity", "group16_outlier_share")["all"].update(max=1.5),
              "outside the range of group16_outlier_share")
     _rejects(shakedown, lambda p: unit(p)["geometry"]["signal_alignment"]["all"].update(min=0.0),
              "outside the range of signal_alignment")
-    _rejects(shakedown, lambda p: unit(p)["geometry"]["weight_stable_rank"]["all"].update(min=-1.0),
+    _rejects(shakedown, lambda p: unit(p)["geometry"]["weight_stable_rank"]["all"].update(min=0.5),
+             "outside the range of weight_stable_rank")
+    _rejects(shakedown, lambda p: unit(p)["geometry"]["weight_stable_rank"]["all"].update(max=65.0),
              "outside the range of weight_stable_rank")
     _rejects(shakedown, lambda p: stat(p)["all"].pop("median"), "summary keys or numbers")
     _rejects(shakedown, lambda p: stat(p)["all"].update(max="large"), "summary keys or numbers")
@@ -1832,6 +1867,63 @@ def test_canonical_validator_rejects_the_bypasses_of_the_astra_audit(canonical):
         p["analysis"]["c5_03_reproduction"]["rows"][0]["abs_diff"] = 0.1
 
     rejects(record_only, "analysis")
+
+
+def test_canonical_validator_rejects_v2_recheck_residuals(canonical, monkeypatch):
+    """All five Astra v2 re-check bypasses (H1 timing, H2 shared fake init, M1 physical bounds, M2 C5-03 disk
+    substitution, and AST/SIGN_FLIP_MIN_P provenance) fail canonical validation."""
+    def rejects(edit, match):
+        _rejects(canonical, edit, match, canonical=True)
+
+    # 1. H1 residual: 3s test opening after setting stage_a/b/c=1s despite 320.214s Stage A training.
+    def early_opening(p):
+        p["stage_seconds"].update(stage_a=1.0, stage_b=1.0, stage_c=1.0, test_scoring=4014.48)
+        p["seconds"] = 4017.48
+        p["meta"]["total_seconds"] = 4018.0
+        p["meta"]["timestamp_start"] = _in_window(canonical, 1795835433 - 1795821453 - 4018)
+        p["data"]["test_access"]["this_opening"]["timestamp"] = _in_window(p, 3.0)
+
+    rejects(early_opening, "stage durations invalid or below sequential unit times")
+    # 2. H2 residual: false 0000... init_fingerprint shared across all seed-1 Part A/B siblings.
+    def fake_shared_init(p):
+        for arm in b.ARMS_AB:
+            _unit(p, "ab", 1, arm)["training"]["init_fingerprint"] = "0" * 16
+
+    rejects(fake_shared_init, "init_fingerprint differs from the initial weights")
+    # 3. M1 residual: group16_max_over_rms=5 (>4) and weight_stable_rank=0.5 (<1) or 513 (>512 at 50m).
+    rejects(lambda p: _unit(p, "ab", 1, b.MUON)["activation_statistics"]["identity"]["group16_max_over_rms"]["all"].update(
+        max=5.0), "outside the range of group16_max_over_rms")
+    rejects(lambda p: _unit(p, "ab", 1, b.MUON)["geometry"]["weight_stable_rank"]["all"].update(min=0.5),
+            "outside the range of weight_stable_rank")
+    rejects(lambda p: _unit(p, "ab", 1, b.MUON)["geometry"]["weight_stable_rank"]["all"].update(max=513.0),
+            "outside the range of weight_stable_rank")
+    # 4. M2 residual: shifting the C5-03 file on disk +0.1 nats and recomputing all derived fields is rejected.
+    c5_disk = ROOT / b.C5_03_RESULT_REPO_PATH
+    c5_src = json.loads(c5_disk.read_bytes())
+    for r in c5_src["part_c"]["seeds"][0]["grid"]:
+        if r["method"] == b.C5_HADAMARD and r["mode"] == "w4a4_hw_static_bf16cal":
+            r["test_nll"] += 0.1
+    shifted_c5_bytes = json.dumps(c5_src).encode()
+    shifted_p = copy.deepcopy(canonical)
+    u = _unit(shifted_p, "c", 1, b.BASELINE)
+    _shift_nll(u, _grid_row(u, b.C5_HADAMARD, "w4a4_hw_static"), "test", 0.1)
+    shifted_p["c5_03_reference"]["seeds"]["1"]["methods"][b.C5_HADAMARD]["w4a4_hw_static"]["test"] += 0.1
+    shifted_p["c5_03_reference"]["result_sha256"] = hashlib.sha256(shifted_c5_bytes).hexdigest()
+    _recompute(shifted_p)
+    orig_read_bytes = Path.read_bytes
+    with monkeypatch.context() as m:
+        m.setattr(Path, "read_bytes", lambda self: shifted_c5_bytes if self == c5_disk else orig_read_bytes(self))
+        with pytest.raises(ValueError, match="differs from pinned"):
+            b.validate_results(shifted_p, canonical=True)
+    # 5. Provenance residual: forcing SIGN_FLIP_MIN_P = 0.125 and recomputing cannot pass producer verification.
+    halved = copy.deepcopy(canonical)
+    with monkeypatch.context() as m:
+        m.setattr(b, "SIGN_FLIP_MIN_P", 0.125)
+        _recompute(halved)
+        with pytest.raises(ValueError, match="SIGN_FLIP_MIN_P differs"):
+            b.validate_results(halved, canonical=True)
+    with pytest.raises(ValueError, match="analysis|producer_blob"):
+        b.validate_results(halved, canonical=True)
 
 
 def test_canonical_external_evidence(canonical, tmp_path):

@@ -78,6 +78,8 @@ import time
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import asdict
 from datetime import timedelta
+from importlib.abc import SourceLoader
+from importlib.util import module_from_spec, spec_from_loader
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -118,6 +120,7 @@ SHAKEDOWN_TEST_ACCESS_LOG = "<output>.work/run_evidence/test_access_log.jsonl"  
 EXPECTED_ROLES = {"training": "train", "calibration": "train", "static_scales": "train",
                   "awq_alpha_selection": "val", "method_and_arm_selection": "val", "evaluation": "test"}
 C5_03_RESULT_REPO_PATH = c503.RESULT_REPO_PATH
+C5_03_RESULT_SHA256 = "e0e435ef2ea8598df22bace95ab76fd10c43b2ff394bf635ab8d1548d8bcad82"
 # The modules that measure, analyze, summarize and validate. ``meta.git_sha`` must hold these bytes.
 SUMMARY_MODULES = (
     DRIVER_MODULE,
@@ -1222,6 +1225,37 @@ def c5_03_reference() -> dict:
             "awq_alphas": source["protocol"]["part_c"]["awq_alphas"], "seeds": seeds}
 
 
+def _parse_c5_03_blob(blob: bytes) -> dict:
+    """Parse and SHA-256-verify a C5-03 result blob against ``C5_03_RESULT_SHA256``."""
+    digest = hashlib.sha256(blob).hexdigest()
+    if digest != C5_03_RESULT_SHA256:
+        raise ValueError(f"{C5_03_RESULT_REPO_PATH} SHA-256 {digest} differs from pinned {C5_03_RESULT_SHA256}")
+    source = json.loads(blob)
+    modes = {"w4a16_fakequant": "w4a16_fakequant", DYNAMIC: DYNAMIC, "w4a4_hw_static": "w4a4_hw_static_bf16cal"}
+    seeds = {}
+    for s in source["part_c"]["seeds"]:
+        grid = {(r["method"], r["mode"]): r for r in s["grid"]}
+        seeds[str(s["seed"])] = {
+            "checkpoint_sha256": s["training"]["checkpoint_sha256"],
+            "checkpoint_file_sha256": s["training"]["checkpoint_file_sha256"],
+            "bf16": {split: s[f"baseline_{split}"]["nll"] for split in SPLITS},
+            "methods": {method: {mine: {split: grid[(method, theirs)][f"{split}_nll"] for split in SPLITS}
+                                 for mine, theirs in modes.items()} for method in (C5_HADAMARD, C5_BEST)},
+            "awq_alpha": grid[(C5_BEST, DYNAMIC)]["awq_alpha"]}
+    return {"result": C5_03_RESULT_REPO_PATH, "result_sha256": digest,
+            "awq_alphas": source["protocol"]["part_c"]["awq_alphas"], "seeds": seeds}
+
+
+def _trusted_c5_03_reference(git_sha: str | None = None) -> dict:
+    """Load the pinned C5-03 reference from Git (when ``git_sha`` is given) and the checkout file."""
+    disk_ref = _parse_c5_03_blob((ROOT / C5_03_RESULT_REPO_PATH).read_bytes())
+    if git_sha is None:
+        return disk_ref
+    blob_ref = _parse_c5_03_blob(c503._git_blob(git_sha, C5_03_RESULT_REPO_PATH))
+    _require(_same(disk_ref, blob_ref), "checkout C5-03 result differs from the producer commit's Git blob")
+    return blob_ref
+
+
 # ======================================================================================
 # Hardware parity of the cross-mix path (recorded with the results)
 # ======================================================================================
@@ -1517,12 +1551,20 @@ SUMMARY_DEFINITIONS = (
     "throughput", "contrast_specs", "_series", "verdict", "analyze", "c5_03_reference", "summarize")
 
 
+_DYNAMIC_MUTATORS = frozenset({"globals", "locals", "setattr", "delattr", "exec", "eval", "__import__", "vars"})
+
+
 def _definitions(source: str) -> dict[str, str]:
-    """``ast.dump`` of every top-level assignment (its value) and function (arguments and body, not its name)."""
+    """``ast.dump`` of every top-level assignment and function (decorators, args, return type and body)."""
     out = {}
     for node in ast.parse(source).body:
-        if isinstance(node, ast.FunctionDef):
-            out[node.name] = ast.dump(node.args) + "".join(ast.dump(stmt) for stmt in node.body)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out[node.name] = "".join((
+                "".join(ast.dump(d) for d in node.decorator_list),
+                ast.dump(node.args),
+                "" if node.returns is None else ast.dump(node.returns),
+                "".join(ast.dump(stmt) for stmt in node.body),
+            ))
         elif isinstance(node, ast.Assign):
             for target in node.targets:
                 names = [target] if isinstance(target, ast.Name) else getattr(target, "elts", [])
@@ -1532,16 +1574,129 @@ def _definitions(source: str) -> dict[str, str]:
     return out
 
 
+def _target_names(node: ast.AST):
+    if isinstance(node, ast.Name):
+        yield node.id
+    elif isinstance(node, (ast.Tuple, ast.List)):
+        for elt in node.elts:
+            yield from _target_names(elt)
+    elif isinstance(node, ast.Starred):
+        yield from _target_names(node.value)
+
+
+def _is_main_guard(node: ast.AST) -> bool:
+    return (isinstance(node, ast.If) and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name) and node.test.left.id == "__name__"
+            and len(node.test.ops) == 1 and isinstance(node.test.ops[0], ast.Eq)
+            and len(node.test.comparators) == 1 and isinstance(node.test.comparators[0], ast.Constant)
+            and node.test.comparators[0].value == "__main__")
+
+
+def _walk_module_scope(node: ast.AST):
+    """Yield every AST node executed in module scope (skipping function/lambda bodies and ``__main__``)."""
+    yield node
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        return
+    for child in ast.iter_child_nodes(node):
+        if not _is_main_guard(child):
+            yield from _walk_module_scope(child)
+
+
+def _module_ast_clean(committed_tree: ast.Module, current_tree: ast.Module, tracked: set[str]) -> bool:
+    """Reject module-scope rebindings, augmented/annotated assignments, shadowed imports, globals or mutators."""
+    committed_imports = {ast.dump(n) for n in committed_tree.body if isinstance(n, (ast.Import, ast.ImportFrom))}
+    current_imports = [n for n in current_tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
+    if not committed_imports <= {ast.dump(n) for n in current_imports}:
+        return False
+    import_names = {alias.asname or alias.name.split(".")[0] for node in current_imports for alias in node.names}
+    guarded = tracked | import_names
+    top_ids = {id(n) for n in current_tree.body}
+    bindings = dict.fromkeys(guarded, 0)
+    for node in ast.walk(current_tree):
+        if isinstance(node, ast.Global) and any(name in guarded for name in node.names):
+            return False
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _DYNAMIC_MUTATORS:
+            return False
+    for node in _walk_module_scope(current_tree):
+        if isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.Delete, ast.NamedExpr)):
+            targets = [node.target] if not isinstance(node, ast.Delete) else node.targets
+            if any(name in guarded for tgt in targets for name in _target_names(tgt)):
+                return False
+        elif isinstance(node, ast.ClassDef) and node.name in guarded:
+            return False
+        elif isinstance(node, (ast.For, ast.AsyncFor)) and any(n in guarded for n in _target_names(node.target)):
+            return False
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            if any(n in guarded for item in node.items if item.optional_vars is not None
+                   for n in _target_names(item.optional_vars)):
+                return False
+        elif isinstance(node, ast.ExceptHandler) and node.name in guarded:
+            return False
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in guarded:
+                if id(node) not in top_ids:
+                    return False
+                bindings[node.name] += 1
+        elif isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                for name in _target_names(tgt):
+                    if name in guarded:
+                        if id(node) not in top_ids:
+                            return False
+                        bindings[name] += 1
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                name = alias.asname or alias.name.split(".")[0]
+                if name in guarded:
+                    if id(node) not in top_ids:
+                        return False
+                    bindings[name] += 1
+    return all(bindings[name] == 1 for name in guarded)
+
+
+class _GitSourceLoader(SourceLoader):
+    def __init__(self, source: bytes, origin: str):
+        self._source = source
+        self._origin = origin
+
+    def get_filename(self, fullname: str) -> str:
+        return self._origin
+
+    def get_data(self, path: str) -> bytes:
+        return self._source
+
+
+@functools.cache
+def _producer_namespace(git_sha: str) -> dict:
+    """Load the committed driver Git blob at ``git_sha`` into an isolated module namespace."""
+    for module in SUMMARY_MODULES:
+        if module != DRIVER_MODULE and c503._git_blob(git_sha, c503._module_repo_path(module)) != _module_path(module).read_bytes():
+            raise ValueError(f"summary module {module} differs from producer commit {git_sha}")
+    blob = c503._git_blob(git_sha, SCRIPT_REPO_PATH)
+    name = f"_c6_01_producer_{git_sha[:12]}"
+    spec = spec_from_loader(name, _GitSourceLoader(blob, f"<git:{git_sha}:{SCRIPT_REPO_PATH}>"))
+    mod = module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    return mod.__dict__
+
+
 def _same_summary_definitions(committed: str, current: str, schema: str | None) -> bool:
     """True iff ``current`` recomputes a result of ``schema`` with the definitions of the ``committed`` driver.
 
     The caveats belong to the schema: the v1 list is ``caveats`` in a v1 driver and ``_caveats_v1`` here.
+    Also rejects module-scope rebindings, augmented/annotated assignments, shadowed imports, globals or mutators.
     """
     if schema == HISTORICAL_SCHEMA_V1:
         pairs = [("caveats", "_caveats_v1")]
+        tracked = set(SUMMARY_DEFINITIONS) | {"_caveats_v1", "caveats"}
     elif schema == SCHEMA_VERSION:
         pairs = [("caveats", "caveats"), ("_caveats_v1", "_caveats_v1")]
+        tracked = set(SUMMARY_DEFINITIONS) | {"caveats", "_caveats_v1"}
     else:
+        return False
+    committed_tree, current_tree = ast.parse(committed), ast.parse(current)
+    if not _module_ast_clean(committed_tree, current_tree, tracked):
         return False
     theirs, mine = _definitions(committed), _definitions(current)
     return all(a in theirs and b in mine and theirs[a] == mine[b]
@@ -1742,7 +1897,7 @@ def run(args) -> dict:
     baseline_dir = None if args.shakedown else args.baseline_checkpoint_dir
     study = run_study(protocol, shards, device, args.checkpoint_dir, baseline_dir, log, before_test)
     payload.update(study)
-    payload["c5_03_reference"] = None if args.shakedown else c5_03_reference()
+    payload["c5_03_reference"] = None if args.shakedown else _trusted_c5_03_reference()
     payload["analysis"] = analyze(payload["units"], payload["selections"], protocol, payload["c5_03_reference"])
     payload["summary"] = summarize(payload)
     meta["splits_opened"] = list(shards.opened)
@@ -1803,10 +1958,10 @@ AWQ_SELECTION_KEYS = {"method", "alphas", "val_nll_hw_dynamic", "selected_alpha"
 ROW_COUNTERS = ("fp4_gemms_per_forward", "nvfp4_modules", "bf16_block_linears", "emulated_modules",
                 "cross_mix_modules")
 # Range of a per-layer metric: (lower bound, the bound is exclusive), and an upper bound where one exists.
-METRIC_LOW = {"weight_stable_rank": (0.0, True), "signal_alignment": (0.0, True), "excess_kurtosis": (-2.0, False),
+METRIC_LOW = {"weight_stable_rank": (1.0, False), "signal_alignment": (0.0, True), "excess_kurtosis": (-2.0, False),
               "max_over_rms": (1.0, False), "group16_max_over_rms": (1.0, False),
               "group16_outlier_share": (0.0, False), "nvfp4_relative_sq_error": (0.0, False)}
-METRIC_HIGH = {"group16_outlier_share": 1.0}
+METRIC_HIGH = {"group16_outlier_share": 1.0, "group16_max_over_rms": 4.0}
 
 
 def _is_count(x) -> bool:
@@ -1959,6 +2114,13 @@ def _expected_stream_fingerprint(train_tokens: int, preset: str, seed: int) -> s
     return h.stream_fingerprint(range(train_tokens), PRESETS[preset], seed)
 
 
+@functools.cache
+def _expected_init_fingerprint(preset: str, seed: int) -> str:
+    """``h.state_fingerprint`` of the initial weights of ``preset`` and ``seed`` (CPU, RNG-isolated)."""
+    with torch.random.fork_rng(devices=[]):
+        return h.state_fingerprint(h.initial_state(PRESETS[preset], seed))
+
+
 def _validate_training(u: dict, payload: dict, where: str) -> None:
     protocol, sel = payload["protocol"], payload["selections"]
     part, arm, seed, tr = u["part"], u["arm"], u["seed"], u["training"]
@@ -2041,10 +2203,16 @@ def _validate_siblings(payload: dict) -> None:
     optimizer), and the two Part C continuations load one baseline checkpoint.
     """
     units, cooldown_from = payload["units"], payload["protocol"]["part_ab"]["cooldown_from"]
+    ab_preset, pc = payload["protocol"]["part_ab"]["preset"], payload["protocol"]["part_c"]
     for seed in payload["protocol"]["seeds"]:
         group = {(u["part"], u["arm"]): u["training"] for u in units if u["seed"] == seed}
         _require(len({group[("ab", arm)]["init_fingerprint"] for arm in ARMS_AB}) == 1,
                  f"seed {seed}: the Part A/B arms do not share one init_fingerprint")
+        _require(group[("ab", MUON)]["init_fingerprint"] == _expected_init_fingerprint(ab_preset, seed),
+                 f"seed {seed}: init_fingerprint differs from the initial weights of {ab_preset}")
+        if pc["baseline"] != "c5_03_preserved":
+            _require(group[("c", BASELINE)]["init_fingerprint"] == _expected_init_fingerprint(pc["preset"], seed),
+                     f"seed {seed}: Part C init_fingerprint differs from the initial weights of {pc['preset']}")
         for part in PARTS:
             streams = {tr["stream_fingerprint"] for (p, _), tr in group.items()
                        if p == part and tr["source"] == "trained_in_run"}
@@ -2060,7 +2228,7 @@ def _validate_siblings(payload: dict) -> None:
                  f"seed {seed}: {CONTINUE} and {QAT_C} do not branch from one baseline checkpoint")
 
 
-def _validate_layer_summary(summary, metric: str, where: str) -> None:
+def _validate_layer_summary(summary, metric: str, where: str, *, upper_bound: float | None = None) -> None:
     """A ``_layer_summary``: finite numbers, ordered extrema, per-kind means inside them, the range of the metric."""
     _require(isinstance(summary, dict) and set(summary) == {"all", "by_kind"} and isinstance(summary["all"], dict)
              and set(summary["all"]) == {"mean", "median", "min", "max"} and isinstance(summary["by_kind"], dict)
@@ -2073,8 +2241,10 @@ def _validate_layer_summary(summary, metric: str, where: str) -> None:
     _require(a["min"] <= a["max"] and all(a["min"] - eps <= v <= a["max"] + eps for v in inside)
              and abs(a["mean"] - math.fsum(kinds) / len(kinds)) <= eps,  # every kind has the same number of layers
              f"{where}: summary bounds violated (min <= mean, median and per-kind means <= max)")
-    (low, exclusive), high = METRIC_LOW[metric], METRIC_HIGH.get(metric, math.inf)
-    _require((a["min"] > low if exclusive else a["min"] >= low - 1e-9) and a["max"] <= high + 1e-9,
+    (low, exclusive), high = METRIC_LOW[metric], min(METRIC_HIGH.get(metric, math.inf),
+                                                     math.inf if upper_bound is None else upper_bound)
+    tol = 1e-6 * max(1.0, abs(low), 0.0 if math.isinf(high) else abs(high))
+    _require((a["min"] > low if exclusive else a["min"] >= low - tol) and a["max"] <= high + tol,
              f"{where}: values outside the range of {metric}")
 
 
@@ -2189,8 +2359,10 @@ def _validate_unit(u: dict, payload: dict, coverage: dict) -> tuple[int, int]:
                      <= fit["weight_sq_error_hadamard_start"], f"{where}.butterfly_fits[{key}].{kind}: fit record")
     _require(isinstance(u["geometry"], dict) and list(u["geometry"]) == ["weight_stable_rank", "signal_alignment"],
              f"{where}: geometry metrics differ")
+    max_stable_rank = float(min(config.width, config.hidden))
     for metric, summary in u["geometry"].items():
-        _validate_layer_summary(summary, metric, f"{where}: geometry.{metric}")
+        _validate_layer_summary(summary, metric, f"{where}: geometry.{metric}",
+                                upper_bound=max_stable_rank if metric == "weight_stable_rank" else None)
     if part == "ab" and arm == MUON:
         stats = u["activation_statistics"]
         _require(isinstance(stats, dict) and list(stats) == list(PROBE_FAMILIES)
@@ -2201,6 +2373,14 @@ def _validate_unit(u: dict, payload: dict, coverage: dict) -> tuple[int, int]:
                 _validate_layer_summary(summary, metric, f"{where}: activation_statistics.{family}.{metric}")
     else:
         _require(u["activation_statistics"] is None, f"{where}: only the probe checkpoints have activation statistics")
+    sec = u["seconds"]
+    _require(isinstance(sec, dict) and set(sec) == {"phase1", "phase2"} and all(_nonneg(v) for v in sec.values()),
+             f"{where}: unit.seconds invalid")
+    _require(sec["phase1"] >= math.fsum(r["seconds_val"] for r in grid)
+             + math.fsum(a["seconds"] for a in u["awq_selection"]) - 1e-3,
+             f"{where}: seconds.phase1 is below the recorded validation and AWQ times")
+    _require(sec["phase2"] >= math.fsum(r["seconds_test"] for r in grid) - 1e-3,
+             f"{where}: seconds.phase2 is below the recorded test scoring times")
     plain = sum(not rq.parse_method(m)[2] for m in methods)
     val = 1 + len(MODES) * plain + 1 + len(awq_methods) * (len(protocol["awq_alphas"]) + len(MODES) - 1)
     return val, 1 + len(MODES) * len(methods) + 1
@@ -2288,11 +2468,22 @@ def _validate_study(payload: dict, canonical: bool) -> None:
                                                "frozen_after_val_scorings": val_scorings,
                                                "test_scored_only_after_freeze": True}),
              "scoring ledger differs: every val.bin scoring must precede the freeze and every test.bin scoring")
+    stage_min = {
+        "stage_a": math.fsum(u["training"]["train_seconds"] + u["seconds"]["phase1"]
+                             for u in units if u["part"] == "ab" and u["arm"] == MUON),
+        "stage_b": math.fsum(u["training"]["train_seconds"] + u["seconds"]["phase1"]
+                             for u in units if u["part"] == "ab" and u["arm"] != MUON),
+        "stage_c": math.fsum(u["training"].get("train_seconds", 0.0) + u["seconds"]["phase1"]
+                             for u in units if u["part"] == "c"),
+        "test_scoring": math.fsum(u["seconds"]["phase2"] for u in units),
+    }
     _require(set(payload["stage_seconds"]) == set(STAGES) and all(_nonneg(v) for v in payload["stage_seconds"].values())
-             and payload["seconds"] >= sum(payload["stage_seconds"].values()) - 1e-6, "stage durations invalid")
+             and all(payload["stage_seconds"][k] >= stage_min[k] - 1e-3 for k in STAGES)
+             and payload["seconds"] >= sum(payload["stage_seconds"].values()) - 1e-6,
+             "stage durations invalid or below sequential unit times")
     reference = payload["c5_03_reference"]
     if pc["baseline"] == "c5_03_preserved":
-        _require(_same(reference, c5_03_reference()),
+        _require(_same(reference, _trusted_c5_03_reference(payload["meta"]["git_sha"] if canonical else None)),
                  "c5_03_reference differs from the committed C5-03 result of this checkout")
         _require(all(reference["seeds"][str(s)]["checkpoint_sha256"] == PINNED_BASELINES[s]["checkpoint_sha256"]
                      and reference["seeds"][str(s)]["checkpoint_file_sha256"] == PINNED_BASELINES[s]["checkpoint_file_sha256"]
@@ -2437,6 +2628,16 @@ def _validate_payload(payload: dict, canonical: bool | None) -> dict:
     _validate_study(payload, canonical)
     _assert_close(payload["summary"], summarize(payload), "summary")
     _require(payload["caveats"] == caveats(payload), "caveats differ from the recomputed caveats")
+    if canonical:
+        _require(SIGN_FLIP_MIN_P == 2.0 / (2 ** N_SEEDS), "SIGN_FLIP_MIN_P differs from 2 / 2**N_SEEDS")
+        pns = _producer_namespace(payload["meta"]["git_sha"])
+        p_analysis = pns["analyze"](payload["units"], payload["selections"], payload["protocol"],
+                                    payload["c5_03_reference"])
+        p_summary = pns["summarize"]({**payload, "analysis": p_analysis})
+        p_caveats = pns["caveats"](payload)
+        _assert_close(payload["analysis"], p_analysis, "producer_blob.analysis")
+        _assert_close(payload["summary"], p_summary, "producer_blob.summary")
+        _require(payload["caveats"] == p_caveats, "caveats differ from the producer commit's recomputed caveats")
     return {"certified_canonical": canonical, "shakedown": payload["shakedown"], "schema_version": schema,
             "awq_in_contemporaneous_freeze": schema == SCHEMA_VERSION}
 
