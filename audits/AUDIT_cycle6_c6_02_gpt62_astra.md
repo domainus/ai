@@ -1,0 +1,235 @@
+# C6-02 independent RTX 5080 audit
+
+**Verdict: FAIL.** The omitted compiled BF16 baseline reverses the 50m Pareto conclusion when the comparison includes the previous study’s default compiled BF16 path. The published graph-only comparison is correctly labeled. On the same RTX 5080, full butterfly took 13.242 ms and compiled BF16 took 11.766 ms. Compiled BF16 also had lower NLL on the three real checkpoints. At 120m full butterfly retained its latency advantage at 10.101 ms versus 10.771 ms for compiled BF16. At w2048_6l the fused path is fast, but the two full-mix families materially change the logits and there is no trained NLL point for that preset.
+
+Dynamic Hadamard closed the small-shape BF16 gap. The native fused path removed one multiplication kernel per layer. The archived artifact and all three inputs matched their pins, and all 729 tests passed. The failed verdict applies to accepting the broader frontier and drop-in compatibility claims.
+
+Reviewed 2026-11-28 on Bazzite, RTX 5080 (sm_120). Artifact commit `a716333`. Producer commit `47cdedd`.
+
+## Severity-ranked findings
+
+1. **HIGH — The 50m frontier depends on omitting the primary BF16 reference.** The cross-full butterfly takes 12.54% longer than compiled BF16, with worse trained test NLL. All three 50m wide paths are slower than compiled BF16. At 120m the butterfly takes 6.22% less time, with worse NLL. Add compiled BF16 to the same timing order and use measured trained quality for its Pareto point. Report the two model conclusions separately.
+2. **HIGH — Concurrent submissions can silently use the wrong scales.** The same cached `LtPlan` mutates a shared descriptor at `nvfp4_small_shape_blackwell.py:825`. Two host threads, each with its own CUDA stream and retained tensors, produced incorrect matrices. Serializing submission removed the errors. Isolate the mutable descriptor per concurrent submitter or protect both pointer updates and the matmul submission as one operation. Require repeated two-thread equality with a serial reference.
+3. **HIGH — A successful butterfly state-dict load can corrupt ordinary inference.** The non-persistent packed coefficients only rebuild at construction. After a standard load from a second layer with different angles, the native forward disagreed at 766 of 768 outputs while public activation quantization still matched the loaded layer. Rebuild the packed table after loading. Require agreement on both sides of the dispatch threshold and after a checkpoint round trip.
+4. **HIGH — Full-mix w2048 fidelity needs a shape-specific qualification.** The benchmark records the differences, but “near-0 parity” does not describe relative logits errors of 0.209 and 0.253. The first down projection changes packed FP4 bytes and later blocks amplify the difference. Use the reference cross-mix for exact-mode execution at affected shapes, or qualify the fused mode against trained w2048 quality before assigning it an NLL.
+5. **MEDIUM — The module-wide dtype conversion changes cross-mix constants.** Casting an already constructed full-mix wrapper to BF16 also casts its FP32 matrices. At K=1408 this raised the maximum mix error from 4.77e-7 to 0.01022. Preserve FP32 coefficient buffers across dtype conversion and check conversion before and after wrapper construction.
+6. **MEDIUM — The result validator accepts contradictory scientific evidence.** It accepts an empty raw direct trace, a failed heuristic parity flag, negative time and impossible logits counts. Validate raw and derived evidence together. The committed digest, independent evidence checks and live traces support the original artifact.
+7. **MEDIUM — Workspace fallback and plan lifetime need an explicit public contract.** The layer falls back for a nonzero-workspace plan. The exported direct helper invokes the plan regardless, passing null workspace and size zero. All measured native heuristics needed zero workspace. Guard the direct helper or supply the required workspace, and bound or dispose of native resources for dynamic shape sets.
+8. **LOW — Mutable tuning state and write-once publication assume a single owner.** Cached tile plans ignore later override changes. Option contexts use a process-global dictionary. The writer's atomic rename can replace an existing regular destination after separate run admission. Make tuning overrides local or invalidate plans on change, and use no-replace final publication if multiple producers may run.
+
+## Same-session compiled BF16 comparison
+
+GPU median in milliseconds, followed by the range of round means in brackets. Lower is faster.
+
+| Forward method | 50m | 120m | w2048_6l |
+|---|---:|---:|---:|
+| Compiled BF16 | 11.765802 [11.664, 12.264] | 10.771410 [10.734, 10.790] | 16.532454 [16.529, 16.632] |
+| BF16 CUDA graph | 14.481390 [14.456, 14.828] | 12.839829 [12.723, 12.882] | 17.549080 [17.467, 17.873] |
+| C6 Hadamard b16 | 10.657070 [10.636, 10.787] | 8.284803 [8.256, 8.371] | 8.005096 [7.972, 8.358] |
+| C6 fused Hadamard b64 | 12.646648 [12.603, 13.188] | 9.291939 [9.289, 9.405] | 9.004742 [9.001, 9.089] |
+| C6 fused full Kron | 12.486928 [12.444, 13.052] | 9.410306 [9.394, 9.492] | 9.520984 [9.498, 9.677] |
+| C6 fused full butterfly | 13.241598 [13.199, 13.598] | 10.101339 [10.073, 10.176] | 10.035414 [9.956, 10.423] |
+
+Wall medians for compiled BF16 versus full butterfly were 11.979 vs 13.518 ms (50m), 11.000 vs 10.327 ms (120m), 16.924 vs 10.138 ms (w2048_6l). The GPU and wall rankings agree. The corresponding C5-03 published compiled BF16 medians were 11.751, 10.794 and 16.696 ms.
+
+The uncompiled BF16 graph captures launch submission. Inductor also fuses operations. In separate CUPTI profiles of 50m and 120m, each uncompiled BF16 graph launched 375 kernels, including 73 GEMMs. Each compiled path launched 134 kernels, also including 73 GEMMs. The 50m full-butterfly path launched 60 each of cross-mix, amax, quantization and FP4 GEMM. Its largest remaining BF16 GEMM kernel name accounted for about 3.95 ms across the forward, and the layer-normalization kernel for 1.85 ms. The saved FP4 GEMM time competes with this remaining BF16 work and the per-layer rotation cost. All measured paths produced finite logits. The relative L2 differences between compiled and graphed BF16 logits were 0.01137, 0.01329 and 0.02006, respectively. Trained compiled-model NLL was therefore measured separately.
+
+## Single-layer spot checks
+
+GPU times below are microseconds. Each cell lists median [min, max] round means. Native C6 forces delegation off.
+
+| M, N, K | Rotation | BF16 | C5 | Default C6 | Native C6 |
+|---|---|---:|---:|---:|---:|
+| 1024, 512, 1408 | none | 23.51 [22.75, 23.91] | 22.74 [21.72, 23.36] | 21.40 [20.19, 22.11] | 21.25 [20.07, 22.22] |
+| 1024, 512, 1408 | had_b16 | 23.51 [22.75, 23.91] | 24.71 [23.77, 24.96] | 21.92 [20.33, 22.34] | 21.93 [20.36, 22.42] |
+| 1024, 512, 1408 | bfly_b16 | 23.51 [22.75, 23.91] | 26.71 [25.47, 27.03] | 24.51 [23.54, 25.20] | 24.37 [23.05, 24.90] |
+| 2048, 8192, 8192 | none | 2369.02 [2364.87, 2425.91] | 432.28 [430.70, 434.59] | 430.95 [429.77, 432.84] | 440.56 [438.34, 442.57] |
+| 2048, 8192, 8192 | had_b16 | 2369.02 [2364.87, 2425.91] | 439.29 [438.03, 440.52] | 438.37 [436.33, 461.00] | 437.76 [436.33, 439.71] |
+| 2048, 8192, 8192 | bfly_b16 | 2369.02 [2364.87, 2425.91] | 450.15 [449.13, 452.00] | 450.36 [449.13, 452.00] | 477.89 [476.73, 498.69] |
+
+At the target small shape, dynamic Hadamard beats BF16, and the butterfly median still trails it. The latter ranges overlap. At the large shape, native butterfly costs 6.2% more time than C5, and native identity costs 1.9% more. Default C6 delegates both. The small native Hadamard advantage over C5 at the large shape is within the observed spread. All quantized spot-check outputs matched C5 bitwise. The retained 31/32 claim is the canonical grid count. This audit retimed two of the eight grid shapes.
+
+## Trained checkpoints and test NLL
+
+Each cell below uses the full C6-01 test split. The C6-01 column gives the archived three-seed mean. For compiled BF16 its reference is the archived BF16 baseline. Each rebuilt GPTQ candidate also matched the archived effective-weight digest.
+
+| Preset | Forward | Seed 1 | Seed 2 | Seed 3 | Live mean | C6-01 mean |
+|---|---|---:|---:|---:|---:|---:|
+| 50m | compiled BF16 | 5.3936286222 | 5.3765352794 | 5.3759397540 | 5.3820345519 | 5.3820324911 |
+| 50m | cross_full_butterfly_b16 | 5.4042080615 | 5.3869049001 | 5.3861837050 | 5.3924322222 | 5.3924322222 |
+| 50m | kron_hadamard_full | 5.4052130389 | 5.3876423853 | 5.3873352995 | 5.3933969079 | 5.3933969079 |
+| 50m | hadamard_b64 | 5.4053324393 | 5.3882967738 | 5.3879717323 | 5.3938669818 | 5.3938669818 |
+| 120m | compiled BF16 | 4.6334646033 | 4.6264826242 | 4.6128836625 | 4.6242769633 | 4.6242854573 |
+| 120m | cross_full_butterfly_b16 | 4.6478281566 | 4.6410651302 | 4.6275134074 | 4.6388022314 | 4.6388022444 |
+| 120m | kron_hadamard_full | 4.6488627235 | 4.6417477110 | 4.6281219496 | 4.6395774614 | 4.6395774535 |
+
+The 120m C6-01 baseline grid contains full Kron and full butterfly. It has no b64 GPTQ test score to transfer. The w2048_6l model has no C6-01 trained Pareto cell.
+
+For the following unequal scores I also rescored the original C6-01 hardware path using the freshly rebuilt weights. Values are test NLLs.
+
+| Model | Seed | Family | Archived | Fast | Rerun original |
+|---|---:|---|---:|---:|---:|
+| 120m | 1 | cross_full_butterfly_b16 | 4.647828187810661 | 4.647828156558661 | 4.647828187810661 |
+| 120m | 1 | kron_hadamard_full | 4.648862786007367 | 4.648862723503367 | 4.648862786007367 |
+| 120m | 3 | cross_full_butterfly_b16 | 4.627513415253108 | 4.627513407440107 | 4.627513415253108 |
+| 120m | 3 | kron_hadamard_full | 4.628121863617631 | 4.628121949560631 | 4.628121863617631 |
+
+Over these checkpoints, nine of nine 50m fused scores and two of six 120m fused scores reproduce exactly. The largest absolute 120m NLL difference was 0.000000085943. This supports numerical transfer at the reported precision for these two trained cells.
+
+The reconstructed frontier below substitutes the live compiled BF16 and measured dynamic-method timings and qualities where available. Other narrow-method entries retain their pinned canonical timings and NLLs. The direct 50m dominance comparison uses only live timings and scores. The names run from lowest latency to lowest NLL.
+
+- 50m — hadamard_b16_gptq_static, gptq, adaptive_butterfly_b16_gptq, compiled BF16.
+- 120m — hadamard_b16_gptq_static, kron_hadamard_full_gptq, cross_full_butterfly_b16_gptq, compiled BF16.
+
+## Where the wide logits diverge
+
+The audit reproduced the random-weight logits comparisons independently. All three 50m wide families matched C6-01 across 412,090,368 logits each. All three 120m families matched across 206,045,184 logits each. The canonical mixed-input hooks had found 3,327 FP32 mismatches for each 120m full mix. A single exact final output does not establish equivalence on different tokens or on the last partial batch of a test set.
+
+At w2048_6l, b64 remained exact across 103,022,592 logits. Full Kron differed at 102,127,503 logits with relative L2 error 0.209078. Full butterfly differed at 102,294,865 with relative L2 error 0.253306. These are finite outputs. A relative L2 error of 0.25 is substantial even when every individual mix error begins near FP32 rounding precision.
+
+I instrumented the first five quantized linears on the actual quantized forward in block 0. The four projections with K=2048 produced identical mixed values and identical quantized operands for both families. The down projection has K=5632. At that projection the Triton two-half FMA reduction and the PyTorch/cuBLAS reference give slightly different FP32 results. With the very same activation input, weights and scales, the difference crosses quantization thresholds.
+
+| First down projection, M=2048, K=5632 | Mixed FP32 mismatches | Max absolute difference | Differing packed FP4 bytes | Differing block scales | Tensor scale on both paths |
+|---|---:|---:|---:|---:|---:|
+| Full Kron | 8,448,528 | 9.536743e-7 | 3 | 0 | 0.000936902361 |
+| Full butterfly | 8,449,721 | 9.536743e-7 | 4 | 0 | 0.001093562692 |
+
+Those three or four packed-byte differences feed the first residual output. As the resulting activations pass through later projections and quantizers, more values change. The measured relative L2 errors at the six block outputs were:
+
+| Family | Block 1 | Block 2 | Block 3 | Block 4 | Block 5 | Block 6 |
+|---|---:|---:|---:|---:|---:|---:|
+| Full Kron | 0.000138 | 0.028007 | 0.081769 | 0.137790 | 0.177348 | 0.208081 |
+| Full butterfly | 0.000129 | 0.060188 | 0.137051 | 0.186336 | 0.222916 | 0.252368 |
+
+The bitwise scale comparisons rule out a shared-scale change at the first divergence. The larger final errors follow successive nonlinear quantization decisions. “One ULP” around a typical mixed value does not bound the error in the logits, and cancellation can make the local ULP count larger. Use the original cross-mix where exact compatibility is needed, or qualify each fused shape against a stated task-level quality tolerance.
+
+## Quantizer, cuBLASLt and CUDA graphs
+
+**Alignment and bounds.** At `nvfp4_small_shape_blackwell.py:520`, vector I/O requires unit K stride. For both the 16-byte and 8-byte paths, the predicate tests the base address and the row stride in bytes. The row-stride test is redundant only when M=1. A valid group contains 16 values by the public K-multiple-of-16 contract. For 16-bit inputs the vector loads consume exactly 32 bytes, and for FP32 they consume 64 bytes. A group offset preserves alignment. Pass 1 masks out surplus tiles and rows. Pass 2 also masks padded groups and rows. The packed coefficient buffer is contiguous with four FP32 values per coefficient pair, so each vector starts on another 16-byte boundary. Both passes mask the coefficient groups separately. The generated `sm_120` PTX I inspected contains `setp.ne.b32`, two zero initializations and `@p ld.global.v2.b64`. A false predicate suppresses the memory operation itself. This argument applies to valid storage-backed tensor views and the shipped tile settings.
+
+**Launch contract.** `launch_amax` returns the actual pass-1 program count. Dynamic `launch_quant` checks a 1-D contiguous workspace on the same device, its FP32 dtype and minimum capacity, and an exact built-in integer equal to that shape and rotation’s C6 count. Static mode requires zero and no workspace. Both public launchers use C6 plans even when the layer dispatcher delegates. The suite exercised short and noncontiguous buffers, invalid counts, dirty buffers and padded scale storage. The returned count does not identify the source activation. A caller who changes input, rotation or workspace contents must rerun pass 1.
+
+**Direct GEMM.** The selected cuBLASLt heuristic uses FP32 compute, device pointer mode and a 1 MiB search limit. `LtPlan.__call__` updates both scale pointers and passes `torch.cuda.current_stream(out.device).cuda_stream` to `cublasLtMatmul`. The graph captures the device addresses for each submission. Eager warm-up is required for a new plan or kernel specialization. In graph use, keep external inputs, weights, scales and result storage valid for the replay lifetime. PyTorch manages allocations made inside its capture pool. Raw pointer submission alone does not extend the life of a tensor supplied by another stream. Use normal PyTorch stream ordering and allocator-lifetime discipline when sharing tensors across streams.
+
+For isolated Hadamard layers at both spot-check shapes, CUPTI found one amax, one quantization and one FP4 GEMM on the direct path. C5 additionally launched one scale-product kernel. The separate eager-forward sync check found zero D2H copies, zero host syncs inside the recorded regions and no sync-debug errors across eight layer/wrapper configurations. Changing inputs produced 32/32 bit-exact graph replays. The full Transformer still contains unrelated multiplies and some delegated paths. The eliminated multiplication concerns the per-layer direct NVFP4 GEMM.
+
+**Resource lifetime.** The cache is keyed by M, N, K, output dtype and device index. Each distinct plan holds a raw matmul descriptor and four layouts. Preferences are destroyed on the successful construction path. The implementation supplies no teardown for descriptors/layouts or per-device handles and no limit on this process-global shape cache. Finite, warmed benchmark shapes bound this cost. A service accepting arbitrary M can grow the cache over its entire lifetime. Normalize index-less device aliases, provide scoped ownership or a bounded cache, and clean up partial plan creation. Keep handle/layout reuse separate from mutable per-submission state.
+
+
+**Independent quantizer cases.** Seed 502, M,K in `(1,16), (3,48), (5,144), (129,80), (4097,32)`, each tested with 5 valid view layouts and FP32/BF16/FP16. The layouts vary row padding, a one-element storage offset and K strides 1 or 2. Each storage ended exactly at the last valid element. For the 75 views, `_vec_ok` selected 128-bit loads 25 times, 64-bit loads eight times, and scalar loads 42 times. I compared packed codes, all padded block-scale bytes and the FP32 tensor-scale bits with the eager reference for all three rotations. Separate inputs isolated +0, −0, NaN, +Inf, −Inf, the smallest positive/negative subnormal, smallest normal and largest finite value of each dtype. The combined result was **306 comparisons, 0 mismatches**. K=1,15,17,127 raised on all three dtypes. With M=0 and K=48, all three returned packed shape `(0,24)`, zero block-scale bytes and global scale 1.0.
+
+For a separate valid allocation-edge check, I placed a contiguous 3×48 view at the end of a 40 MiB device allocation. CUDA driver `cuMemGetAddressRange_v2` returned success and zero bytes between the storage end and the reported allocation boundary in all three dtypes. Each selected 128-bit I/O, completed after synchronization and matched the reference. This tests actual allocation endpoints. Protected neighboring pages and a compute-sanitizer run were outside this measurement.
+
+**Scalar products, fallback, shapes and state.** At M=6, N=128, K=256, the following are the FP32 bit patterns written by the quantizer for alpha and independently returned by `aten::mul`. The signed decimal interpretation is `view(torch.int32)`. In every row, direct GEMM and `torch._scaled_mm_v2` on the same quantized operands returned bitwise-identical BF16, FP16 and FP32 outputs, including their nonfinite outputs.
+
+| Activation scale × weight scale | Fused / PyTorch bits |
+|---|---:|
+| +0 × 1 | 0 / 0 |
+| −0 × 1 | −2147483648 / −2147483648 |
+| NaN × 1 | 2147483647 / 2147483647 |
+| +Inf × 1 | 2139095040 / 2139095040 |
+| 0 × +Inf | 2147483647 / 2147483647 |
+| 1e30 × 1e30 | 2139095040 / 2139095040 |
+| 1e−30 × 1e−20 | 0 / 0 |
+| 1e−20 × 1e−20 | 71362 / 71362 |
+| 1 × 1 | 1065353216 / 1065353216 |
+
+A `(2,3,256)` input returned `(2,3,128)` bitwise equal to C5 for each output dtype. An empty leading dimension returned `(0,3,128)`. Bias is outside both layers’ APIs. A supplied bias produced `TypeError: NVFP4Linear.__init__() got an unexpected keyword argument 'bias'`. All 72 canonical direct GEMM comparisons passed. To exercise the otherwise unobserved fallback branch, I temporarily set the cached plan’s declared workspace to 4096 bytes, then restored it. The layer matched C5 in all three dtypes. CUPTI reported `[amax, quant, scale_product, fp4_gemm]` for the fallback. This is branch coverage with a simulated requirement. The public helper lacks the layer’s `plan.direct` branch and the selected heuristic returned zero workspace on the live grid.
+
+On a warmed, non-default capture stream, eight input-changing replays interleaved with other eager calls matched the reference 8/8. Serial eager CPU/CUPTI traces gave `C5: aten::mul=True [amax, quant, scale_product, fp4_gemm]` and `C6: aten::mul=False [amax, quant, fp4_gemm]`. Consecutive cache queries with identical keys returned the same plan.
+
+For the concurrent test, each host thread owned a stream, distinct activation/weight scales and a live serial reference. Both used M=32, N=128, K=256 and BF16 output, synchronized warm-up, a barrier before each ordinary direct call, and retained outputs through stream completion. The first 100 calls per thread yielded 99/100 correct per thread. A fresh process alternated unprotected and protected submissions twice. Unprotected counts were `[499,497]` and `[499,497]` out of 500 per thread. With a lock around host submission they were `[500,500]` both times. Driver execution remained asynchronous. Correct stream binding alone cannot protect shared descriptor mutations between CPU threads.
+
+For a fresh adaptive butterfly layer at K=2048, C5 and C6 outputs matched bitwise at M=1023,1024,1025. Delegation was `False, True, True`. A separate checkpoint test constructed two K=256, N=128 layers with independently drawn angles, converted one using `from_layer`, then called `load_state_dict(other.state_dict())`. PyTorch reported `<All keys matched successfully>`. The new layer initially matched its source, and its public `quantize_input` still matched the loaded reference after the load. Its native forward disagreed in 766/768 elements. The delegated path reads the persistent C5-layout tables. The native path instead reads the stale `(16,G,4)` buffer. The same loaded K=2048 layer produced 130,831/130,944 differing outputs at M=1023 (native), then 0/131,072 at M=1024 (delegated). A second test applied `.bfloat16()` to a constructed full cross-mix wrapper at K=1408. Both of its own coefficient buffers changed dtype to BF16. The maximum absolute mix difference grew from 4.7683716e−7 to 0.010219097 on the same input.
+
+At M=17, K=256, identity, the cached pass-1 tile was `(64,1,1)`. Installing a valid `(32,1,1,512)` override updated the tile selector, yet the cached launch still returned `(64,1,1)`. The override was removed after the probe. Both pass caches depend on mutable global tile tables outside the cache key. The benchmark's `options` context also saves, clears and restores a shared dictionary. Serial benchmark capture is covered. Independent simultaneous tuning contexts need isolated settings.
+
+## Provenance and dispatch history
+
+I fetched `origin` and branched from `a716333d6c692ebc35476fd61398def8289cbfbf`. The committed result passed `validate_results(..., canonical=True, output=CANONICAL_OUTPUT)`. Its SHA-256 is `ceff189c3298905b355705dab89532d3a80bbeaf7343a7d27c804865f83949a2`. The recorded producer is `47cdedd8ff03027f39dd9e225279626824a0aeff` with `git_dirty=false`. The retained log also reports a clean start. These observations establish source and artifact identity. The historical working tree itself is unavailable for direct inspection.
+
+All seven `SUMMARY_MODULES` and all 20 modules in the driver’s static transitive import closure match the producer blobs byte for byte. Hashing each ordered module name, a NUL byte and its Git blob yields `b6f3c2a863a2d06d1d13b84b86b671ca8668701dcbac038e3af77f42e1b142c0`, exactly the recorded digest. I also compared these three inputs with their Git bytes at `88b473a`, `a4ebc54` and `47cdedd`.
+
+| Input | SHA-256 in all four trees |
+|---|---|
+| `research/quant_ptq/nvfp4_inference_blackwell.py` | `2b3a2af2615061d952216fa1691fdbd2f659961a5706f555c76bf35593053192` |
+| `results/cycle5_c5_03_nvfp4_120m_fusion.json` | `e0e435ef2ea8598df22bace95ab76fd10c43b2ff394bf635ab8d1548d8bcad82` |
+| `results/cycle6_c6_01_wide_rotated_qat.json` | `c490a415568244bd1e2489d0004adc025d856e92452cb976c05efc2dcdf66bf9` |
+
+| Retained evidence file | Measured SHA-256 | Check |
+|---|---|---|
+| `rejected_canonical_a4ebc54.json` | `33fabff660fea8da98c7fea98ff96975c88d098c826d5de9d642275e797efbb3` | Matches constant |
+| `canonical_a4ebc54.log` | `f58cbf162b8d867e08c2f874cbae49a553afc2ccf3f906085b8b7cd1b33de1bd` | Matches constant. Ends with `ValueError: part_c 50m: kernel launches per forward`, exit 1 |
+| `canonical_47cdedd.log` | `1a232f0c0c3f3898b1927b04556c4854c188c4ee3217d27a687335285cbed4a2` | No corresponding constant. Reports the canonical write and exit 0 |
+
+The rejected run completed the timed grid. The next commit fixed the Part C launch count and also changed the model under test. Previously every rotation delegated above `M*K > 2^23`. The new rules delegate identity from `2^23` inclusive and butterfly from `2^21` inclusive if `K >= 2048`. Hadamard stays on C6. The code comments cite RTX 5080 measurements on overlapping shapes. The four C5-relative regressions listed in the rejected summary are precisely the four delegated cells in the accepted summary. Two large cells already delegated before the change. The new summary explicitly excludes delegated cells from the regression count. Both runs beat BF16 in 31/32 cells and miss butterfly at 1024 × 512 × 1408. At 2048 × 8192 × 8192 the accepted ablation reports native butterfly at 478.82 µs and C5 at 451.59 µs. All three fused full-butterfly model medians moved by less than 0.04 ms between attempts.
+
+The switch is disclosed, performance-informed routing after the first attempt. The evidence supports the selected dispatcher on the measured shapes. A zero-regression count cannot establish a uniformly faster native quantizer or predict the crossover on unseen workloads. Freeze thresholds before evaluating disjoint shapes and publish the underlying sweep if making that broader claim.
+
+## Offline validation and artifact handling
+
+The canonical SHA-256 is the identity check. The offline validator also checks the recorded data for consistency. The following probes used fresh in-memory copies. Each copy went through the full canonical validator with the checkout’s canonical path. None wrote to the results directory.
+
+| Changed evidence | Observed validator result |
+|---|---|
+| First Part B heuristic row reports failed bit equality and negative graph time | Accepted |
+| Direct Part B trace reports no raw kernels and includes `aten::mul` in its CPU operators, while its separate kernel-kind list stays intact | Accepted |
+| Large ablation row has an empty delegation map | Accepted |
+| Ordinary Part A shape has an empty delegation map | Rejected, `delegation record` |
+| Wide Kron row has negative relative logits error and a logits population of one with over 100 million reported mismatches | Accepted |
+| 50m C6 Hadamard CUPTI summary has zero FP4 GEMMs | Rejected, `kernel launches per forward` |
+| 50m Pareto frontier is empty | Rejected, `pareto.50m.frontier: lengths differ` |
+| Producer dirty flag is true | Rejected, `a canonical result needs a 40-hex git_sha and a clean tree (git_dirty False)` |
+| Source-identical results commit `a716333` as the producer with its corresponding run configuration digest | Accepted |
+
+The validator verifies the committed code under the claimed producer. Several commits can have those bytes. The published file hash independently distinguishes this artifact. The history constant includes two file hashes, but offline validation never reads the retained artifacts. The canonical tests pin the published result separately. Cross-check raw kernel names with classifications and CPU operators, enforce positive durations and heuristic integrity, validate both delegation maps, and check population counts, error bounds and zero/parity relationships. Add an external receipt check for the historical artifacts when they are available. Size the claims of the offline mode to the evidence it actually reads.
+
+The guarded writer traverses parent components relative to a verified directory descriptor using `O_NOFOLLOW`, checks the leaf, creates an exclusive temporary file, reopens it with `O_NOFOLLOW`, verifies round-trip JSON, and renames with both directory descriptors. The suite exercises symlinked directories and leaves, traversal, reserved aliases and outputs outside the checkout on private fixtures. The write-once check happens at run admission. In a private mock repository, two successive guarded publications of ordinary data to the same regular destination left `{"trial": 2}`. Thus atomic replacement is verified, while two admitted producers can still overwrite each other. Use atomic no-replace publication if concurrent canonical producers are supported.
+
+
+I checked the unmodified artifact against several of the missing predicates separately. All four raw Part B traces classify to their recorded kernel lists. Both C6 traces omit CPU `aten::mul` and both C5/PyTorch traces contain it. All seven returned algorithm configurations report exact output, zero workspace and positive graph time (12.371–12.482 µs). All 236 Part A per-kernel records have positive finite duration and agree with the raw kernel name classification. Both ablation maps match the dispatch rules. All 274 timed method records have matching counts for GPU rounds, event-sample rows and stored means.
+
+## Reproduction protocol
+
+Python and pytest came from `/home/ryan/Documents/projects/ai/.venv/bin`. All application imports came from the audit checkout through `PYTHONPATH=.`. The only CUDA device was the RTX 5080, selected with `CUDA_VISIBLE_DEVICES=0`. The initial load average was 1.75 on 16 logical CPUs. Desktop applications were resident on the card. Audit GPU jobs ran serially. Temporary files, compiler caches and pytest outputs were private to this run.
+
+For Part C, use the C6-02 driver as `b`, call `b.c503.set_numerics()`, and initialize each `Transformer(b.PART_C_CONFIGS[name])` on CUDA exactly as in `part_c_model`, with seed 1, BF16 weights, eval mode, and random token IDs. Batches are 16, 8 and 4 at 512 tokens. Generate per-layer angles with the device generator seeded to 6. Construct the dynamic Hadamard model with `NVFP4Linear.from_weight` and `FastNVFP4Linear.from_layer`. For each wide family, use `_wide_modules` and install `FastCrossInput(FastNVFP4Linear.from_layer(layer), cross)`. Compare each model’s logits with the reference wrapper holding the same quantized layer. Keep every model alive, warm the compiled BF16 model three times under inference mode, and capture the five uncompiled models into one shared pool. The following is the timing core. All methods compute full logits.
+
+```python
+compiled = torch.compile(bf16_model)
+with torch.inference_mode():
+    for _ in range(3):
+        compiled(tokens)
+    functions = {"compiled": lambda: compiled(tokens)}
+    pool = torch.cuda.graph_pool_handle()
+    for name, model in graph_models.items():
+        functions[name] = b.c503.capture_shared(lambda m=model: m(tokens), pool)
+    flush = torch.empty(4 * torch.cuda.get_device_properties(0).L2_cache_size,
+                        dtype=torch.uint8, device="cuda")
+    records, orders = b.e2e.williams_timing(functions, squares=2, iters=10,
+                                             flush=flush, wall_iters=2)
+```
+
+The six-way comparison gives 12 balanced rounds, 120 flushed event samples and 24 wall samples per method per model. GPU medians and ranges use the 12 round means. The cache flush precedes the start event. Compilation, construction, profiling and parity checks are outside the timed interval. Compiled BF16 uses default Inductor settings, matching C5-03. The five graph paths replay one at a time on the same stream and discard their outputs during timing. Weights are random in this timing protocol. Checkpoint scores below use trained weights. The timing study covers full-batch forward execution on one machine and date.
+
+For the layer spot checks, use `b._inputs(device, M, N, K, 1)` and `b._layers`. Capture BF16 `x @ W.T` plus C5, default C6 and C6 with `delegate_large=False` for each of identity, Hadamard and butterfly. Check every quantized output bitwise against its C5 partner. Run the same event protocol over these ten methods, giving 20 rounds and 200 event samples per method. Profile captured graphs in a separate untimed pass. The 4× L2 flush applies to each individual event measurement in both experiments.
+
+For the checkpoint comparison, read the canonical C6-01 units `ab/muon_ss3_54` and `c/c5_03_baseline` for seeds 1–3. Use `c503.load_checkpoint` to verify file and tensor hashes. Verify the data manifest, regenerate the 128 train calibration sequences at seed 20261126, gather the C6-01 Hessians and build the published GPTQ rotations with `Study.candidate` (150 butterfly steps, AWQ alpha 0). Compare the resulting effective weight digest with the matching fake-quant row. Wrap the identical encoded hardware layers in `FastCrossInput` and evaluate the dynamic method with the canonical `q.evaluate_split` and microbatch. The test file SHA-256 is `4eb46f1424856849d2973923dbf3c886d37eb743cf22053fc7e1eea1f41ab92a`. Each score covers 3,906 windows, or 1,999,872 targets. When the fused score differs from the archived score, repeat the full scoring with the original hardware wrapper as a control. The trained BF16 comparator uses the same checkpoint cast to BF16 and the default compiled forward under inference mode, with the same FP32 cross-entropy scoring.
+
+
+The runtime was PyTorch 2.14.1+cu130, Triton 3.8.0, CUDA 13.0, cuDNN 92400, driver 615.78.08 and Python 3.13.12. The flush buffer held 268,435,456 bytes (256 MiB). TF32 and reduced-precision BF16/FP16 reductions were disabled, as in both producer scripts.
+
+```bash
+PYTHONPATH=. /home/ryan/Documents/projects/ai/.venv/bin/pytest tests/test_c6_02_nvfp4_small_shape_fusion.py tests/test_nvfp4_inference.py tests/test_c5_03_nvfp4_120m_fusion.py tests/test_c5_02_isoloss_ptq_mitigation.py tests/test_c6_01_wide_rotated_qat.py -q
+```
+
+Exact pytest footer: `729 passed, 85 warnings in 1161.72s (0:19:21)`. Zero failures and zero skips. Warnings included the documented sync-debug limitation, empty graph warnings in capture-refusal tests, and a Triton AST deprecation. The canonical result independently records 300 parity cases, comprising 288 activation cases, nine launcher cases and three packed-table cases.
+
+## Source locations
+
+- Quantizer vector loads, sizing checks and partial-count contract. [C6-02 kernels and launchers](../research/quant_ptq/nvfp4_small_shape_blackwell.py#L279)
+- cuBLASLt plan submission, cache and layer routing. [C6-02 direct GEMM](../research/quant_ptq/nvfp4_small_shape_blackwell.py#L763)
+- Timing workload and Pareto mapping. [C6-02 Part C](../research/quant_ptq/bench_c6_02_nvfp4_small_shape_fusion.py#L526)
+- Compiled BF16 comparator in the previous study. [C5-03 Part B](../research/quant_ptq/bench_c5_03_nvfp4_120m_fusion.py#L873)
+- Trained GPTQ reconstruction and reference hardware wrapper. [C6-01 study](../research/quant_ptq/bench_c6_01_wide_rotated_qat.py#L683)
+- Offline consistency checks. [C6-02 validator](../research/quant_ptq/bench_c6_02_nvfp4_small_shape_fusion.py#L1201)
