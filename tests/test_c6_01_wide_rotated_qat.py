@@ -1138,8 +1138,20 @@ def test_canonical_validator_rejects_tampering(canonical, tmp_path):
     first = subprocess.run(["git", "-C", str(ROOT), "rev-list", "--max-parents=0", "HEAD"], capture_output=True,
                            text=True).stdout.split()[0]
     assert head != first
-    rejects(lambda p: _set(p, ("meta", "git_sha"), first), "import closure|code_sha256|cannot read")
-    rejects(lambda p: p.update(canonical=False, shakedown=True), "differs from the shakedown protocol")
+    rejects(lambda p: _set(p, ("meta", "git_sha"), first), "test_access")  # the access log names the producer
+
+    def producer(sha):  # another producer commit, consistently: only the code provenance can object
+        def edit(p):
+            p["meta"]["git_sha"] = p["data"]["test_access"]["this_opening"]["git_sha"] = sha
+        return edit
+
+    parent = subprocess.run(["git", "-C", str(ROOT), "rev-parse", f"{canonical['meta']['git_sha']}~1"],
+                            capture_output=True, text=True).stdout.strip()
+    for sha in (first, parent):  # commits without the C6-01 driver
+        rejects(producer(sha), "import closure at meta.git_sha")
+    rejects(lambda p: _set(p, ("meta", "code_sha256"), "0" * 64), "committed git blobs")
+    rejects(lambda p: p.update(canonical=False, shakedown=True), "not labeled canonical")
+    _rejects(canonical, lambda p: p.update(canonical=False, shakedown=True), "differs from the shakedown protocol")
     alias = tmp_path / "alias.json"
     alias.symlink_to(b.CANONICAL_OUTPUT)
 
