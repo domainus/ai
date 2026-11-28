@@ -134,13 +134,21 @@ def test_benchmark_shapes_are_bit_exact(M, K, rotation):
 @needs_fp4
 def test_large_inputs_are_delegated_to_the_c5_03_quantizer():
     M, K = 2048, 8192
-    assert fs.delegated(M, K) and not fs.delegated(1024, 4096) and M * K > fs.DELEGATE_ABOVE
+    assert fs.delegated(M, K, "none") and fs.delegated(M, K, "adaptive_butterfly_b16")
+    assert not fs.delegated(M, K, "hadamard_b16") and not fs.delegated(1024, 4096, "none")
+    assert not fs.delegated(8192, 1408, "adaptive_butterfly_b16") and fs.delegated(8192, 1408, "none")
+    assert fs.delegated(4096, 2048, "adaptive_butterfly_b16") and fs.delegated(1024, 2048, "adaptive_butterfly_b16")
+    assert not fs.delegated(512, 2048, "adaptive_butterfly_b16") and not fs.delegated(128, 4096, "adaptive_butterfly_b16")
+    assert not fs.delegated(1023, 8192, "none") and fs.delegated(1024, 8192, "none")  # from 2^23 elements
     assert fs.quantizer_plan(M, K, "none")["delegated_to"] == "nvfp4_inference_blackwell"
+    assert "delegated_to" not in fs.quantizer_plan(M, K, "hadamard_b16")
     x = torch.randn(M, K, device="cuda").to(torch.bfloat16)
-    assert _same(fs.quantize_activation(x, "hadamard_b16"), nb.quantize_activation(x, "hadamard_b16"))
-    with b.options(delegate_large=False):  # the C6-02 kernels themselves are exact there too
-        assert not fs.delegated(M, K)
-        assert _same(fs.quantize_activation(x, "hadamard_b16"), nb.quantize_activation_ref(x, "hadamard_b16"))
+    angles, tables = _args("adaptive_butterfly_b16", K)
+    for rotation, a, t in (("none", None, None), ("adaptive_butterfly_b16", angles, tables)):
+        assert _same(fs.quantize_activation(x, rotation, t), nb.quantize_activation(x, rotation, t))
+        with b.options(delegate_large=False):  # the C6-02 kernels themselves are exact there too
+            assert not fs.delegated(M, K, rotation)
+            assert _same(fs.quantize_activation(x, rotation, t), nb.quantize_activation_ref(x, rotation, a))
 
 
 # ------------------------------------------------------------------ public launchers
@@ -487,7 +495,7 @@ TAMPERS = {
     .__setitem__("c6_02_beats_bf16", True),
     "part a orders": lambda p: p["part_a"]["shapes"][0]["cuda_graph_williams_orders"].reverse(),
     "part a shapes": lambda p: p["part_a"]["shapes"].pop(),
-    "part a delegation": lambda p: p["part_a"]["shapes"][0].__setitem__("delegated_to_c5_03", True),
+    "part a delegation": lambda p: p["part_a"]["shapes"][0]["delegated_to_c5_03"].__setitem__("none", True),
     "profile mul": lambda p: next(iter(p["part_a"]["shapes"][0]["cuda_graph_kernel_profile"]["c6_02_none"].values()))
     .__setitem__("kind", "scale_product"),
     "profile impl": lambda p: p["part_a"]["shapes"][0]["cuda_graph_kernel_profile"].__setitem__(

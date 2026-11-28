@@ -16,8 +16,9 @@ Quantizer (``quantize_activation``, ``launch_amax``, ``launch_quant``, ``FastNVF
     as (16, G, 4) ``(cos, sin)`` pairs, so a warp loads them coalesced, 128 bits per two pairs.
     Dynamic mode keeps the two launches of C5-03 (deterministic partial maxima, no atomics, PDL), with
     one pass-1 tile per program where possible (at most ``PASS1_PROGRAMS`` = 512 partials).
-    Inputs with more than ``DELEGATE_ABOVE`` elements are DRAM bound; there the C5-03 kernels are as fast
-    or faster, so ``quantize_activation`` and ``FastNVFP4Linear`` hand them to ``nvfp4_inference_blackwell``.
+    Large inputs are DRAM bound; where the C5-03 kernels are as fast or faster there (``delegated``:
+    ``none`` from 2^23 elements, the butterfly from 2^21 elements with K >= 2048, never ``hadamard_b16``),
+    ``quantize_activation`` and ``FastNVFP4Linear`` hand them to ``nvfp4_inference_blackwell``.
 
 GEMM (``nvfp4_scaled_mm_lt``)
     ``torch._scaled_mm_v2`` multiplies the two FP32 tensor scales in a separate elementwise kernel
@@ -66,10 +67,14 @@ PASS1_PROGRAMS = 512
 # fused alpha, the rotated FP32 stash of the dynamic butterfly (off: measured slower), and the delegation of
 # large inputs to C5-03.
 OPTIONS = {"pdl": True, "vector_io": True, "lt_gemm": True, "stash": False, "delegate_large": True}
-# Inputs above this many elements are DRAM bound; there C5-03's 2D tiles (angles shared by 16-32 rows)
-# match or beat these kernels (measured at 2048 x 8192), so ``quantize_activation`` and ``FastNVFP4Linear``
-# hand them to ``nvfp4_inference_blackwell`` unchanged (same bits). ``launch_amax``/``launch_quant`` never delegate.
-DELEGATE_ABOVE = 1 << 23
+# Large inputs are DRAM bound. Measured on the RTX 5080 (CUDA graphs, 4x L2 flush; C5-03 time / C6-02 time):
+# hadamard_b16 1.08-1.14 at 8-12M elements and 1.00 at 16.8M; none 1.00 at 8-12M and 0.98 at 16.8M; the
+# butterfly 1.01-1.05 below 2M elements and at K = 1408 (1.05 at 8192 x 1408), but 0.98-1.02 at K >= 2048 from
+# 2M elements and 0.94 at 2048 x 8192, where the C5-03 2D tiles share the coefficients of a group across 16-32
+# rows. From these sizes on, ``quantize_activation`` and ``FastNVFP4Linear`` hand the input to
+# ``nvfp4_inference_blackwell`` unchanged (same bits); ``launch_amax`` / ``launch_quant`` never delegate.
+DELEGATE_FROM = {"none": 1 << 23, "hadamard_b16": None, "adaptive_butterfly_b16": 1 << 21}
+DELEGATE_MIN_K = {"none": 0, "hadamard_b16": 0, "adaptive_butterfly_b16": 2048}
 STASH_MAX_BYTES = 16 << 20  # largest FP32 rotated stash (M * K * 4 bytes) of the butterfly dynamic path
 
 
@@ -600,7 +605,7 @@ def _quant(x, M, K, packed_u8, scale, gs, workspace, n_part, rot, tables, pdl: b
 
 def quantizer_plan(M: int, K: int, rotation: str, static: bool = False) -> dict:
     """The launches that ``quantize_activation`` makes for an (M, K) input (for result records)."""
-    if delegated(M, K):
+    if delegated(M, K, rotation):
         return {"delegated_to": "nvfp4_inference_blackwell", **nb.quantizer_plan(M, K, rotation, static)}
     grid, pc, pc4, n_index, block, rows, pblock, warps = _pass2(M, K, rotation, not static,
                                                                0 if static else _n_partials(M, K, rotation))
@@ -690,14 +695,15 @@ def quantize_activation(x: Tensor, rotation: str = "none", tables=None,
         global_scale = global_scale.reshape(())
         if global_scale.dtype != torch.float32 or global_scale.device != x.device:
             raise ValueError("A static global scale must be a float32 tensor on the device of x")
-    if delegated(M, K):
+    if delegated(M, K, rotation):
         return nb._quantize(x, M, K, rotation, tables, global_scale)
     return _quantize(x, M, K, rotation, _public_tables(tables), global_scale).act
 
 
-def delegated(M: int, K: int) -> bool:
-    """True when an (M, K) activation goes through the C5-03 quantizer and ``torch._scaled_mm_v2``."""
-    return OPTIONS["delegate_large"] and M * K > DELEGATE_ABOVE
+def delegated(M: int, K: int, rotation: str) -> bool:
+    """True when an (M, K) activation of ``rotation`` goes through the C5-03 quantizer and ``torch._scaled_mm_v2``."""
+    limit = DELEGATE_FROM[rotation]
+    return OPTIONS["delegate_large"] and limit is not None and M * K >= limit and K >= DELEGATE_MIN_K[rotation]
 
 
 # ======================================================================================
@@ -914,7 +920,7 @@ class FastNVFP4Linear(nb.NVFP4Linear):
             return x.new_empty(*lead, self.out_features, dtype=self.out_dtype)
         if not x2.is_cuda or x2.dtype not in (torch.float32, torch.bfloat16, torch.float16):
             raise ValueError("NVFP4Linear needs a CUDA float32, bfloat16 or float16 input")
-        if delegated(M, self.in_features):
+        if delegated(M, self.in_features, self.rotation):
             return nb.NVFP4Linear.forward(self, x)
         plan = lt_plan(M, self.out_features, self.in_features, self.out_dtype, x2.device) \
             if OPTIONS["lt_gemm"] and self.out_dtype in _OUT_TYPES else None
@@ -1040,5 +1046,6 @@ class FastCrossInput(nn.Module):
 
 
 __all__ = ["FastNVFP4Linear", "FastCrossInput", "CROSS_TILE", "quantize_activation", "launch_amax", "launch_quant", "quantizer_plan",
-           "nvfp4_scaled_mm_lt", "lt_plan", "packed_tables", "LtPlan", "ROTATIONS", "MAX_PARTIALS", "PASS1_PROGRAMS", "OPTIONS", "delegated", "DELEGATE_ABOVE",
+           "nvfp4_scaled_mm_lt", "lt_plan", "packed_tables", "LtPlan", "ROTATIONS", "MAX_PARTIALS", "PASS1_PROGRAMS", "OPTIONS",
+           "delegated", "DELEGATE_FROM", "DELEGATE_MIN_K",
            "LT_WORKSPACE_LIMIT"]

@@ -151,6 +151,16 @@ SHAKEDOWN = {
     "parity": {"quick": True},
 }
 CANONICAL_PARITY_MIN_CASES = 279
+# A first canonical attempt (producer a4ebc54) measured everything and was rejected by its own validator: the
+# Part C kernel-count rule did not count the layers that C6-02 delegates to C5-03. The rule and the delegation
+# limits (now per rotation) were corrected, and the canonical result was measured again. The rejected payload and its log are kept
+# outside git (artifacts/c6_02_run_evidence/); their SHA-256 values are recorded here.
+SUPERSEDED_ATTEMPT = {
+    "producer_git_sha": "a4ebc54ab67bf32448e076706780377c8bc8915d",
+    "rejected_by": "part_c 50m: kernel launches per forward",
+    "rejected_canonical_a4ebc54.json": "33fabff660fea8da98c7fea98ff96975c88d098c826d5de9d642275e797efbb3",
+    "canonical_a4ebc54.log": "f58cbf162b8d867e08c2f874cbae49a553afc2ccf3f906085b8b7cd1b33de1bd",
+}
 
 
 def _require(condition, message: str) -> None:
@@ -261,6 +271,11 @@ def _inputs(device, M: int, N: int, K: int, seed: int):
     return x, W, angles
 
 
+def _delegation(M: int, K: int) -> dict:
+    """Per variant: does C6-02 hand this (M, K) input to the C5-03 path (``fs.delegated``)?"""
+    return {v: fs.delegated(M, K, VARIANT_ROTATION[v]) for v in VARIANTS}
+
+
 def summarize_part_a_row(row: dict) -> dict:
     """Per mode: every method's median ms and speedups; per variant C6-02 against C5-03 and BF16."""
     flops = 2.0 * row["m"] * row["n"] * row["k"]
@@ -310,7 +325,7 @@ def part_a_shape(device, M: int, N: int, K: int, t: dict, flush: Tensor, seed: i
     graphed, graph_orders = timing(graphs, t, t["squares_a"], flush)
     profile = kernel_profile({k: v for k, v in graphs.items() if k != "bf16_cublas"}, flush)
     row = {"m": M, "n": N, "k": K, "label": PART_A_LABELS.get((M, N, K), ""), "checks": checks,
-           "delegated_to_c5_03": fs.delegated(M, K), "lt_plan": plan.record(),
+           "delegated_to_c5_03": _delegation(M, K), "lt_plan": plan.record(),
            "plans": {v: {"c5_03": nb.quantizer_plan(M, K, VARIANT_ROTATION[v], v.endswith("static_gs")),
                          "c6_02": fs.quantizer_plan(M, K, VARIANT_ROTATION[v], v.endswith("static_gs"))}
                      for v in VARIANTS},
@@ -342,7 +357,7 @@ def ablation_shape(device, M: int, N: int, K: int, t: dict, flush: Tensor, seed:
     timed, orders = timing(graphs, t, t["squares_a"], flush)
     table = c503._timing_table(timed, "bf16_cublas")
     log(f"  A ablation ({M},{N},{K}) graph us: " + "  ".join(f"{k} {v['ms'] * 1e3:.2f}" for k, v in table.items()))
-    return {"m": M, "n": N, "k": K, "mode": "cuda_graph", "delegated_to_c5_03": fs.delegated(M, K),
+    return {"m": M, "n": N, "k": K, "mode": "cuda_graph", "delegated_to_c5_03": _delegation(M, K),
             "checks": checks, "williams_orders": orders, "timing": timed, "summary": table}
 
 
@@ -359,9 +374,10 @@ def part_a(device, protocol: dict, flush: Tensor, log) -> dict:
                       "rounds. `wall_ms`: host clock between synchronizes. c5_03_* is nvfp4_inference_blackwell "
                       "(pinned bytes) with torch._scaled_mm_v2; c6_02_* is nvfp4_small_shape_blackwell "
                       "(FastNVFP4Linear sharing the same NVFP4 weights) with the direct cuBLASLt call; both allocate "
-                      "their buffers per call. Inputs above fs.DELEGATE_ABOVE elements are delegated to the C5-03 "
-                      "path by design.",
-            "l2_flush_bytes": flush.numel(), "delegate_above_elements": fs.DELEGATE_ABOVE,
+                      "their buffers per call. Large inputs (fs.DELEGATE_FROM, fs.DELEGATE_MIN_K per rotation) are "
+                      "delegated to the C5-03 path by design.",
+            "l2_flush_bytes": flush.numel(), "delegate_from_elements": fs.DELEGATE_FROM,
+            "delegate_min_k": fs.DELEGATE_MIN_K,
             "shapes": rows, "ablation": ablation}
 
 
@@ -822,13 +838,16 @@ def summarize(payload: dict) -> dict:
     shapes = []
     for r in a["shapes"]:
         s = r["summary"]["cuda_graph"]
-        shapes.append({"mnk": [r["m"], r["n"], r["k"]], "label": r["label"], "delegated_to_c5_03": r["delegated_to_c5_03"],
+        shapes.append({"mnk": [r["m"], r["n"], r["k"]], "label": r["label"],
+                       "delegated_to_c5_03": r["delegated_to_c5_03"],
                        "bf16_cublas_ms": s["methods"]["bf16_cublas"]["ms"], "gemm_only": s["gemm_only"],
                        "cuda_graph": s["variants"], "eager": r["summary"]["eager"]["variants"]})
     cells = [(r["mnk"], v) for r in shapes for v in VARIANTS]
     beats = [[*m, v] for m, v in cells if next(x for x in shapes if x["mnk"] == m)["cuda_graph"][v]["c6_02_beats_bf16"]]
     trailing = [[*m, v] for m, v in cells if [*m, v] not in beats]
-    regressions = [[*r["mnk"], v] for r in shapes for v in VARIANTS if not r["cuda_graph"][v]["c6_02_faster_than_c5_03"]]
+    regressions = [[*r["mnk"], v] for r in shapes for v in VARIANTS
+                   if not r["cuda_graph"][v]["c6_02_faster_than_c5_03"] and not r["delegated_to_c5_03"][v]]
+    delegated = [[*r["mnk"], v] for r in shapes for v in VARIANTS if r["delegated_to_c5_03"][v]]
     target = next((r for r in shapes if r["mnk"] == [1024, 512, 1408]), None)
     profile = None
     if target is not None:
@@ -850,6 +869,7 @@ def summarize(payload: dict) -> dict:
                          m["fused_cross_mix_parity"].items()}} for name, m in c["models"].items()}
     return {"part_a_cuda_graph_cells_beating_bf16": [len(beats), len(cells)],
             "part_a_cuda_graph_trailing_bf16": trailing, "part_a_cuda_graph_regressions_vs_c5_03": regressions,
+            "part_a_cuda_graph_delegated_cells": delegated,
             "part_a": shapes, "part_a_1024x512x1408_kernel_us": profile,
             "part_a_ablation": [{"mnk": [x["m"], x["n"], x["k"]], "ms": {k: v["ms"] for k, v in x["summary"].items()}}
                                 for x in a["ablation"]],
@@ -864,13 +884,15 @@ def caveats(payload: dict) -> list[str]:
         "nvfp4_inference_blackwell.py (C5-03) is unchanged: the C5-03 and C6-01 validators pin its bytes, so the C6-02 "
         "fast path is the separate module nvfp4_small_shape_blackwell (drop-in, bit-identical operands and outputs).",
         f"Part A: C6-02 beats BF16 cuBLAS in {beats}/{cells} CUDA-graph cells; trailing cells: "
-        f"{s['part_a_cuda_graph_trailing_bf16'] or 'none'}; cells slower than C5-03: "
+        f"{s['part_a_cuda_graph_trailing_bf16'] or 'none'}; non-delegated cells slower than C5-03: "
         f"{s['part_a_cuda_graph_regressions_vs_c5_03'] or 'none'}. Each cell is one Williams-balanced session; "
         "cell-to-cell differences of about 1-2% are within the session-to-session spread measured while tuning (the "
         "GPU also drives the desktop).",
-        f"Inputs above {fs.DELEGATE_ABOVE} elements (here only 2048 x 8192) use the C5-03 quantizer and "
-        "torch._scaled_mm_v2 by design: there the DRAM-bound C5-03 2D tiles match or beat the C6-02 kernels (see the "
-        "c6_02_no_delegate ablation), so C6-02 and C5-03 run the same code at that shape.",
+        "Large inputs use the C5-03 quantizer and torch._scaled_mm_v2 by design (fs.delegated: none from 2^23 "
+        "elements, the butterfly from 2^21 elements with K >= 2048, never hadamard_b16): there the DRAM-bound C5-03 "
+        "2D tiles match or beat the C6-02 kernels (c6_02_no_delegate ablation at 2048 x 8192; the limits come from "
+        f"pre-run sweeps recorded in the module). Delegated cells run the same code as C5-03: "
+        f"{s['part_a_cuda_graph_delegated_cells'] or 'none'}; their C5-03/C6-02 differences are session noise.",
         "Part B: the elementwise kernel is aten::mul of the two FP32 tensor scales inside torch._scaled_mm_v2; the C6-02 "
         "quantizer writes alpha = global_scale * w_global (one rounded FP32 product, the same value) and the GEMM calls "
         "cublasLtMatmul with PyTorch's descriptor (1 MiB heuristic limit, device pointer mode). Equality with "
@@ -886,6 +908,10 @@ def caveats(payload: dict) -> list[str]:
         "input twice); sharing it would be a further model-level change, not measured here.",
         "The butterfly coefficients of FastNVFP4Linear live in a non-persistent (16, G, 4) buffer derived from the "
         "(cos, sin) tables; the public quantize_activation keeps the (G, 4, 8) table API.",
+        f"Study history: a first canonical attempt from {SUPERSEDED_ATTEMPT['producer_git_sha'][:7]} was rejected by "
+        f"its validator ({SUPERSEDED_ATTEMPT['rejected_by']}: delegated layers were not counted); this result was "
+        "measured again after that rule and the per-rotation delegation limits were corrected. The rejected payload "
+        "and log are retained outside git with the SHA-256 values in SUPERSEDED_ATTEMPT.",
     ]
     return out
 
@@ -1178,7 +1204,7 @@ def _validate_part_a(payload: dict) -> None:
     _require([[r["m"], r["n"], r["k"]] for r in a["shapes"]] == protocol["part_a"]["shapes"], "part_a shapes differ")
     for r in a["shapes"]:
         where = f"part_a {r['m']}x{r['n']}x{r['k']}"
-        _require(r["delegated_to_c5_03"] == fs.delegated(r["m"], r["k"]), f"{where}: delegation record")
+        _require(r["delegated_to_c5_03"] == _delegation(r["m"], r["k"]), f"{where}: delegation record")
         expected_checks = {f"{GEMM_ONLY[1]}_equals_public_bitwise", *(f"{v}_c6_02_operands_equal_reference"
                                                                       for v in VARIANTS),
                            *(f"{v}_c6_02_output_equals_c5_03_bitwise" for v in VARIANTS)}
@@ -1189,7 +1215,8 @@ def _validate_part_a(payload: dict) -> None:
                              r[f"{mode}_williams_orders"], f"{where}/{mode}")
         _require(set(r["cuda_graph_kernel_profile"]) == set(PART_A_METHODS) - {"bf16_cublas"}, f"{where}: profiles")
         for method, kernels in r["cuda_graph_kernel_profile"].items():
-            _validate_profile(method, kernels, r["delegated_to_c5_03"], where)
+            variant = method.split("_", 2)[2] if method.startswith(IMPLS) else None
+            _validate_profile(method, kernels, bool(variant and r["delegated_to_c5_03"][variant]), where)
         _close(summarize_part_a_row(r), r["summary"], f"{where}.summary")
     _require([[x["m"], x["n"], x["k"]] for x in a["ablation"]] == protocol["part_a"]["ablation_shapes"],
              "part_a ablation shapes differ")
@@ -1249,14 +1276,24 @@ def _validate_part_c(payload: dict) -> None:
         layers = row["nvfp4_layers"]
         old, new = kinds["c5_03_had_b16"], kinds["c6_02_had_b16"]
         fused, c601 = kinds["c6_02_fused_cross_full_butterfly_b16"], kinds["c6_01_cross_full_butterfly_b16"]
-        # The BF16 parts of the model launch their own elementwise products; the NVFP4 layers differ by one each.
+        had, bfly = _delegated_layers(row, "hadamard_b16"), _delegated_layers(row, "adaptive_butterfly_b16")
+        # The BF16 parts of the model launch their own elementwise products; every NVFP4 layer on the
+        # torch._scaled_mm_v2 path (C5-03, or delegated by C6-02) adds one.
         _require(old.get("fp4_gemm") == new.get("fp4_gemm") == fused.get("fp4_gemm") == c601.get("fp4_gemm") == layers
-                 and old.get("scale_product", 0) - new.get("scale_product", 0) == layers
-                 and fused.get("scale_product", 0) == new.get("scale_product", 0)
+                 and old.get("scale_product", 0) - new.get("scale_product", 0) == layers - had
+                 and fused.get("scale_product", 0) - new.get("scale_product", 0) == bfly - had
                  and fused.get("cross_mix") == layers and "cross_mix" not in c601
                  and old.get("quant") == new.get("quant") == fused.get("quant") == layers,
                  f"{where}: kernel launches per forward")
         _close(summarize_part_c_model(row), row["summary"], f"{where}.summary")
+
+
+def _delegated_layers(row: dict, rotation: str) -> int:
+    """NVFP4 layers of a Part C model whose (tokens, in_features) input C6-02 delegates to the C5-03 path."""
+    c = row["config"]
+    M = row["tokens_per_call"]
+    per_block = [c["width"]] * 4 + [c["hidden"]]  # qkv, out, gate, up read the width; down reads the hidden size
+    return c["layers"] * sum(fs.delegated(M, K, rotation) for K in per_block)
 
 
 def _validate_sync(payload: dict) -> None:
