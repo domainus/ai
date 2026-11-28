@@ -9,9 +9,13 @@ with tampering probes) and the committed canonical result, whose SHA-256 is pinn
 """
 
 import copy
+import gc
 import hashlib
+import io
 import json
 import math
+import threading
+import weakref
 from pathlib import Path
 
 import pytest
@@ -31,7 +35,10 @@ if CUDA:
     from research.quant_ptq import rotated_qat as rq
 
 CANONICAL_RESULT = ROOT / "results" / "cycle6_c6_02_nvfp4_small_shape_fusion.json"
-CANONICAL_SHA256 = "ceff189c3298905b355705dab89532d3a80bbeaf7343a7d27c804865f83949a2"
+# The v2 canonical result and its producer commit. ``None`` only in the producer commit itself, before the
+# canonical run (the result file does not exist there); the result commit pins both.
+CANONICAL_SHA256 = None
+CANONICAL_PRODUCER = None
 ROTS = ("none", "hadamard_b16", "adaptive_butterfly_b16")
 M_SIZES = (1, 37, 128, 129, 256, 512)
 K_SIZES = (64, 80, 512, 768, 1408, 2048)
@@ -325,6 +332,189 @@ def test_first_launch_or_plan_during_capture_is_refused():
             fs.lt_plan(5, 160, 4096 + 96, torch.bfloat16, x.device)
 
 
+@needs_fp4
+def test_concurrent_direct_gemm_submissions_are_exact():
+    """Two host threads, own streams and scales, one shared cached plan: every output equals its serial reference."""
+    M, N, K = 32, 128, 256
+    work = []
+    for seed in (1, 2):
+        g = torch.Generator(device="cuda").manual_seed(seed)
+        x = (torch.randn(M, K, generator=g, device="cuda") * 10.0 ** seed).to(torch.bfloat16)
+        layer = nb.NVFP4Linear.from_weight(torch.randn(N, K, generator=g, device="cuda") * 0.02 * seed, "none")
+        a = nb.quantize_activation(x, "none")
+        alpha = (a.global_scale * layer.w_global).reshape(())
+        ref = nb.nvfp4_scaled_mm_public(a, layer.w_packed, layer.w_scale, layer.w_global)
+        assert _bits(fs.nvfp4_scaled_mm_lt(a, layer.w_packed, layer.w_scale, alpha), ref)  # warm-up, serial
+        work.append((a, layer, alpha, ref))
+    assert not torch.equal(work[0][0].scale, work[1][0].scale)
+    torch.cuda.synchronize()
+    iters = 500
+    for _ in range(2):
+        barrier, bad, errors = threading.Barrier(2), [None, None], []
+
+        def run(i):
+            try:
+                a, layer, alpha, ref = work[i]
+                stream = torch.cuda.Stream()
+                with torch.cuda.stream(stream):
+                    wrong = torch.zeros((), dtype=torch.int64, device="cuda")
+                    for _ in range(iters):
+                        barrier.wait()
+                        out = fs.nvfp4_scaled_mm_lt(a, layer.w_packed, layer.w_scale, alpha)
+                        wrong += (out.view(torch.int16) != ref.view(torch.int16)).any()
+                stream.synchronize()
+                bad[i] = int(wrong)
+            except BaseException as exc:  # noqa: BLE001 - reported below
+                errors.append(exc)
+                barrier.abort()
+
+        threads = [threading.Thread(target=run, args=(i,)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors and bad == [0, 0]
+
+
+@needs_fp4
+@pytest.mark.parametrize("K,Ms", [(2048, (1023, 1024)), (256, (6, 37))])
+def test_butterfly_load_state_dict_rebuilds_the_packed_tables(K, Ms):
+    """load_state_dict from a layer with other angles: native and delegated forwards follow the loaded tables."""
+    rot = "adaptive_butterfly_b16"
+    g = torch.Generator(device="cuda").manual_seed(K)
+    src = nb.NVFP4Linear.from_weight(torch.randn(128, K, generator=g, device="cuda") * 0.02, rot, _angles(K, 11))
+    fast = fs.FastNVFP4Linear.from_weight(torch.randn(128, K, generator=g, device="cuda") * 0.02, rot, _angles(K, 12))
+    if K == 2048:  # both sides of the butterfly delegation limit
+        assert not fs.delegated(1023, K, rot) and fs.delegated(1024, K, rot)
+    ptr = fast.cos_sin.data_ptr()
+    assert fast.load_state_dict(src.state_dict()) is not None
+    assert torch.equal(fast.cos_sin, fs.packed_tables(src.cos, src.sin)) and fast.cos_sin.data_ptr() == ptr
+    xs = [torch.randn(M, K, generator=g, device="cuda").to(torch.bfloat16) for M in Ms]
+    for x in xs:
+        assert _bits(fast(x), src(x)), x.shape
+    buf = io.BytesIO()
+    torch.save(torch.nn.Sequential(src).state_dict(), buf)
+    buf.seek(0)
+    other = torch.nn.Sequential(fs.FastNVFP4Linear.from_weight(torch.randn(128, K, device="cuda"), rot, _angles(K, 13)))
+    other.load_state_dict(torch.load(buf, weights_only=True))
+    for x in xs:
+        assert _bits(other(x), src(x)), x.shape
+
+
+@needs_fp4
+def test_lt_plan_device_alias_workspace_contract_and_close(monkeypatch):
+    M, N, K = 37, 96, 64
+    x = torch.randn(M, K, device="cuda").to(torch.bfloat16)
+    layer = nb.NVFP4Linear.from_weight(torch.randn(N, K, device="cuda") * 0.02, "none")
+    a = nb.quantize_activation(x, "none")
+    alpha = (a.global_scale * layer.w_global).reshape(())
+    ref = nb.nvfp4_scaled_mm_public(a, layer.w_packed, layer.w_scale, layer.w_global)
+    here = torch.device("cuda", torch.cuda.current_device())
+    cached = fs.lt_plan(M, N, K, torch.bfloat16, torch.device("cuda"))
+    assert cached is fs.lt_plan(M, N, K, torch.bfloat16, here) is fs.lt_plan(M, N, K, torch.bfloat16, "cuda")
+    assert fs._device_index(torch.device("cuda")) == fs._device_index(here) == here.index
+    plan = fs.LtPlan(M, N, K, torch.bfloat16, torch.device("cuda"))  # a private plan, not cached
+    plan.workspace_bytes = 4096  # simulate an algorithm that needs a workspace
+    out = torch.empty((M, N), dtype=torch.bfloat16, device="cuda")
+    for bad in (None, torch.empty(4095, dtype=torch.uint8, device="cuda"), torch.empty(4096, device="cuda"),
+                torch.empty(8192, dtype=torch.uint8, device="cuda")[::2], torch.empty(4096, dtype=torch.uint8)):
+        with pytest.raises(ValueError, match="workspace"):
+            plan(a, layer.w_packed, layer.w_scale, alpha, out, bad)
+    plan(a, layer.w_packed, layer.w_scale, alpha, out, torch.empty(4096, dtype=torch.uint8, device="cuda"))
+    assert _bits(out, ref)
+    plan.close()
+    plan.close()  # idempotent
+    with pytest.raises(RuntimeError, match="closed"):
+        plan(a, layer.w_packed, layer.w_scale, alpha, out, torch.empty(4096, dtype=torch.uint8, device="cuda"))
+    seen, call = [], fs.LtPlan.__call__
+
+    def spy(self, *args, **kwargs):
+        seen.append(args[5] if len(args) > 5 else kwargs.get("workspace"))
+        return call(self, *args, **kwargs)
+
+    monkeypatch.setattr(fs.LtPlan, "__call__", spy)
+    monkeypatch.setattr(cached, "workspace_bytes", 4096)
+    got = fs.nvfp4_scaled_mm_lt(a, layer.w_packed, layer.w_scale, alpha)  # the helper supplies the workspace
+    assert seen[-1] is not None and seen[-1].dtype == torch.uint8 and seen[-1].nbytes >= 4096 and _bits(got, ref)
+
+
+@needs_fp4
+def test_lt_plan_cache_is_a_bounded_lru(monkeypatch):
+    monkeypatch.setattr(fs, "LT_PLAN_CACHE_MAX", 2)
+    fs.clear_lt_plan_cache()
+    K, N = 64, 256
+    p1, p2 = fs.lt_plan(1, N, K, torch.bfloat16, "cuda"), fs.lt_plan(2, N, K, torch.bfloat16, "cuda")
+    assert fs.lt_plan(1, N, K, torch.bfloat16, "cuda") is p1  # p1 is now the most recent
+    p3 = fs.lt_plan(3, N, K, torch.bfloat16, "cuda")
+    keys = [k[0] for k in fs._LT_PLANS]
+    assert keys == [1, 3] and not p2.closed  # evicted, not closed: a caller may still hold it
+    x = torch.randn(2, K, device="cuda").to(torch.bfloat16)
+    layer = nb.NVFP4Linear.from_weight(torch.randn(N, K, device="cuda") * 0.02, "none")
+    a = nb.quantize_activation(x, "none")
+    alpha = (a.global_scale * layer.w_global).reshape(())
+    out = torch.empty((2, N), dtype=torch.bfloat16, device="cuda")
+    assert _bits(p2(a, layer.w_packed, layer.w_scale, alpha, out),
+                 nb.nvfp4_scaled_mm_public(a, layer.w_packed, layer.w_scale, layer.w_global))
+    dropped = weakref.ref(p2)
+    del p2
+    gc.collect()
+    assert dropped() is None  # its last reference went: the descriptor and layouts were destroyed
+    assert fs.clear_lt_plan_cache() == 2 and p1.closed and p3.closed and not fs._LT_PLANS
+    with pytest.raises(RuntimeError, match="closed"):
+        p1(a, layer.w_packed, layer.w_scale, alpha, out)
+
+
+@needs_fp4
+def test_tile_overrides_take_effect_without_stale_plans():
+    M, K = 17, 256
+    x = torch.randn(M, K, device="cuda")
+    ref = nb.quantize_activation_ref(x, "none")
+    default1, default2 = fs._pass1(M, K, "none"), fs._pass2(M, K, "none", True, fs._n_partials(M, K, "none"))
+    assert default1[3] == 64
+    fs.TILES["pass1"][(M, K, "none")] = (32, 1, 1, 512)
+    fs.TILES["pass2"][(M, K, "none")] = (64, 1, 2)
+    try:
+        assert fs._pass1(M, K, "none")[3] == 32 and fs.quantizer_plan(M, K, "none")["pass1_tile"] == [32, 1, 1]
+        assert fs.quantizer_plan(M, K, "none")["pass2_tile"] == [64, 1, 2]
+        assert _same(fs.quantize_activation(x), ref)
+    finally:
+        del fs.TILES["pass1"][(M, K, "none")], fs.TILES["pass2"][(M, K, "none")]
+    assert fs._pass1(M, K, "none") == default1
+    assert fs._pass2(M, K, "none", True, fs._n_partials(M, K, "none")) == default2
+
+
+@needs_fp4
+def test_options_scope_is_isolated_per_thread_and_nests():
+    barrier, seen, errors = threading.Barrier(2), {}, []
+
+    def run(name, value):
+        try:
+            with fs.options_scope(pdl=value):
+                barrier.wait()
+                seen[name] = (fs._option("pdl"), fs.quantizer_plan(129, 768, "none")["pdl"])
+                barrier.wait()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+            barrier.abort()
+
+    threads = [threading.Thread(target=run, args=args) for args in (("a", False), ("b", True))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors and seen == {"a": (False, False), "b": (True, True)}
+    assert fs.OPTIONS["pdl"] is True and fs._option("pdl") is True
+    with b.options(pdl=False):
+        with fs.options_scope(vector_io=False):
+            assert fs._option("pdl") is False and fs._option("vector_io") is False
+        assert fs._option("vector_io") is True and fs._option("pdl") is False
+    assert fs._option("pdl") is True and fs.OPTIONS == {"pdl": True, "vector_io": True, "lt_gemm": True,
+                                                        "stash": False, "delegate_large": True}
+    with pytest.raises(KeyError):
+        with fs.options_scope(unknown=1):
+            pass
+
+
 # ------------------------------------------------------------------ fused cross-block mix
 @needs_fp4
 @pytest.mark.parametrize("family", ("hadamard_b64", "kron_hadamard_full", "cross_full_butterfly_b16"))
@@ -362,6 +552,51 @@ def test_fused_cross_mix_chunks_many_blocks_and_rejects_bad_inputs():
         fs.FastCrossInput(layer, rq.CrossMix(K, 16))
     with pytest.raises(ValueError):
         fused.mixed(x.cpu())
+
+
+@needs_fp4
+@pytest.mark.parametrize("family", ("kron_hadamard_full", "cross_full_butterfly_b16"))
+def test_exact_cross_mix_matches_crossinput_at_the_w2048_down_projection(family):
+    """K = 5632 (w2048_6l down projection), 2048 rows: exact mode is bit-identical to rotated_qat.CrossInput."""
+    K = 5632
+    cross = rq.make_cross(rq.FAMILIES[family][0], K)
+    rot = rq.kernel_rotation(family)
+    W = torch.randn(2048, K, device="cuda") * 0.02
+    layer = fs.FastNVFP4Linear.from_layer(nb.NVFP4Linear.from_weight(
+        cross.forward(W), rot, _angles(K) if rot == "adaptive_butterfly_b16" else None))
+    exact, eager = fs.FastCrossInput(layer, cross, exact=True), rq.CrossInput(layer, cross)
+    x = torch.randn(4, 512, K, device="cuda").to(torch.bfloat16)
+    assert exact.exact and not fs.FastCrossInput(layer, cross).exact
+    assert _bits(exact.mixed(x), cross.forward(x.float()).reshape(-1, K))
+    assert _bits(exact(x), eager(x))
+
+
+@needs_fp4
+def test_cross_mix_matrices_stay_fp32_under_dtype_conversion():
+    K = 1408
+    cross = rq.make_cross("full", K)
+    W = torch.randn(256, K, device="cuda") * 0.02
+
+    def build():
+        return fs.FastNVFP4Linear.from_layer(nb.NVFP4Linear.from_weight(cross.forward(W), "hadamard_b16"))
+
+    x = torch.randn(1024, K, device="cuda").to(torch.bfloat16)
+    base = fs.FastCrossInput(build(), cross)
+    want_mix, want_out = base.mixed(x), base(x)
+    assert (want_mix - cross.forward(x.float())).abs().max().item() < 1e-6
+    conversions = (lambda m: m.bfloat16(), lambda m: m.half(), lambda m: m.to(dtype=torch.bfloat16),
+                   lambda m: m.to("cuda", torch.float16), lambda m: m.cpu().cuda())
+    built = [conv(fs.FastCrossInput(build(), cross)) for conv in conversions]  # after construction
+    built += [fs.FastCrossInput(build().bfloat16(), cross), fs.FastCrossInput(build().half(), cross).half()]  # before
+    for m in built:
+        assert m.h.dtype == m.mix.dtype == torch.float32 and m.h.is_cuda and m.mix.is_cuda
+        assert _bits(m.mixed(x), want_mix) and _bits(m(x), want_out)
+    moved = fs.FastCrossInput(build(), cross).cpu()
+    assert moved.h.device.type == "cpu" and moved.h.dtype == torch.float32
+    broken = fs.FastCrossInput(build(), cross)
+    broken._buffers["mix"] = broken.mix.bfloat16()
+    with pytest.raises(RuntimeError, match="float32"):
+        broken.mixed(x)
 
 
 # ------------------------------------------------------------------ driver helpers and guards
@@ -436,6 +671,15 @@ def test_atomic_writer_guards(sandbox, tmp_path):
         b.verify_canonical_output_path(tmp_path / "plain.json")
     with pytest.raises(ValueError, match="outside"):
         b.write_json_atomic(tmp_path / "cycle6_c6_02_x.json", payload)  # a reserved name outside ROOT
+    b.write_json_atomic(b.CANONICAL_OUTPUT, payload, canonical_dest=True)
+    with pytest.raises(FileExistsError):  # no-replace publication
+        b.write_json_atomic(b.CANONICAL_OUTPUT, {"trial": 2}, canonical_dest=True)
+    assert json.loads(b.CANONICAL_OUTPUT.read_text()) == payload and _leftovers(sandbox / "results") == []
+    plain = sandbox / "results" / "plain.json"
+    b.write_json_atomic(plain, {"trial": 1})
+    b.write_json_atomic(plain, {"trial": 2})  # ordinary outputs may be replaced
+    assert json.loads(plain.read_text()) == {"trial": 2}
+    b.CANONICAL_OUTPUT.unlink()
     (sandbox / "results").rename(sandbox / "real")
     (sandbox / "results").symlink_to(sandbox / "real", target_is_directory=True)
     with pytest.raises(ValueError, match="symlink"):
@@ -465,6 +709,10 @@ def test_shakedown_is_valid_and_complete(shakedown):
     assert s["pareto"] == {}  # the tiny model has no C6-01 cell
     with pytest.raises(ValueError, match="canonical"):
         b.validate_results(copy.deepcopy(s), canonical=True)
+
+
+def _first_model(payload: dict) -> dict:
+    return next(iter(payload["part_c"]["models"].values()))
 
 
 def _flip(record: dict, key: str) -> None:
@@ -510,13 +758,36 @@ TAMPERS = {
     "part b exact": lambda p: p["part_b"]["exactness"][0].__setitem__("bitwise_equal_public", False),
     "part b trace": lambda p: p["part_b"]["traces"]["cublaslt_fused_alpha"]["kernel_kinds"].append("scale_product"),
     "part b heuristic": lambda p: p["part_b"]["heuristic"]["selected"].__setitem__("tile_id", -1),
-    "part c check": lambda p: p["part_c"]["models"]["tiny"]["checks"].__setitem__(
-        "had_b16_c6_02_logits_equal_c5_03_bitwise", False),
-    "part c parity": lambda p: p["part_c"]["models"]["tiny"]["fused_cross_mix_parity"]["hadamard_b64"].__setitem__(
+    # The five bypasses that the v1 validator accepted (audit, "Offline validation and artifact handling"):
+    "part b heuristic row": lambda p: p["part_b"]["heuristic"]["algorithms"][0].update(bitwise_equal_public=False,
+                                                                                      cuda_graph_ms=-1.0),
+    "part b heuristic workspace": lambda p: p["part_b"]["heuristic"]["algorithms"][0].__setitem__("workspace_bytes", -1),
+    "part b empty raw trace": lambda p: p["part_b"]["traces"]["cublaslt_fused_alpha"].__setitem__("kernels", []),
+    "part b direct aten mul": lambda p: p["part_b"]["traces"]["c6_02_layer"]["aten_ops"].append("aten::mul"),
+    "part b raw kind": lambda p: p["part_b"]["traces"]["torch_scaled_mm_v2"]["kernels"].__setitem__(0, "nvjet_bf16"),
+    "ablation delegation empty": lambda p: p["part_a"]["ablation"][-1].__setitem__("delegated_to_c5_03", {}),
+    "profile count": lambda p: next(iter(p["part_a"]["shapes"][0]["cuda_graph_kernel_profile"]["c6_02_none"].values()))
+    .__setitem__("count", 0),
+    "profile us": lambda p: next(iter(p["part_a"]["shapes"][0]["cuda_graph_kernel_profile"]["c6_02_none"].values()))
+    .__setitem__("us", -1.0),
+    "part c negative logits error": lambda p: _first_model(p)["fused_cross_mix_parity"]["kron_hadamard_full"]
+    .__setitem__("logits_rel_diff_vs_c6_01", -1.0),
+    "part c impossible logits count": lambda p: _first_model(p)["fused_cross_mix_parity"]["kron_hadamard_full"]
+    .update(logits_numel=1, logits_mismatches=10 ** 8, logits_bitwise_equal_c6_01=False),
+    "part c mixed count": lambda p: _first_model(p)["fused_cross_mix_parity"]["hadamard_b64"].__setitem__(
+        "mixed_values", 1),
+    "part c zero biconditional": lambda p: _first_model(p)["fused_cross_mix_parity"]["hadamard_b64"].__setitem__(
+        "layers_exact", _first_model(p)["fused_cross_mix_parity"]["hadamard_b64"]["layers_exact"] - 1),
+    "part c compiled parity": lambda p: _first_model(p)["bf16_compiled_parity"].__setitem__("logits_finite", False),
+    "part c compiled timing": lambda p: _first_model(p)["timing"]["bf16_compiled"]["gpu"].__setitem__("median_ms", -1.0),
+    "part c compiled profile": lambda p: _first_model(p)["kernel_kinds_per_forward"]["bf16_compiled"].__setitem__(
+        "fp4_gemm", 1.0),
+    "part c trained eval": lambda p: p["part_c"]["compiled_bf16_trained_eval"].__setitem__("x", {}),
+    "part c check": lambda p: _first_model(p)["checks"].__setitem__("had_b16_c6_02_logits_equal_c5_03_bitwise", False),
+    "part c parity": lambda p: _first_model(p)["fused_cross_mix_parity"]["hadamard_b64"].__setitem__(
         "mixed_mismatches", -1),
-    "part c summary": lambda p: p["part_c"]["models"]["tiny"]["summary"]["wide"]["hadamard_b64"].__setitem__(
-        "c6_02_fused_ms", 1.0),
-    "part c kernels": lambda p: p["part_c"]["models"]["tiny"]["kernel_kinds_per_forward"]["c6_02_had_b16"].__setitem__(
+    "part c summary": lambda p: _first_model(p)["summary"]["wide"]["hadamard_b64"].__setitem__("c6_02_fused_ms", 1.0),
+    "part c kernels": lambda p: _first_model(p)["kernel_kinds_per_forward"]["c6_02_had_b16"].__setitem__(
         "scale_product", 99.0),
     "summary": lambda p: p["summary"].__setitem__("part_a_cuda_graph_cells_beating_bf16", [8, 8]),
     "caveats": lambda p: p["caveats"].append("x"),
@@ -535,6 +806,8 @@ def test_validator_rejects_tampering_of_a_shakedown(shakedown, name):
 # ------------------------------------------------------------------ the committed canonical result
 @pytest.fixture(scope="module")
 def canonical():
+    if CANONICAL_SHA256 is None:  # the producer commit, before its canonical run
+        pytest.skip("the v2 canonical result is pinned in the commit that adds it")
     data = CANONICAL_RESULT.read_bytes()
     assert hashlib.sha256(data).hexdigest() == CANONICAL_SHA256
     return json.loads(data)
@@ -550,22 +823,77 @@ def test_committed_canonical_result_is_pinned_and_valid(canonical):
     assert payload["kernel_parity"]["cases"] >= b.CANONICAL_PARITY_MIN_CASES
     assert payload["kernel_parity"]["bitwise_failures"] == []
     assert [r["mnk"] for r in payload["summary"]["part_a"]] == c503.PART_A_SHAPES
-    assert set(payload["pareto"]) == {"50m", "120m"}
+    assert producer == CANONICAL_PRODUCER and payload["schema_version"] == "cycle6_c6_02.v2"
+    assert set(payload["pareto"]) == {"50m", "120m"} and set(payload["part_c"]["models"]) == {"50m", "120m", "w2048_6l"}
+    for preset, p in payload["pareto"].items():
+        assert "bf16_compiled" in [x["method"] for x in p["points"]] and p["frontier_vs_bf16_graph"]
+        trained = payload["part_c"]["compiled_bf16_trained_eval"][preset]
+        assert [r["seed"] for r in trained["seeds"]] == [1, 2, 3] and trained["test_split_sha256"] == b.C6_01_TEST_SHA256
+    for name, m in payload["part_c"]["models"].items():
+        assert "bf16_compiled" in m["timing"] and m["bf16_compiled_parity"]["logits_finite"] is True
+        assert m["summary"]["methods"]["c6_02_had_b16"]["speedup_vs_bf16_compiled"] > 0
+    assert not any("near-0 parity" in c for c in payload["caveats"])
+    assert any(c.startswith("Fused cross-mix fidelity, w2048_6l") and "latency only" in c for c in payload["caveats"])
+
+
+def _seed0(payload: dict) -> dict:
+    return payload["part_c"]["compiled_bf16_trained_eval"]["50m"]["seeds"][0]
+
+
+CANONICAL_TAMPERS = {
+    "trained checkpoint hash": lambda p: _seed0(p).__setitem__("checkpoint_sha256", "0" * 64),
+    "trained nll": lambda p: _seed0(p).__setitem__("test_nll", _seed0(p)["test_nll"] + 0.01),
+    "trained windows": lambda p: _seed0(p).__setitem__("windows", 3905),
+    "trained split": lambda p: p["part_c"]["compiled_bf16_trained_eval"]["120m"].__setitem__("test_split_sha256", "0" * 64),
+    "pareto frontier vs graph": lambda p: p["pareto"]["50m"]["frontier_vs_bf16_graph"].pop(),
+    "pareto compiled nll": lambda p: next(x for x in p["pareto"]["120m"]["points"] if x["method"] == "bf16_compiled")
+    .__setitem__("test_nll", 9.0),
+    "w2048 fidelity": lambda p: p["summary"]["part_c"]["w2048_6l"]["fused_cross_mix_fidelity"].__setitem__(
+        "kron_hadamard_full", "logits_bitwise_equal_c6_01"),
+}
+
+
+@needs_fp4
+@pytest.mark.parametrize("name", sorted(CANONICAL_TAMPERS))
+def test_validator_rejects_canonical_only_tampering(canonical, name):
+    with pytest.raises(ValueError):
+        b.validate_results(_tamper(canonical, CANONICAL_TAMPERS[name]), canonical=True)
+
+
+@needs_fp4
+def test_validator_rejects_the_result_commit_as_producer(canonical):
+    """The v1 validator accepted the source-identical result commit as producer (with its recomputed config hash)."""
+    log = c503._git("log", "-1", "--format=%H", "--", b.RESULT_REPO_PATH)
+    result_commit = log.stdout.decode().strip()
+    assert c503._is_hex(result_commit, 40) and result_commit != canonical["meta"]["git_sha"]
+    assert b._matches_current_summary_code(result_commit)  # same summary bytes: only the tree check tells them apart
+
+    def substitute(p):
+        p["meta"]["git_sha"] = result_commit
+        p["run_config_hash"] = b.run_config_hash(p["shakedown"], p["protocol"], p["meta"]["code_sha256"], result_commit,
+                                                 p["meta"]["environment"])
+
+    with pytest.raises(ValueError, match="already contains"):
+        b.validate_results(_tamper(canonical, substitute), canonical=True)
+
+
+@needs_fp4
+def test_superseded_receipts(tmp_path):
+    verified = b.verify_superseded_receipts()
+    assert verified[f"a716333:{b.RESULT_REPO_PATH}"] == "verified"  # the v1 result blob in git history
+    assert len(b.SUPERSEDED_ATTEMPTS) == 2 and b.SUPERSEDED_ATTEMPTS[1]["receipts"][
+        "superseded_canonical_47cdedd.json"] == "ceff189c3298905b355705dab89532d3a80bbeaf7343a7d27c804865f83949a2"
+    present = [k for k, v in verified.items() if v == "verified" and not k.startswith("a716333")]
+    assert set(present) <= {n for a in b.SUPERSEDED_ATTEMPTS for n in a["receipts"]}
+    (tmp_path / "canonical_a4ebc54.log").write_text("tampered\n")
+    with pytest.raises(ValueError, match="receipt"):
+        b.verify_superseded_receipts(tmp_path)
 
 
 @needs_fp4
 @pytest.mark.parametrize("name", sorted(TAMPERS))
 def test_validator_rejects_tampering_of_the_canonical_result(canonical, name):
-    if name == "part c check" or name.startswith("part c"):  # the canonical models are 50m, 120m, w2048_6l
-        fn = {"part c check": lambda p: p["part_c"]["models"]["50m"]["checks"].__setitem__(
-            "had_b16_c6_02_logits_equal_c5_03_bitwise", False),
-              "part c parity": lambda p: p["part_c"]["models"]["120m"]["fused_cross_mix_parity"]["hadamard_b64"]
-              .__setitem__("mixed_mismatches", -1),
-              "part c summary": lambda p: p["part_c"]["models"]["50m"]["summary"]["wide"]["hadamard_b64"].__setitem__(
-                  "c6_02_fused_ms", 1.0),
-              "part c kernels": lambda p: p["part_c"]["models"]["w2048_6l"]["kernel_kinds_per_forward"]["c6_02_had_b16"]
-              .__setitem__("scale_product", 99.0)}[name]
-    elif name == "canonical flag":
+    if name == "canonical flag":
         fn = lambda p: p.__setitem__("canonical", False)  # noqa: E731
     else:
         fn = TAMPERS[name]

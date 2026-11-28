@@ -27,13 +27,20 @@ GEMM (``nvfp4_scaled_mm_lt``)
     the same value) next to the tensor scale, and the GEMM calls ``cublasLtMatmul`` directly (ctypes)
     with the matmul descriptor, layouts, 1 MiB workspace limit and first heuristic algorithm that
     PyTorch uses. The output equals ``nvfp4_scaled_mm_public`` bit for bit (checked by the tests and the
-    C6-02 benchmark). Plans whose heuristic needs a workspace fall back to ``_scaled_mm_v2``.
+    C6-02 benchmark). In ``FastNVFP4Linear``, plans whose heuristic needs a workspace fall back to
+    ``_scaled_mm_v2``; ``nvfp4_scaled_mm_lt`` allocates the workspace instead. A per-plan lock makes the
+    scale-pointer update and the submission one host section (concurrent threads on their own streams).
+    Plans are an LRU cache of ``LT_PLAN_CACHE_MAX`` entries (``clear_lt_plan_cache`` closes them).
 
 Cross-block mix (``FastCrossInput``)
     ``rotated_qat.CrossInput`` runs the C6-01 cross-block mix as ``x.float()`` and two batched cuBLAS
     products (50-110 us per layer at 1024 rows). One Triton kernel reads the input directly and computes
     the same two contractions with the two-half FMA order of the cuBLAS ``gemmSN`` kernels. That order
-    gives the same FP32 bits wherever cuBLAS uses it (measured); elsewhere results differ by rounding.
+    gives the same FP32 bits wherever cuBLAS uses it (measured); elsewhere results differ by rounding,
+    which can change FP4 codes (a latency path, not exact; ``exact=True`` uses the reference mix).
+
+Tuning state: ``options_scope`` overrides ``OPTIONS`` per context (``contextvars``); ``TILES`` overrides
+take effect on the next call (the launch-plan caches are keyed on the resolved tile).
 
 Numerics are those of ``nvfp4_inference_blackwell`` (IEEE ``div_rn``, no FMA contraction, native
 ``cvt.rn.satfinite.e2m1x2.f32`` with NaN mapped to a signed zero, E4M3 via ``cvt.rn.satfinite``).
@@ -45,8 +52,12 @@ builds the cuBLASLt plan).
 
 from __future__ import annotations
 
+import collections
+import contextlib
+import contextvars
 import ctypes
 import functools
+import threading
 from pathlib import Path
 from typing import NamedTuple
 
@@ -67,12 +78,39 @@ PASS1_PROGRAMS = 512
 # fused alpha, the rotated FP32 stash of the dynamic butterfly (off: measured slower), and the delegation of
 # large inputs to C5-03.
 OPTIONS = {"pdl": True, "vector_io": True, "lt_gemm": True, "stash": False, "delegate_large": True}
+# Scoped overrides of ``OPTIONS`` (``options_scope``): a ``ContextVar``, so concurrent threads or tasks that tune
+# different settings never see each other's changes. ``OPTIONS`` itself stays the process-wide default.
+_OPTION_OVERRIDES: contextvars.ContextVar[dict | None] = contextvars.ContextVar("c6_02_options", default=None)
+
+
+def _option(name: str):
+    """The setting ``name`` of the current context: the innermost ``options_scope`` override, else ``OPTIONS``."""
+    overrides = _OPTION_OVERRIDES.get()
+    if overrides is not None and name in overrides:
+        return overrides[name]
+    return OPTIONS[name]
+
+
+@contextlib.contextmanager
+def options_scope(**changes):
+    """Override ``OPTIONS`` keys in this context only (nested scopes merge; a CUDA graph keeps its capture's)."""
+    unknown = set(changes) - set(OPTIONS)
+    if unknown:
+        raise KeyError(f"unknown options {sorted(unknown)}")
+    token = _OPTION_OVERRIDES.set({**(_OPTION_OVERRIDES.get() or {}), **changes})
+    try:
+        yield
+    finally:
+        _OPTION_OVERRIDES.reset(token)
+
 # Large inputs are DRAM bound. Measured on the RTX 5080 (CUDA graphs, 4x L2 flush; C5-03 time / C6-02 time):
 # hadamard_b16 1.08-1.14 at 8-12M elements and 1.00 at 16.8M; none 1.00 at 8-12M and 0.98 at 16.8M; the
 # butterfly 1.01-1.05 below 2M elements and at K = 1408 (1.05 at 8192 x 1408), but 0.98-1.02 at K >= 2048 from
 # 2M elements and 0.94 at 2048 x 8192, where the C5-03 2D tiles share the coefficients of a group across 16-32
 # rows. From these sizes on, ``quantize_activation`` and ``FastNVFP4Linear`` hand the input to
 # ``nvfp4_inference_blackwell`` unchanged (same bits); ``launch_amax`` / ``launch_quant`` never delegate.
+# These limits were set after a first measured attempt, from sweeps on overlapping shapes: they are
+# performance-informed routing for the measured shapes, not a predicted crossover for unseen workloads.
 DELEGATE_FROM = {"none": 1 << 23, "hadamard_b16": None, "adaptive_butterfly_b16": 1 << 21}
 DELEGATE_MIN_K = {"none": 0, "hadamard_b16": 0, "adaptive_butterfly_b16": 2048}
 STASH_MAX_BYTES = 16 << 20  # largest FP32 rotated stash (M * K * 4 bytes) of the butterfly dynamic path
@@ -81,7 +119,9 @@ STASH_MAX_BYTES = 16 << 20  # largest FP32 rotated stash (M * K * 4 bytes) of th
 # ======================================================================================
 # Tiles (chosen from sweeps on the RTX 5080 at the eight C5-03 shapes)
 # ======================================================================================
-TILES = {"pass1": {}, "pass2": {}}  # (M, K, rotation) -> tile override, for tuning sweeps (empty otherwise)
+# (M, K, rotation) -> tile override, for tuning sweeps (empty otherwise). The launch-plan caches are keyed on
+# the resolved tile, so a change here takes effect on the next call.
+TILES = {"pass1": {}, "pass2": {}}
 
 
 def _pass1_tile(M: int, K: int, rotation: str) -> tuple[int, int, int, int]:
@@ -520,7 +560,7 @@ def _store_group(v, bamax, gs, r, g, valid, inside, q_ptr, s_ptr, G, pc4, Q64: t
 def _vec_ok(x: Tensor) -> int:
     """The ``VEC`` load width of ``_load16``: 2 (128-bit) or 1 (64-bit) when the K stride is 1 and every
     group (the first one and every row) is 16- or 8-byte aligned; 0 (one load per input) otherwise."""
-    if not OPTIONS["vector_io"] or x.stride(1) != 1:
+    if not _option("vector_io") or x.stride(1) != 1:
         return 0
     row = x.stride(0) * x.element_size()
     for width, align in ((2, 16), (1, 8)):
@@ -547,24 +587,32 @@ def _stash(M: int, K: int, rotation: str) -> bool:
     return rotation == "adaptive_butterfly_b16" and M * K * 4 <= STASH_MAX_BYTES
 
 
-@functools.cache
 def _pass1(M: int, K: int, rot: str) -> tuple:
-    """(grid, n_index, n_tiles, BLOCK, ROWS, warps) of pass 1 (cached per shape)."""
-    block, rows, warps, most = _pass1_tile(M, K, rot)
+    """(grid, n_index, n_tiles, BLOCK, ROWS, warps) of pass 1 (cached per shape and resolved tile)."""
+    return _pass1_plan(M, K, tuple(_pass1_tile(M, K, rot)))
+
+
+@functools.cache
+def _pass1_plan(M: int, K: int, tile: tuple) -> tuple:
+    block, rows, warps, most = tile
     n_index = -(-M // rows) * (K // 16)
     n_tiles = -(-n_index // block)
     programs = max(1, min(n_tiles, most, PASS1_PROGRAMS))
     return (programs, 1, 1), n_index, n_tiles, block, rows, warps
 
 
-@functools.cache
 def _pass2(M: int, K: int, rot: str, dynamic: bool, n_part: int) -> tuple:
-    """(grid, pc, pc4, n_index, BLOCK, ROWS, PBLOCK, warps) of pass 2 (cached per shape and setting).
+    """(grid, pc, pc4, n_index, BLOCK, ROWS, PBLOCK, warps) of pass 2 (cached per shape, setting and resolved tile).
 
     The grid covers the padded scale matrix: pr / ROWS strips (pr is a multiple of 128) times pc columns.
     """
+    return _pass2_plan(M, K, tuple(_pass2_tile(M, K, rot)), dynamic, n_part)
+
+
+@functools.cache
+def _pass2_plan(M: int, K: int, tile: tuple, dynamic: bool, n_part: int) -> tuple:
     pr, pc = scale_layout(M, K)
-    block, rows, warps = _pass2_tile(M, K, rot)
+    block, rows, warps = tile
     pblock = 1 << max(n_part - 1, 0).bit_length() if dynamic else 1  # next power of 2
     n_index = pr // rows * pc
     return (max(1, -(-n_index // block)), 1, 1), pc, pc // 4, n_index, block, rows, pblock, warps
@@ -589,14 +637,14 @@ def _quant(x, M, K, packed_u8, scale, gs, workspace, n_part, rot, tables, pdl: b
            w_global: Tensor | None = None, alpha: Tensor | None = None, planes: bool = False) -> None:
     """Pass 2 of ``rot``'s plan; ``planes``: ``x`` is the rotated FP32 plane stash of pass 1 (no rotation)."""
     dynamic = workspace is not None
-    pdl = pdl and dynamic and OPTIONS["pdl"]
+    pdl = pdl and dynamic and _option("pdl")
     grid, pc, pc4, n_index, block, rows, pblock, warps = _pass2(M, K, rot, dynamic, n_part if dynamic else 0)
     rot_id = 0 if planes else ROTATIONS[rot]
     ws = workspace if dynamic else gs
     cos, sin, sg, sj, packed = tables if tables is not None else (ws, ws, 0, 0, False)
     fused = alpha is not None
     vec = 0 if planes else _vec_ok(x)
-    q64 = OPTIONS["vector_io"] and packed_u8.data_ptr() % 8 == 0
+    q64 = _option("vector_io") and packed_u8.data_ptr() % 8 == 0
     nb._launch(_quant_kernel, grid, (x, packed_u8, scale, gs, ws, cos, sin, w_global if fused else gs,
                                      alpha if fused else gs),
                (M, K // 16, pc, x.stride(0), x.stride(1), pc4, n_part, n_index, sg, sj),
@@ -614,7 +662,7 @@ def quantizer_plan(M: int, K: int, rotation: str, static: bool = False) -> dict:
         return {"launches": 1, **plan}
     g1, _, n_tiles, block1, rb1, warps1 = _pass1(M, K, rotation)
     return {"launches": 2, "pass1_tile": [block1, rb1, warps1], "pass1_programs": g1[0],
-            "pass1_tiles": n_tiles, **plan, "pdl": OPTIONS["pdl"], "vector_io": OPTIONS["vector_io"]}
+            "pass1_tiles": n_tiles, **plan, "pdl": _option("pdl"), "vector_io": _option("vector_io")}
 
 
 def launch_amax(x: Tensor, workspace: Tensor, rotation: str = "none", tables=None) -> int:
@@ -673,7 +721,7 @@ def _quantize(x: Tensor, M: int, K: int, rotation: str, tables, global_scale: Te
     workspace = torch.empty(n + 2, dtype=torch.float32, device=x.device)  # partials, tensor scale, alpha
     gs = workspace[n]
     alpha = workspace[n + 1] if w_global is not None else None
-    if OPTIONS["stash"] and _stash(M, K, rotation):
+    if _option("stash") and _stash(M, K, rotation):
         # Pass 1 also writes R x (FP32 planes); pass 2 quantizes them without rotating. Pass 2 reads what
         # pass 1 writes, so under PDL it waits before its first load (only its launch overlaps pass 1).
         stash = torch.empty((16 * M, K // 16), dtype=torch.float32, device=x.device)  # 16 planes (M, G)
@@ -703,16 +751,18 @@ def quantize_activation(x: Tensor, rotation: str = "none", tables=None,
 def delegated(M: int, K: int, rotation: str) -> bool:
     """True when an (M, K) activation of ``rotation`` goes through the C5-03 quantizer and ``torch._scaled_mm_v2``."""
     limit = DELEGATE_FROM[rotation]
-    return OPTIONS["delegate_large"] and limit is not None and M * K >= limit and K >= DELEGATE_MIN_K[rotation]
+    return _option("delegate_large") and limit is not None and M * K >= limit and K >= DELEGATE_MIN_K[rotation]
 
 
 # ======================================================================================
 # cuBLASLt GEMM with a device alpha (no elementwise scale product)
 # ======================================================================================
 _LT_LIB = None
+_LT_CACHE_LOCK = threading.RLock()  # guards the three process-wide caches below
 _LT_HANDLES: dict = {}
-_LT_PLANS: dict = {}
+_LT_PLANS: collections.OrderedDict = collections.OrderedDict()
 _LT_ZERO: dict = {}
+LT_PLAN_CACHE_MAX = 256  # cached (M, N, K, out dtype, device) plans; the least recently used is dropped beyond it
 LT_WORKSPACE_LIMIT = 1 << 20  # the limit PyTorch's scaled_mm passes to the heuristic (selects the same algorithm)
 # cuBLASLt enums (cublasLt.h / library_types.h of CUDA 13)
 _COMPUTE_32F, _R_32F, _R_16F, _R_16BF, _R_4F_E2M1 = 68, 0, 2, 14, 33
@@ -738,16 +788,20 @@ class _Heuristic(ctypes.Structure):
 def _lt():
     """The cuBLASLt library that PyTorch loaded (``nvidia/cu13/lib``), with the argument types we call."""
     global _LT_LIB
-    if _LT_LIB is None:
-        import nvidia  # the CUDA wheels of this PyTorch build
-        lib = ctypes.CDLL(str(Path(next(iter(nvidia.__path__))) / "cu13" / "lib" / "libcublasLt.so.13"))
-        vp = ctypes.c_void_p
-        lib.cublasLtMatmul.argtypes = [vp] * 14 + [ctypes.c_size_t, vp]
-        lib.cublasLtMatmul.restype = ctypes.c_int
-        lib.cublasLtMatmulDescSetAttribute.argtypes = [vp, ctypes.c_int, vp, ctypes.c_size_t]
-        lib.cublasLtMatmulDescSetAttribute.restype = ctypes.c_int
-        _LT_LIB = lib
-    return _LT_LIB
+    with _LT_CACHE_LOCK:
+        if _LT_LIB is None:
+            import nvidia  # the CUDA wheels of this PyTorch build
+            lib = ctypes.CDLL(str(Path(next(iter(nvidia.__path__))) / "cu13" / "lib" / "libcublasLt.so.13"))
+            vp = ctypes.c_void_p
+            lib.cublasLtMatmul.argtypes = [vp] * 14 + [ctypes.c_size_t, vp]
+            lib.cublasLtMatmul.restype = ctypes.c_int
+            lib.cublasLtMatmulDescSetAttribute.argtypes = [vp, ctypes.c_int, vp, ctypes.c_size_t]
+            lib.cublasLtMatmulDescSetAttribute.restype = ctypes.c_int
+            for name in ("cublasLtMatmulDescDestroy", "cublasLtMatrixLayoutDestroy", "cublasLtMatmulPreferenceDestroy"):
+                getattr(lib, name).argtypes = [vp]
+                getattr(lib, name).restype = ctypes.c_int
+            _LT_LIB = lib
+        return _LT_LIB
 
 
 def _ck(status: int, what: str) -> None:
@@ -766,44 +820,59 @@ class LtPlan:
     The descriptor is PyTorch's (``CUBLASLT_LOG_LEVEL=5`` trace of ``torch._scaled_mm_v2``): FP32 compute
     and scale, ``A = W`` (K x N, transposed), ``B = x`` (K x M), VEC16_UE4M3 block scales, device pointer
     mode, no fast accumulation, and the first heuristic result under a 1 MiB workspace limit.
+
+    Thread safety: the two block-scale pointers live in the shared descriptor, so ``__call__`` sets them and
+    submits ``cublasLtMatmul`` under one per-plan lock. The lock covers host submission only; the GEMM still
+    runs asynchronously on the caller's current stream, and a CUDA graph replay does not touch it.
+    Lifetime: ``close`` (idempotent) destroys the descriptor and layouts; a dropped plan closes itself.
     """
 
     def __init__(self, M: int, N: int, K: int, out_dtype: torch.dtype, device: torch.device):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Warm up the NVFP4 cuBLASLt GEMM eagerly once per shape before CUDA-graph capture")
         lt = _lt()
+        self._lock = threading.Lock()
         self.M, self.N, self.K, self.out_dtype = M, N, K, out_dtype
-        self.handle = _handle(device)
-        self.desc = ctypes.c_void_p()
-        _ck(lt.cublasLtMatmulDescCreate(ctypes.byref(self.desc), _COMPUTE_32F, _R_32F), "MatmulDescCreate")
-        _set(self.desc, _DESC_TRANSA, _OP_T, ctypes.c_int32)
-        _set(self.desc, _DESC_TRANSB, _OP_N, ctypes.c_int32)
-        _set(self.desc, _DESC_FAST_ACCUM, 0, ctypes.c_int8)
-        _set(self.desc, _DESC_POINTER_MODE, _POINTER_MODE_DEVICE, ctypes.c_int32)
-        _set(self.desc, _DESC_A_SCALE_MODE, _SCALE_VEC16_UE4M3, ctypes.c_int32)
-        _set(self.desc, _DESC_B_SCALE_MODE, _SCALE_VEC16_UE4M3, ctypes.c_int32)
-        probe = torch.empty(256, dtype=torch.uint8, device=device)  # the heuristic needs non-null scale pointers
-        _set(self.desc, _DESC_A_SCALE_POINTER, probe.data_ptr(), ctypes.c_void_p)
-        _set(self.desc, _DESC_B_SCALE_POINTER, probe.data_ptr(), ctypes.c_void_p)
-        out = _OUT_TYPES[out_dtype]
-        self.layouts = []
-        for dtype, rows, cols in ((_R_4F_E2M1, K, N), (_R_4F_E2M1, K, M), (out, N, M), (out, N, M)):
-            layout = ctypes.c_void_p()
-            _ck(lt.cublasLtMatrixLayoutCreate(ctypes.byref(layout), dtype, ctypes.c_uint64(rows), ctypes.c_uint64(cols),
-                                              ctypes.c_int64(rows)), "MatrixLayoutCreate")
-            self.layouts.append(layout)
-        pref = ctypes.c_void_p()
-        _ck(lt.cublasLtMatmulPreferenceCreate(ctypes.byref(pref)), "MatmulPreferenceCreate")
-        limit = ctypes.c_uint64(LT_WORKSPACE_LIMIT)
-        _ck(lt.cublasLtMatmulPreferenceSetAttribute(pref, _PREF_MAX_WORKSPACE_BYTES, ctypes.byref(limit), 8),
-            "MatmulPreferenceSetAttribute")
-        self.heuristic = _Heuristic()
-        found = ctypes.c_int()
-        _ck(lt.cublasLtMatmulAlgoGetHeuristic(self.handle, self.desc, *self.layouts, pref, 1,
-                                              ctypes.byref(self.heuristic), ctypes.byref(found)), "AlgoGetHeuristic")
-        lt.cublasLtMatmulPreferenceDestroy(pref)
-        if found.value < 1:
-            raise RuntimeError(f"cuBLASLt has no NVFP4 algorithm for {(M, N, K)}")
+        self.device_index = _device_index(device)
+        self.desc, self.layouts = None, []
+        pref = None
+        try:
+            self.handle = _handle(self.device_index)
+            desc = ctypes.c_void_p()
+            _ck(lt.cublasLtMatmulDescCreate(ctypes.byref(desc), _COMPUTE_32F, _R_32F), "MatmulDescCreate")
+            self.desc = desc
+            _set(desc, _DESC_TRANSA, _OP_T, ctypes.c_int32)
+            _set(desc, _DESC_TRANSB, _OP_N, ctypes.c_int32)
+            _set(desc, _DESC_FAST_ACCUM, 0, ctypes.c_int8)
+            _set(desc, _DESC_POINTER_MODE, _POINTER_MODE_DEVICE, ctypes.c_int32)
+            _set(desc, _DESC_A_SCALE_MODE, _SCALE_VEC16_UE4M3, ctypes.c_int32)
+            _set(desc, _DESC_B_SCALE_MODE, _SCALE_VEC16_UE4M3, ctypes.c_int32)
+            probe = torch.empty(256, dtype=torch.uint8, device=_cuda(self.device_index))  # non-null scale pointers
+            _set(desc, _DESC_A_SCALE_POINTER, probe.data_ptr(), ctypes.c_void_p)
+            _set(desc, _DESC_B_SCALE_POINTER, probe.data_ptr(), ctypes.c_void_p)
+            out = _OUT_TYPES[out_dtype]
+            for dtype, rows, cols in ((_R_4F_E2M1, K, N), (_R_4F_E2M1, K, M), (out, N, M), (out, N, M)):
+                layout = ctypes.c_void_p()
+                _ck(lt.cublasLtMatrixLayoutCreate(ctypes.byref(layout), dtype, ctypes.c_uint64(rows),
+                                                  ctypes.c_uint64(cols), ctypes.c_int64(rows)), "MatrixLayoutCreate")
+                self.layouts.append(layout)
+            pref = ctypes.c_void_p()
+            _ck(lt.cublasLtMatmulPreferenceCreate(ctypes.byref(pref)), "MatmulPreferenceCreate")
+            limit = ctypes.c_uint64(LT_WORKSPACE_LIMIT)
+            _ck(lt.cublasLtMatmulPreferenceSetAttribute(pref, _PREF_MAX_WORKSPACE_BYTES, ctypes.byref(limit), 8),
+                "MatmulPreferenceSetAttribute")
+            self.heuristic = _Heuristic()
+            found = ctypes.c_int()
+            _ck(lt.cublasLtMatmulAlgoGetHeuristic(self.handle, desc, *self.layouts, pref, 1,
+                                                  ctypes.byref(self.heuristic), ctypes.byref(found)), "AlgoGetHeuristic")
+            if found.value < 1:
+                raise RuntimeError(f"cuBLASLt has no NVFP4 algorithm for {(M, N, K)}")
+        except BaseException:
+            self.close()
+            raise
+        finally:
+            if pref is not None and pref.value:
+                lt.cublasLtMatmulPreferenceDestroy(pref)
         self.workspace_bytes = int(self.heuristic.workspaceSize)
         self.algo = ctypes.byref(self.heuristic.algo)
         self.config = {}
@@ -811,53 +880,128 @@ class LtPlan:
             value, written = ctypes.c_int32(), ctypes.c_size_t()
             lt.cublasLtMatmulAlgoConfigGetAttribute(self.algo, attr, ctypes.byref(value), 4, ctypes.byref(written))
             self.config[name] = value.value
-        self.zero = _zero(device)
+        self.zero = _zero(self.device_index)
 
     @property
     def direct(self) -> bool:
-        """The direct call needs no workspace (every algorithm seen on sm_120); otherwise use ``_scaled_mm_v2``."""
+        """The algorithm needs no workspace (every one seen on sm_120). ``FastNVFP4Linear`` falls back to
+        ``_scaled_mm_v2`` otherwise; ``nvfp4_scaled_mm_lt`` allocates the workspace."""
         return self.workspace_bytes == 0
+
+    @property
+    def closed(self) -> bool:
+        return self.desc is None
 
     def record(self) -> dict:
         return {"mnk": [self.M, self.N, self.K], "out_dtype": str(self.out_dtype), "workspace_bytes": self.workspace_bytes,
                 "algo": dict(self.config), "direct": self.direct}
 
-    def __call__(self, a: NVFP4Activation, w_packed: Tensor, w_scale: Tensor, alpha: Tensor, out: Tensor) -> Tensor:
+    def __call__(self, a: NVFP4Activation, w_packed: Tensor, w_scale: Tensor, alpha: Tensor, out: Tensor,
+                 workspace: Tensor | None = None) -> Tensor:
+        """Submit ``out = alpha a W^T`` on the current stream of ``out.device``.
+
+        A plan with ``workspace_bytes > 0`` needs a contiguous CUDA ``uint8`` ``workspace`` of at least that
+        many bytes on that device (kept alive by the caller until the GEMM completes); ``ValueError`` otherwise.
+        """
+        size = 0
+        if self.workspace_bytes > 0:
+            if (not isinstance(workspace, Tensor) or not workspace.is_cuda or workspace.dtype != torch.uint8
+                    or not workspace.is_contiguous() or workspace.device != out.device
+                    or workspace.nbytes < self.workspace_bytes):
+                raise ValueError(f"this cuBLASLt plan needs a contiguous CUDA uint8 workspace of at least "
+                                 f"{self.workspace_bytes} bytes on {out.device}")
+            size = self.workspace_bytes
         lt = _lt()
-        _set(self.desc, _DESC_A_SCALE_POINTER, w_scale.data_ptr(), ctypes.c_void_p)
-        _set(self.desc, _DESC_B_SCALE_POINTER, a.scale.data_ptr(), ctypes.c_void_p)
         stream = torch.cuda.current_stream(out.device).cuda_stream
-        _ck(lt.cublasLtMatmul(self.handle, self.desc, alpha.data_ptr(), w_packed.data_ptr(), self.layouts[0],
-                              a.packed.data_ptr(), self.layouts[1], self.zero.data_ptr(), out.data_ptr(),
-                              self.layouts[2], out.data_ptr(), self.layouts[3], self.algo, None, 0, stream),
-            "Matmul")
+        with self._lock:  # the scale pointers and the submission that reads them are one host section
+            if self.desc is None:
+                raise RuntimeError("this cuBLASLt plan is closed")
+            _set(self.desc, _DESC_A_SCALE_POINTER, w_scale.data_ptr(), ctypes.c_void_p)
+            _set(self.desc, _DESC_B_SCALE_POINTER, a.scale.data_ptr(), ctypes.c_void_p)
+            _ck(lt.cublasLtMatmul(self.handle, self.desc, alpha.data_ptr(), w_packed.data_ptr(), self.layouts[0],
+                                  a.packed.data_ptr(), self.layouts[1], self.zero.data_ptr(), out.data_ptr(),
+                                  self.layouts[2], out.data_ptr(), self.layouts[3], self.algo,
+                                  workspace.data_ptr() if size else None, size, stream), "Matmul")
         return out
 
+    def close(self) -> None:
+        """Destroy the descriptor and layouts (idempotent; a later call raises). CUDA graphs captured
+        earlier keep working: the descriptor is read at submission only."""
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            return
+        with lock:
+            lt = _LT_LIB
+            if lt is not None:
+                for layout in self.layouts:
+                    lt.cublasLtMatrixLayoutDestroy(layout)
+                if self.desc is not None:
+                    lt.cublasLtMatmulDescDestroy(self.desc)
+            self.layouts, self.desc = [], None
 
-def _handle(device: torch.device):
-    key = torch.device(device).index
-    handle = _LT_HANDLES.get(key)
-    if handle is None:
-        handle = ctypes.c_void_p()
-        with torch.cuda.device(device):
-            _ck(_lt().cublasLtCreate(ctypes.byref(handle)), "Create")
-        _LT_HANDLES[key] = handle
-    return handle
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:  # interpreter shutdown
+            pass
 
 
-def _zero(device: torch.device) -> Tensor:
-    key = torch.device(device).index
-    if key not in _LT_ZERO:
-        _LT_ZERO[key] = torch.zeros((), dtype=torch.float32, device=device)  # beta (device pointer mode)
-    return _LT_ZERO[key]
+def _device_index(device) -> int:
+    """The CUDA device index of ``device`` (an index-less ``cuda`` is the current device)."""
+    device = torch.device(device) if not isinstance(device, int) else torch.device("cuda", device)
+    if device.type != "cuda":
+        raise ValueError(f"the NVFP4 cuBLASLt GEMM needs a CUDA device, not {device}")
+    return torch.cuda.current_device() if device.index is None else device.index
+
+
+def _cuda(index: int) -> torch.device:
+    return torch.device("cuda", index)
+
+
+def _handle(index: int):
+    """The per-device cuBLASLt handle (one per device for the process lifetime; holds no per-call state)."""
+    with _LT_CACHE_LOCK:
+        handle = _LT_HANDLES.get(index)
+        if handle is None:
+            handle = ctypes.c_void_p()
+            with torch.cuda.device(index):
+                _ck(_lt().cublasLtCreate(ctypes.byref(handle)), "Create")
+            _LT_HANDLES[index] = handle
+        return handle
+
+
+def _zero(index: int) -> Tensor:
+    with _LT_CACHE_LOCK:
+        if index not in _LT_ZERO:
+            _LT_ZERO[index] = torch.zeros((), dtype=torch.float32, device=_cuda(index))  # beta (device pointer mode)
+        return _LT_ZERO[index]
 
 
 def lt_plan(M: int, N: int, K: int, out_dtype: torch.dtype, device) -> LtPlan:
-    key = (M, N, K, out_dtype, torch.device(device).index)
-    plan = _LT_PLANS.get(key)
-    if plan is None:
-        plan = _LT_PLANS[key] = LtPlan(M, N, K, out_dtype, torch.device(device))
-    return plan
+    """The cached plan of (M, N, K, out dtype, device index): an LRU of at most ``LT_PLAN_CACHE_MAX`` plans.
+
+    An evicted plan is not closed here (a caller may still hold it); it closes when its last reference goes.
+    """
+    key = (M, N, K, out_dtype, _device_index(device))
+    with _LT_CACHE_LOCK:
+        plan = _LT_PLANS.get(key)
+        if plan is not None:
+            _LT_PLANS.move_to_end(key)
+            return plan
+        plan = _LT_PLANS[key] = LtPlan(M, N, K, out_dtype, _cuda(key[-1]))
+        while len(_LT_PLANS) > LT_PLAN_CACHE_MAX:
+            _LT_PLANS.popitem(last=False)
+        return plan
+
+
+def clear_lt_plan_cache() -> int:
+    """Close and drop every cached plan (teardown; a closed plan refuses later calls). Returns the count."""
+    with _LT_CACHE_LOCK:
+        plans = list(_LT_PLANS.values())
+        _LT_PLANS.clear()
+    for plan in plans:
+        plan.close()
+    return len(plans)
 
 
 def nvfp4_scaled_mm_lt(a: NVFP4Activation, w_packed: Tensor, w_scale: Tensor, alpha: Tensor,
@@ -865,11 +1009,15 @@ def nvfp4_scaled_mm_lt(a: NVFP4Activation, w_packed: Tensor, w_scale: Tensor, al
     """``a @ W^T`` through cuBLASLt with the device scalar ``alpha = a.global_scale * w_global``.
 
     Equals ``nb.nvfp4_scaled_mm_public(a, w_packed, w_scale, w_global, out_dtype)`` bit for bit when
-    ``alpha`` holds that FP32 product.
+    ``alpha`` holds that FP32 product. A plan that needs a workspace gets one from the caching allocator
+    (stream-ordered, so it stays valid until the GEMM on this stream completes).
     """
     M, N, K = a.packed.shape[0], w_packed.shape[0], a.packed.shape[1] * 2
-    out = torch.empty((M, N), dtype=out_dtype, device=a.packed.device)
-    return lt_plan(M, N, K, out_dtype, a.packed.device)(a, w_packed, w_scale, alpha, out)
+    device = a.packed.device
+    out = torch.empty((M, N), dtype=out_dtype, device=device)
+    plan = lt_plan(M, N, K, out_dtype, device)
+    workspace = None if plan.direct else torch.empty(plan.workspace_bytes, dtype=torch.uint8, device=device)
+    return plan(a, w_packed, w_scale, alpha, out, workspace)
 
 
 # ======================================================================================
@@ -878,7 +1026,9 @@ def nvfp4_scaled_mm_lt(a: NVFP4Activation, w_packed: Tensor, w_scale: Tensor, al
 class FastNVFP4Linear(nb.NVFP4Linear):
     """``nb.NVFP4Linear`` (same state dict and outputs) on the C6-02 quantizer and GEMM.
 
-    A butterfly layer also keeps its coefficients in the (16, G, 4) layout of ``packed_tables`` (a non-persistent buffer).
+    A butterfly layer also keeps its coefficients in the (16, G, 4) layout of ``packed_tables`` (a
+    non-persistent buffer derived from ``cos`` and ``sin``). ``load_state_dict`` rebuilds it after the load,
+    in place when the shape and device are unchanged (so earlier CUDA-graph captures read the new values).
     """
 
     _FP32_BUFFERS = (*nb.NVFP4Linear._FP32_BUFFERS, "cos_sin")
@@ -888,8 +1038,19 @@ class FastNVFP4Linear(nb.NVFP4Linear):
         self._add_transposed()
 
     def _add_transposed(self) -> None:
-        if self.rotation == "adaptive_butterfly_b16":
-            self.register_buffer("cos_sin", packed_tables(self.cos, self.sin), persistent=False)
+        if self.rotation != "adaptive_butterfly_b16":
+            return
+        packed = packed_tables(self.cos, self.sin)
+        current = self._buffers.get("cos_sin")
+        if current is not None and current.shape == packed.shape and current.device == packed.device:
+            with torch.no_grad():
+                current.copy_(packed)
+        else:
+            self.register_buffer("cos_sin", packed, persistent=False)
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        super()._load_from_state_dict(*args, **kwargs)
+        self._add_transposed()  # cos_sin is not in the state dict: derive it from the loaded tables
 
     @property
     def _fast_tables(self):
@@ -923,7 +1084,7 @@ class FastNVFP4Linear(nb.NVFP4Linear):
         if delegated(M, self.in_features, self.rotation):
             return nb.NVFP4Linear.forward(self, x)
         plan = lt_plan(M, self.out_features, self.in_features, self.out_dtype, x2.device) \
-            if OPTIONS["lt_gemm"] and self.out_dtype in _OUT_TYPES else None
+            if _option("lt_gemm") and self.out_dtype in _OUT_TYPES else None
         fused = plan is not None and plan.direct
         a, alpha = _quantize(x2, M, self.in_features, self.rotation, self._fast_tables, self.act_global_scale,
                              self.w_global if fused else None)
@@ -1005,17 +1166,26 @@ CROSS_MAX_OUT_BLOCKS = 16  # output blocks per program of the block mix (registe
 class FastCrossInput(nn.Module):
     """``rotated_qat.CrossInput`` with the cross-block mix in one Triton kernel (BF16/FP16/FP32 input, FP32 out).
 
-    ``forward(x) = layer(C x)`` like ``CrossInput``. The mix reads the input directly (no ``x.float()``
+    ``forward(x) = layer(C x)`` like ``CrossInput``. The fused mix reads the input directly (no ``x.float()``
     copy) and replaces the two batched cuBLAS products. Its FP32 output equals ``cross.forward(x.float())``
-    bit for bit where cuBLAS uses the two-half ``gemmSN`` order (every b64 shape measured, the full mix at
-    M = 1024); elsewhere it differs by rounding (about 1 ulp). The benchmark records the mismatches.
+    bit for bit only where cuBLAS uses the two-half ``gemmSN`` order (every b64 shape measured, the full mix
+    at M = 1024, K <= 2048); elsewhere single values differ by FP32 rounding (about 1e-6 at K = 5632).
+    Such a difference can move a value across an FP4 rounding threshold, and later layers amplify the
+    changed codes: the full mix of the w2048_6l model differs from ``CrossInput`` by 0.21-0.25 relative L2
+    in its logits. The fused mode is therefore a latency path that must be qualified per shape.
+    ``exact=True`` runs ``cross.forward(x.float())`` instead (bit-identical to ``CrossInput`` at any shape).
+
+    ``h`` and ``mix`` stay FP32 under module dtype conversion (``.bfloat16()``, ``.half()``, ``.to(dtype)``)
+    and follow device moves.
     """
 
-    def __init__(self, layer: nn.Module, cross):
+    _FP32_BUFFERS = ("h", "mix")
+
+    def __init__(self, layer: nn.Module, cross, exact: bool = False):
         super().__init__()
         if cross.identity:
             raise ValueError("FastCrossInput needs a mixing CrossMix (block > 16 or a block mix)")
-        self.layer, self.cross = layer, cross
+        self.layer, self.cross, self.exact = layer, cross, bool(exact)
         self.n, self.groups, self.blocks = cross.n, cross.block // 16, cross.n // cross.block
         # ``rotated_qat.hadamard_matrix``: the FP64 Sylvester matrix of ``fwht``, rounded to FP32 as ``CrossMix._matrix``
         device = next(iter(layer.buffers()), torch.empty(0)).device  # the mix matrices follow the layer
@@ -1024,12 +1194,27 @@ class FastCrossInput(nn.Module):
         self.register_buffer("mix", None if cross._mix is None else cross._mix.float().contiguous().to(device),
                              persistent=False)
 
+    def _apply(self, fn, recurse=True):
+        # Like ``nb.NVFP4Linear``: hold the FP32 matrices out of ``fn`` and only follow its device.
+        held = {n: self._buffers.pop(n) for n in self._FP32_BUFFERS if self._buffers.get(n) is not None}
+        try:
+            super()._apply(fn, recurse)
+        finally:
+            for name, value in held.items():
+                self._buffers[name] = value.to(fn(value).device)
+        return self
+
     def mixed(self, x: Tensor) -> Tensor:
         """FP32 ``C x`` of ``x`` (..., n) as a contiguous (rows, n) tensor."""
         x2 = x.reshape(-1, self.n)
         if not x2.is_cuda or x2.dtype not in (torch.float32, torch.bfloat16, torch.float16):
             raise ValueError("FastCrossInput needs a CUDA float32, bfloat16 or float16 input")
         M = x2.shape[0]
+        if self.exact:
+            with torch.autocast(device_type="cuda", enabled=False):
+                return self.cross.forward(x2.float()).reshape(M, self.n).contiguous()
+        if self.h.dtype != torch.float32 or (self.mix is not None and self.mix.dtype != torch.float32):
+            raise RuntimeError("FastCrossInput mix matrices must be float32")
         out = torch.empty((M, self.n), dtype=torch.float32, device=x2.device)
         if M == 0:
             return out
@@ -1042,10 +1227,13 @@ class FastCrossInput(nn.Module):
         return out
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.exact:  # the expression of ``rotated_qat.CrossInput.forward``
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                return self.layer(self.cross.forward(x.float()))
         return self.layer(self.mixed(x).reshape(*x.shape[:-1], self.n))
 
 
 __all__ = ["FastNVFP4Linear", "FastCrossInput", "CROSS_TILE", "quantize_activation", "launch_amax", "launch_quant", "quantizer_plan",
-           "nvfp4_scaled_mm_lt", "lt_plan", "packed_tables", "LtPlan", "ROTATIONS", "MAX_PARTIALS", "PASS1_PROGRAMS", "OPTIONS",
-           "delegated", "DELEGATE_FROM", "DELEGATE_MIN_K",
-           "LT_WORKSPACE_LIMIT"]
+           "nvfp4_scaled_mm_lt", "lt_plan", "clear_lt_plan_cache", "packed_tables", "LtPlan", "ROTATIONS", "MAX_PARTIALS",
+           "PASS1_PROGRAMS", "OPTIONS", "options_scope", "TILES", "delegated", "DELEGATE_FROM", "DELEGATE_MIN_K",
+           "LT_WORKSPACE_LIMIT", "LT_PLAN_CACHE_MAX"]

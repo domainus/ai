@@ -10,19 +10,25 @@ Part A  One linear layer at the eight C5-03 shapes, (16, 4096, 4096) .. (2048, 8
 Part B  The ~1.6 us elementwise kernel of ``torch._scaled_mm_v2``: the dispatcher trace (``aten::mul`` of the
         two FP32 tensor scales), the kernels of the direct cuBLASLt call, its bit-for-bit equality with
         ``nvfp4_scaled_mm_public`` for every shape and output dtype, and the cuBLASLt heuristic algorithms.
-Part C  Full Transformer forwards (50m, 120m, w2048_6l; random weights) as CUDA graphs: BF16, C5-03 against
-        C6-02 for the four variants, and the C6-01 wide cross-mix families (``hadamard_b64``,
-        ``kron_hadamard_full``, ``cross_full_butterfly_b16``) on the C6-01 path (``rotated_qat.CrossInput``
-        over the C5-03 layer), on ``CrossInput`` over the C6-02 layer, and with the fused cross-mix kernel
-        (``FastCrossInput``). The Pareto analysis links these latencies to the verified C6-01 test NLLs
-        (``results/cycle6_c6_01_wide_rotated_qat.json``, SHA-256 pinned).
+Part C  Full Transformer forwards (50m, 120m, w2048_6l; random weights): BF16 as a CUDA graph and compiled
+        (``torch.compile`` default Inductor, the primary BF16 comparator of C5-03), C5-03 against C6-02 for the
+        four variants, and the C6-01 wide cross-mix families (``hadamard_b64``, ``kron_hadamard_full``,
+        ``cross_full_butterfly_b16``) on the C6-01 path (``rotated_qat.CrossInput`` over the C5-03 layer), on
+        ``CrossInput`` over the C6-02 layer, and with the fused cross-mix kernel (``FastCrossInput``), all in one
+        Williams-balanced session per model. The compiled BF16 forward is also scored on the six pinned trained
+        C6-01 checkpoints (50m and 120m, three seeds, full test split). The Pareto analysis links the latencies to
+        these NLLs and to the verified C6-01 test NLLs (``results/cycle6_c6_01_wide_rotated_qat.json``, pinned),
+        per model, with and without the compiled BF16 point.
 
 Timing: Williams-balanced orders, CUDA events around every call with a 4x L2 flush (268 MB on the RTX 5080)
 before every sample, raw per-call event times, and a host wall clock. TF32 and reduced-precision
 reductions are off.
 
 ``cycle6_c6_02*.json`` is reserved: only the canonical protocol, on an sm_120+ device, from a clean committed
-tree, in this checkout, without ``..`` or a symlink, may write it, and it is written once.
+tree, in this checkout, without ``..`` or a symlink, may write it, and it is written once (atomic no-replace
+publication). The producer commit must not contain the result file. The trained compiled-BF16 points read the
+gitignored ``artifacts/real_text/test.bin``, ``artifacts/c6_01_checkpoints`` and ``artifacts/c5_03_checkpoints``
+(each file SHA-256 verified).
 
 Run (canonical, alone on the GPU, from a clean commit):
     PYTHONPATH=. .venv/bin/python research/quant_ptq/bench_c6_02_nvfp4_small_shape_fusion.py
@@ -51,6 +57,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -65,7 +72,7 @@ from research.quant_ptq import nvfp4_small_shape_blackwell as fs
 from research.quant_ptq import rotated_qat as rq
 
 ROOT = Path(__file__).resolve().parents[2]
-SCHEMA_VERSION = "cycle6_c6_02.v1"
+SCHEMA_VERSION = "cycle6_c6_02.v2"
 TASK = ("Cycle 6 C6-02: Blackwell small-shape NVFP4 quantizer fusion, fused cuBLASLt alpha and wide cross-mix "
         "latency against the C6-01 perplexities")
 DRIVER_MODULE = "research.quant_ptq.bench_c6_02_nvfp4_small_shape_fusion"
@@ -94,6 +101,15 @@ PINNED_INPUTS = {
 C6_01_RESULT = "results/cycle6_c6_01_wide_rotated_qat.json"
 C5_03_RESULT = "results/cycle5_c5_03_nvfp4_120m_fusion.json"
 TOL = 1e-9
+# The trained compiled-BF16 points: the C6-01 test split and checkpoint directories (gitignored artifacts;
+# every file is verified by SHA-256 before use: test.bin here, checkpoints by ``c503.load_checkpoint``).
+TEST_SPLIT_REPO_PATH = "artifacts/real_text/test.bin"
+C6_01_TEST_SHA256 = "4eb46f1424856849d2973923dbf3c886d37eb743cf22053fc7e1eea1f41ab92a"
+CHECKPOINT_DIRS = {"50m": "artifacts/c6_01_checkpoints", "120m": "artifacts/c5_03_checkpoints"}
+TRAINED_SEEDS = (1, 2, 3)
+COMPILED_BF16_NLL_TOL = 1e-3  # |compiled BF16 - archived C6-01 BF16| test NLL per seed (autocast FP32 weights there)
+PROFILE_REPS_A = 20
+PROFILE_REPS_C = 3
 
 VARIANTS = ("none", "had_b16", "bfly_b16", "had_b16_static_gs")
 VARIANT_ROTATION = c503.VARIANT_ROTATION
@@ -112,14 +128,18 @@ ABLATION_METHODS = ("bf16_cublas", *(f"{a}_{v}" for v in ABLATION_VARIANTS for a
 OUT_DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 WIDE_FAMILIES = ("hadamard_b64", "kron_hadamard_full", "cross_full_butterfly_b16")
 WIDE_PATHS = ("c6_01", "c6_02_crossinput", "c6_02_fused")
-PART_C_METHODS = ("bf16_graph", *(f"{i}_{v}" for v in VARIANTS for i in IMPLS),
+BF16_METHODS = ("bf16_graph", "bf16_compiled")
+PART_C_METHODS = (*BF16_METHODS, *(f"{i}_{v}" for v in VARIANTS for i in IMPLS),
                   *(f"{p}_{f}" for f in WIDE_FAMILIES for p in WIDE_PATHS))
 PART_C_CONFIGS = c503.PART_B_CONFIGS
 # Pareto: (C6-02 Part C method, C6-01 cell method) per evaluated C6-01 method. C6-01 cells: 50m = Part A/B
 # arm ``ab/muon_ss3_54`` (three seeds), 120m = Part C arm ``c/c5_03_baseline`` (three seeds).
 PARETO_CELLS = {"50m": "ab/muon_ss3_54", "120m": "c/c5_03_baseline"}
+PART_C_PROFILED = (*BF16_METHODS, "c5_03_had_b16", "c6_02_had_b16", "c6_01_cross_full_butterfly_b16",
+                   "c6_02_fused_cross_full_butterfly_b16")
 PARETO_POINTS = {
-    "bf16": ("bf16_graph", None),
+    "bf16_graph": ("bf16_graph", None),
+    "bf16_compiled": ("bf16_compiled", None),
     "gptq": ("c6_02_none", "gptq/w4a4_hw_dynamic"),
     "hadamard_b16_gptq": ("c6_02_had_b16", "hadamard_b16_gptq/w4a4_hw_dynamic"),
     "hadamard_b16_gptq_static": ("c6_02_had_b16_static_gs", "hadamard_b16_gptq/w4a4_hw_static"),
@@ -138,7 +158,8 @@ CANONICAL = {
     "timing": {"squares_a": 2, "squares_c": 2, "iters": 10, "l2_flush_multiple": 4, "wall_iters": 2},
     "part_a": {"shapes": PART_A_SHAPES, "ablation_shapes": [[1024, 512, 1408], [2048, 8192, 8192]]},
     "part_b": {"shapes": PART_A_SHAPES, "out_dtypes": list(OUT_DTYPES), "algo_shape": [1024, 512, 1408]},
-    "part_c": {"models": {"50m": 16, "120m": 8, "w2048_6l": 4}, "families": list(WIDE_FAMILIES)},
+    "part_c": {"models": {"50m": 16, "120m": 8, "w2048_6l": 4}, "families": list(WIDE_FAMILIES),
+               "compiled_warmup": 3, "trained_eval_presets": list(PARETO_CELLS), "trained_seeds": list(TRAINED_SEEDS)},
     "parity": {"quick": False},
 }
 SHAKEDOWN = {
@@ -147,20 +168,34 @@ SHAKEDOWN = {
     "part_a": {"shapes": [[16, 256, 256], [129, 512, 768]], "ablation_shapes": [[129, 512, 768]]},
     "part_b": {"shapes": [[16, 256, 256], [129, 512, 768]], "out_dtypes": list(OUT_DTYPES),
                "algo_shape": [129, 512, 768]},
-    "part_c": {"models": {"tiny": 2}, "families": list(WIDE_FAMILIES)},
+    "part_c": {"models": {"tiny": 2}, "families": list(WIDE_FAMILIES),
+               "compiled_warmup": 3, "trained_eval_presets": [], "trained_seeds": list(TRAINED_SEEDS)},
     "parity": {"quick": True},
 }
 CANONICAL_PARITY_MIN_CASES = 279
-# A first canonical attempt (producer a4ebc54) measured everything and was rejected by its own validator: the
-# Part C kernel-count rule did not count the layers that C6-02 delegates to C5-03. The rule and the delegation
-# limits (now per rotation) were corrected, and the canonical result was measured again. The rejected payload and its log are kept
-# outside git (artifacts/c6_02_run_evidence/); their SHA-256 values are recorded here.
-SUPERSEDED_ATTEMPT = {
-    "producer_git_sha": "a4ebc54ab67bf32448e076706780377c8bc8915d",
-    "rejected_by": "part_c 50m: kernel launches per forward",
-    "rejected_canonical_a4ebc54.json": "33fabff660fea8da98c7fea98ff96975c88d098c826d5de9d642275e797efbb3",
-    "canonical_a4ebc54.log": "f58cbf162b8d867e08c2f874cbae49a553afc2ccf3f906085b8b7cd1b33de1bd",
-}
+# Earlier canonical attempts, newest last. Receipts are SHA-256 values of retained files (outside git, in
+# ``artifacts/c6_02_run_evidence/``) and, for v1, of the committed result blob (``verify_superseded_receipts``).
+SUPERSEDED_ATTEMPTS = (
+    {"schema_version": "cycle6_c6_02.v1", "producer_git_sha": "a4ebc54ab67bf32448e076706780377c8bc8915d",
+     "result_commit": None,
+     "outcome": "rejected by its own validator (part_c 50m: kernel launches per forward): the Part C kernel-count "
+                "rule did not count the layers that C6-02 delegates to C5-03; the rule and the per-rotation "
+                "delegation limits were corrected before the next attempt",
+     "receipts": {"rejected_canonical_a4ebc54.json":
+                  "33fabff660fea8da98c7fea98ff96975c88d098c826d5de9d642275e797efbb3",
+                  "canonical_a4ebc54.log": "f58cbf162b8d867e08c2f874cbae49a553afc2ccf3f906085b8b7cd1b33de1bd"}},
+    {"schema_version": "cycle6_c6_02.v1", "producer_git_sha": "47cdedd8ff03027f39dd9e225279626824a0aeff",
+     "result_commit": "a716333d6c692ebc35476fd61398def8289cbfbf",
+     "outcome": "accepted by its validator, then failed the independent GPT 6.2 Astra audit "
+                "(audits/AUDIT_cycle6_c6_02_gpt62_astra.md): no compiled BF16 baseline in Part C or the Pareto "
+                "(it reverses the 50m conclusion), a concurrent cuBLASLt scale-pointer race, a stale packed "
+                "butterfly table after load_state_dict, unqualified w2048_6l full-mix fidelity, BF16 casts of "
+                "the cross-mix matrices, and validator gaps; superseded by this v2 result",
+     "receipts": {"superseded_canonical_47cdedd.json":
+                  "ceff189c3298905b355705dab89532d3a80bbeaf7343a7d27c804865f83949a2",
+                  "canonical_47cdedd.log": "1a232f0c0c3f3898b1927b04556c4854c188c4ee3217d27a687335285cbed4a2"}},
+)
+SUPERSEDED_EVIDENCE_DIR = "artifacts/c6_02_run_evidence"
 
 
 def _require(condition, message: str) -> None:
@@ -173,14 +208,9 @@ def _require(condition, message: str) -> None:
 # ======================================================================================
 @contextmanager
 def options(**changes):
-    """Temporarily change ``fs.OPTIONS`` (a CUDA graph keeps the setting of its capture)."""
-    saved = dict(fs.OPTIONS)
-    fs.OPTIONS.update(changes)
-    try:
+    """Change ``fs.OPTIONS`` keys in this context only (``fs.options_scope``; a CUDA graph keeps its capture's)."""
+    with fs.options_scope(**changes):
         yield
-    finally:
-        fs.OPTIONS.clear()
-        fs.OPTIONS.update(saved)
 
 
 def capture_under(fn, pool=None, **opts):
@@ -213,8 +243,9 @@ def kernel_kind(name: str) -> str:
     return "other"
 
 
-def kernel_profile(replays: dict, flush: Tensor, reps: int = 20) -> dict:
-    """Per method: mean CUPTI kernel duration (us) and launches per replay, by kernel name (L2 flushed)."""
+def kernel_profile(replays: dict, flush: Tensor, reps: int = PROFILE_REPS_A) -> dict:
+    """Per method and kernel name: mean CUPTI duration (us) and launches per replay, the total launch count over
+    ``reps`` replays and the kernel kind (L2 flushed)."""
     out = {}
     for name, replay in replays.items():
         torch.cuda.synchronize()
@@ -230,8 +261,8 @@ def kernel_profile(replays: dict, flush: Tensor, reps: int = 20) -> dict:
                 counts[event.name[:160]] += 1
         if not totals:
             raise RuntimeError("CUPTI recorded no CUDA kernel (prime CUPTI before any CPU-only profiler session)")
-        out[name] = {k: {"us": totals[k] / reps, "launches": counts[k] / reps, "kind": kernel_kind(k)}
-                     for k in sorted(totals)}
+        out[name] = {k: {"us": totals[k] / reps, "launches": counts[k] / reps, "count": counts[k],
+                         "kind": kernel_kind(k)} for k in sorted(totals)}
     return out
 
 
@@ -424,27 +455,27 @@ def heuristic_algorithms(M: int, N: int, K: int, device, flush: Tensor, t: dict)
                                                     ctypes.byref(written))
             config[name] = value.value
         out = torch.full((M, N), float("nan"), dtype=torch.bfloat16, device=device)
-        outs.append(out)
+        size = int(results[i].workspaceSize)
+        ws = torch.empty(max(size, 1), dtype=torch.uint8, device=device)  # the algorithm's own workspace
+        outs.append((out, ws))
 
-        def call(i=i, out=out):
-            fs._set(plan.desc, fs._DESC_A_SCALE_POINTER, layer.w_scale.data_ptr(), ctypes.c_void_p)
-            fs._set(plan.desc, fs._DESC_B_SCALE_POINTER, a.scale.data_ptr(), ctypes.c_void_p)
-            fs._ck(lt.cublasLtMatmul(plan.handle, plan.desc, alpha.data_ptr(), layer.w_packed.data_ptr(),
-                                     plan.layouts[0], a.packed.data_ptr(), plan.layouts[1], plan.zero.data_ptr(),
-                                     out.data_ptr(), plan.layouts[2], out.data_ptr(), plan.layouts[3],
-                                     ctypes.byref(results[i].algo), None, 0,
-                                     torch.cuda.current_stream().cuda_stream), "Matmul")
-        if results[i].workspaceSize == 0:
-            call()
-            torch.cuda.synchronize()
-            graphs[f"algo_{i}"] = e2e.capture(call)
-        algos.append({"index": i, "config": config, "workspace_bytes": int(results[i].workspaceSize),
-                      "waves": float(results[i].wavesCount),
-                      "bitwise_equal_public": bool(results[i].workspaceSize == 0 and _bitwise_equal(out, ref))})
+        def call(i=i, out=out, ws=ws, size=size):
+            with plan._lock:  # the shared descriptor's scale pointers and the submission: one host section
+                fs._set(plan.desc, fs._DESC_A_SCALE_POINTER, layer.w_scale.data_ptr(), ctypes.c_void_p)
+                fs._set(plan.desc, fs._DESC_B_SCALE_POINTER, a.scale.data_ptr(), ctypes.c_void_p)
+                fs._ck(lt.cublasLtMatmul(plan.handle, plan.desc, alpha.data_ptr(), layer.w_packed.data_ptr(),
+                                         plan.layouts[0], a.packed.data_ptr(), plan.layouts[1], plan.zero.data_ptr(),
+                                         out.data_ptr(), plan.layouts[2], out.data_ptr(), plan.layouts[3],
+                                         ctypes.byref(results[i].algo), ws.data_ptr() if size else None, size,
+                                         torch.cuda.current_stream().cuda_stream), "Matmul")
+        call()
+        torch.cuda.synchronize()
+        graphs[f"algo_{i}"] = e2e.capture(call)
+        algos.append({"index": i, "config": config, "workspace_bytes": size, "direct": size == 0,
+                      "waves": float(results[i].wavesCount), "bitwise_equal_public": _bitwise_equal(out, ref)})
     timed, orders = timing(graphs, t, 1, flush) if graphs else ({}, [])
     for row in algos:
-        name = f"algo_{row['index']}"
-        row["graph_ms"] = timed[name]["gpu"]["median_ms"] if name in timed else None
+        row["cuda_graph_ms"] = timed[f"algo_{row['index']}"]["gpu"]["median_ms"]
     return {"mnk": [M, N, K], "returned": found.value, "selected": plan.record()["algo"], "algorithms": algos,
             "williams_orders": orders}
 
@@ -471,7 +502,8 @@ def part_b(device, protocol: dict, flush: Tensor, log) -> dict:
             for name, dtype in OUT_DTYPES.items():
                 plan = fs.lt_plan(M2, N2, K2, dtype, device)
                 out = torch.full((M2, N2), float("nan"), dtype=dtype, device=device)  # C must not be read
-                plan(act, lay.w_packed, lay.w_scale, al, out)
+                ws = None if plan.direct else torch.empty(plan.workspace_bytes, dtype=torch.uint8, device=device)
+                plan(act, lay.w_packed, lay.w_scale, al, out, ws)
                 ref = nb.nvfp4_scaled_mm_public(act, lay.w_packed, lay.w_scale, lay.w_global, dtype)
                 exact.append({"mnk": [M2, N2, K2], "rotation": rot, "out_dtype": name, "direct": plan.direct,
                               "algo": plan.record()["algo"], "bitwise_equal_public": _bitwise_equal(out, ref)})
@@ -482,7 +514,8 @@ def part_b(device, protocol: dict, flush: Tensor, log) -> dict:
     return {"design": "Profiler traces of one call (CPU aten ops, CUDA kernels); the direct cuBLASLt call writes into "
                       "a NaN-filled output (beta = 0 must not read C) and is compared bit for bit with "
                       "nvfp4_scaled_mm_public for every shape, rotation and output dtype; every heuristic algorithm "
-                      "is timed as a CUDA graph (4x L2 flush).",
+                      "(with its own workspace when it needs one) is checked bit for bit and timed as a CUDA graph "
+                      "(4x L2 flush).",
             "traces": traces, "exactness": exact, "heuristic": algos}
 
 
@@ -506,21 +539,26 @@ def _wide_modules(model, family: str, angles: dict) -> dict:
 
 
 def summarize_part_c_model(row: dict) -> dict:
+    """Median GPU ms of every method and its speedups against BOTH BF16 references (compiled and CUDA graph)."""
     t = row["timing"]
     bf16 = t["bf16_graph"]["gpu"]["median_ms"]
+    comp = t["bf16_compiled"]["gpu"]["median_ms"]
     table = {n: {"ms": t[n]["gpu"]["median_ms"], "wall_ms": t[n]["wall"]["median_ms"],
                  "tokens_per_s": row["tokens_per_call"] / (t[n]["gpu"]["median_ms"] * 1e-3),
-                 "speedup_vs_bf16_graph": bf16 / t[n]["gpu"]["median_ms"]} for n in PART_C_METHODS}
+                 "speedup_vs_bf16_graph": bf16 / t[n]["gpu"]["median_ms"],
+                 "speedup_vs_bf16_compiled": comp / t[n]["gpu"]["median_ms"]} for n in PART_C_METHODS}
     variants = {v: {"c5_03_ms": table[f"c5_03_{v}"]["ms"], "c6_02_ms": table[f"c6_02_{v}"]["ms"],
                     "c6_02_speedup_vs_c5_03": table[f"c5_03_{v}"]["ms"] / table[f"c6_02_{v}"]["ms"],
-                    "c6_02_speedup_vs_bf16_graph": bf16 / table[f"c6_02_{v}"]["ms"]} for v in VARIANTS}
+                    "c6_02_speedup_vs_bf16_graph": bf16 / table[f"c6_02_{v}"]["ms"],
+                    "c6_02_speedup_vs_bf16_compiled": comp / table[f"c6_02_{v}"]["ms"]} for v in VARIANTS}
     wide = {f: {"c6_01_ms": table[f"c6_01_{f}"]["ms"], "c6_02_crossinput_ms": table[f"c6_02_crossinput_{f}"]["ms"],
                 "c6_02_fused_ms": table[f"c6_02_fused_{f}"]["ms"],
                 "fused_speedup_vs_c6_01": table[f"c6_01_{f}"]["ms"] / table[f"c6_02_fused_{f}"]["ms"],
                 "fused_speedup_vs_bf16_graph": bf16 / table[f"c6_02_fused_{f}"]["ms"],
+                "fused_speedup_vs_bf16_compiled": comp / table[f"c6_02_fused_{f}"]["ms"],
                 "fused_overhead_vs_c6_02_had_b16": table[f"c6_02_fused_{f}"]["ms"] / table["c6_02_had_b16"]["ms"]}
             for f in WIDE_FAMILIES}
-    return {"methods": table, "variants": variants, "wide": wide}
+    return {"bf16_graph_ms": bf16, "bf16_compiled_ms": comp, "methods": table, "variants": variants, "wide": wide}
 
 
 def part_c_model(device, name: str, batch: int, t: dict, flush: Tensor, seed: int, log) -> dict:
@@ -560,6 +598,13 @@ def part_c_model(device, name: str, batch: int, t: dict, flush: Tensor, seed: in
         for p, m in variants.items():
             models[f"{p}_{fam}"] = m
     keep += list(models.values())
+    compiled = torch.compile(model)  # default Inductor settings, as the C5-03 primary BF16 comparator
+    began = time.perf_counter()
+    with torch.inference_mode():
+        for _ in range(3):
+            compiled(tokens)
+    torch.cuda.synchronize()
+    compile_seconds = time.perf_counter() - began
 
     def forward(m):
         def run():
@@ -570,6 +615,7 @@ def part_c_model(device, name: str, batch: int, t: dict, flush: Tensor, seed: in
     checks, parity, rel = {}, {}, {}
     with torch.inference_mode():  # one pair (or triple) of logits at a time: 50m logits are 0.8 GB each
         reference = model(tokens).float()
+        rel["bf16_compiled"] = e2e._rel(compiled(tokens), reference)
         for v in VARIANTS:
             a, b = models[f"c5_03_{v}"](tokens), models[f"c6_02_{v}"](tokens)
             checks[f"{v}_c6_02_logits_equal_c5_03_bitwise"] = _bitwise_equal(b, a)
@@ -580,34 +626,51 @@ def part_c_model(device, name: str, batch: int, t: dict, flush: Tensor, seed: in
             checks[f"{fam}_c6_02_crossinput_logits_equal_c6_01_bitwise"] = _bitwise_equal(b, a)
             parity[fam] = {"logits_bitwise_equal_c6_01": _bitwise_equal(c, a),
                            "logits_mismatches": _mismatches(c, a), "logits_numel": c.numel(),
-                           "logits_max_abs_diff": float((c.float() - a.float()).abs().max()),
+                           "logits_max_abs_diff": _max_abs_diff(c, a),
                            "logits_rel_diff_vs_c6_01": e2e._rel(c, a)}
             for p, logits in zip(WIDE_PATHS, (a, b, c)):
                 rel[f"{p}_{fam}"] = e2e._rel(logits, reference)
             del a, b, c
             parity[fam].update(_fused_mix_parity(model, tokens, fused_modules[fam]))
     del reference
+    with torch.inference_mode():
+        compiled_logits = compiled(tokens)
     pool = torch.cuda.graph_pool_handle()
-    functions = {"bf16_graph": c503.capture_shared(forward(model), pool)}
-    for k in PART_C_METHODS[1:]:
+    graph_out = {}
+    functions = {"bf16_graph": c503.capture_shared(
+        lambda: graph_out.__setitem__("y", forward(model)()), pool), "bf16_compiled": forward(compiled)}
+    functions["bf16_graph"]()  # the replayed graph logits against the compiled logits (before the pool is shared)
+    torch.cuda.synchronize()
+    compiled_parity = {"logits_finite": bool(torch.isfinite(compiled_logits).all()),
+                       "logits_numel": compiled_logits.numel(),
+                       "logits_rel_diff_vs_bf16_graph": e2e._rel(compiled_logits, graph_out["y"]),
+                       "logits_max_abs_diff_vs_bf16_graph": _max_abs_diff(compiled_logits, graph_out["y"])}
+    del compiled_logits, graph_out
+    for k in PART_C_METHODS[2:]:
         functions[k] = c503.capture_shared(forward(models[k]), pool)
     functions = {k: functions[k] for k in PART_C_METHODS}
     profile = {k: _kinds(p) for k, p in kernel_profile(
-        {k: functions[k] for k in ("c5_03_had_b16", "c6_02_had_b16", "c6_01_cross_full_butterfly_b16",
-                                   "c6_02_fused_cross_full_butterfly_b16")}, flush, reps=3).items()}
+        {k: functions[k] for k in PART_C_PROFILED}, flush, reps=PROFILE_REPS_C).items()}
     timed, orders = timing(functions, t, t["squares_c"], flush)
     row = {"config": asdict(config), "batch": batch, "tokens_per_call": batch * config.sequence_length,
            "nvfp4_layers": len(linears), "linear_parameters": sum(m.weight.numel() for m in linears.values()),
-           "checks": checks, "fused_cross_mix_parity": parity, "logits_rel_diff_vs_bf16": rel,
+           "compile_seconds": compile_seconds, "checks": checks, "bf16_compiled_parity": compiled_parity,
+           "fused_cross_mix_parity": parity, "logits_rel_diff_vs_bf16": rel,
            "kernel_kinds_per_forward": profile, "williams_orders": orders, "timing": timed}
     row["summary"] = summarize_part_c_model(row)
     s = row["summary"]
-    log(f"  C {name}: bf16 graph {s['methods']['bf16_graph']['ms']:.3f} ms | " + "  ".join(
+    log(f"  C {name}: bf16 graph {s['bf16_graph_ms']:.3f} compiled {s['bf16_compiled_ms']:.3f} ms | " + "  ".join(
         f"{v} {s['variants'][v]['c5_03_ms']:.3f}->{s['variants'][v]['c6_02_ms']:.3f}" for v in VARIANTS) + " | " +
         "  ".join(f"{f} {s['wide'][f]['c6_01_ms']:.3f}->{s['wide'][f]['c6_02_fused_ms']:.3f}" for f in WIDE_FAMILIES))
-    del model, models, functions, keep, pool, fused_modules
+    del model, models, functions, keep, pool, fused_modules, compiled
+    torch._dynamo.reset()
     torch.cuda.empty_cache()
     return row
+
+
+def _max_abs_diff(a: Tensor, b: Tensor) -> float:
+    """max |a - b| in FP32, one leading row at a time (exact: max does not depend on the order; less memory)."""
+    return max(float((x.float() - y.float()).abs().max()) for x, y in zip(a, b))
 
 
 @torch.no_grad()
@@ -645,47 +708,145 @@ def _fused_mix_parity(model, tokens: Tensor, modules: dict) -> dict:
     return counts
 
 
-def c6_01_cells() -> dict:
-    """The C6-01 per-method three-seed test NLL means of the Pareto cells (from the SHA-256-pinned result)."""
+def _c6_01_result() -> dict:
     data = (ROOT / C6_01_RESULT).read_bytes()
     _require(hashlib.sha256(data).hexdigest() == PINNED_INPUTS[C6_01_RESULT], f"{C6_01_RESULT} is not the pinned file")
-    cells = json.loads(data)["analysis"]["cells"]
+    return json.loads(data)
+
+
+def _c6_01_unit(result: dict, preset: str, seed: int) -> dict:
+    part, arm = PARETO_CELLS[preset].split("/")
+    found = [u for u in result["units"] if (u["part"], u["seed"], u["arm"]) == (part, seed, arm)]
+    _require(len(found) == 1, f"C6-01 has no unique unit {PARETO_CELLS[preset]} seed {seed}")
+    return found[0]
+
+
+def c6_01_cells() -> dict:
+    """The C6-01 per-method three-seed test NLL means of the Pareto cells (from the SHA-256-pinned result)."""
+    cells = _c6_01_result()["analysis"]["cells"]
     out = {}
     for preset, cell in PARETO_CELLS.items():
         c = cells[cell]
-        rows = {"bf16": {"test_nll": c["bf16"]["test"]["mean"], "test_delta_nll": 0.0}}
+        rows = {"bf16_graph": {"test_nll": c["bf16"]["test"]["mean"], "test_delta_nll": 0.0, "nll_source": "c6_01"}}
         for point, (_, key) in PARETO_POINTS.items():
             if key is not None and key in c["methods"]:
                 m = c["methods"][key]["test"]
-                rows[point] = {"test_nll": m["nll"]["mean"], "test_delta_nll": m["delta_nll"]["mean"]}
-        out[preset] = {"cell": cell, "methods": rows}
+                rows[point] = {"test_nll": m["nll"]["mean"], "test_delta_nll": m["delta_nll"]["mean"],
+                               "nll_source": "c6_01"}
+        out[preset] = {"cell": cell, "bf16_test_nll": c["bf16"]["test"]["mean"], "methods": rows}
     return out
 
 
-def pareto(part_c: dict) -> dict:
-    """Latency (C6-02 Part C graph ms) against the C6-01 test NLL; the frontier is the non-dominated set."""
+def compiled_bf16_trained_eval(device, presets, log) -> dict:
+    """Test NLL of the compiled BF16 forward on the pinned trained C6-01 checkpoints of every Pareto preset.
+
+    Per seed: ``c503.load_checkpoint`` (file and tensor SHA-256 of the C6-01 training record), cast to BF16,
+    ``torch.compile`` (default Inductor) and ``q.evaluate_split`` under inference mode on the full test split
+    (SHA-256 verified), with the C6-01 window length and microbatch. Presets without a C6-01 cell are skipped.
+    """
+    presets = [p for p in presets if p in PARETO_CELLS]
+    if not presets:
+        return {}
+    result = _c6_01_result()
+    test_path = ROOT / TEST_SPLIT_REPO_PATH
+    test_sha = c503.file_sha256(test_path)
+    _require(test_sha == C6_01_TEST_SHA256 == result["data"]["splits"]["test"]["sha256"],
+             f"{TEST_SPLIT_REPO_PATH} is not the C6-01 test split")
+    tokens = np.memmap(test_path, dtype=np.uint16, mode="r")
     cells = c6_01_cells()
+    out = {}
+    for preset in presets:
+        config = PART_C_CONFIGS[preset]
+        _require(asdict(config) == result["configs"][PARETO_CELLS[preset].split("/")[0]],
+                 f"{preset}: the Part C config differs from the C6-01 config")
+        seeds = []
+        for seed in TRAINED_SEEDS:
+            unit = _c6_01_unit(result, preset, seed)
+            record = unit["training"]
+            began = time.perf_counter()
+            model = c503.load_checkpoint(config, device, ROOT / CHECKPOINT_DIRS[preset] / record["checkpoint_file"],
+                                         record).to(torch.bfloat16).eval()
+            compiled = torch.compile(model)
+            with torch.inference_mode():
+                scored = q.evaluate_split(compiled, tokens, config.sequence_length, config.micro_batch, device)
+            seeds.append({"seed": seed, "checkpoint_file": record["checkpoint_file"],
+                          "checkpoint_sha256": record["checkpoint_sha256"],
+                          "checkpoint_file_sha256": record["checkpoint_file_sha256"],
+                          "test_nll": scored["nll"], "tokens": scored["tokens"], "windows": scored["windows"],
+                          "split_tokens": scored["split_tokens"],
+                          "c6_01_bf16_test_nll": unit["baseline_test"]["nll"],
+                          "seconds": time.perf_counter() - began})
+            log(f"  C trained {preset} seed {seed}: compiled BF16 test NLL {scored['nll']:.6f} "
+                f"(C6-01 BF16 {unit['baseline_test']['nll']:.6f})")
+            del model, compiled
+            torch._dynamo.reset()
+            torch.cuda.empty_cache()
+        mean = math.fsum(r["test_nll"] for r in seeds) / len(seeds)
+        out[preset] = {"c6_01_cell": PARETO_CELLS[preset], "test_split_sha256": test_sha,
+                       "checkpoint_dir": CHECKPOINT_DIRS[preset], "seeds": seeds, "mean_test_nll": mean,
+                       "c6_01_bf16_mean_test_nll": cells[preset]["bf16_test_nll"],
+                       "mean_delta_vs_c6_01_bf16": mean - cells[preset]["bf16_test_nll"]}
+    return out
+
+
+def _frontier(points: list[dict]) -> list[str]:
+    """Non-dominated methods by (latency, test NLL), fastest first."""
+    frontier, best = [], math.inf
+    for p in sorted(points, key=lambda p: (p["latency_ms"], p["test_nll"])):
+        if p["test_nll"] < best:
+            frontier.append(p["method"])
+            best = p["test_nll"]
+    return frontier
+
+
+def pareto(part_c: dict) -> dict:
+    """Latency (Part C GPU median ms) against test NLL, per Pareto preset.
+
+    Points: every C6-01 method (archived C6-01 three-seed test NLL), ``bf16_graph`` (archived C6-01 BF16 NLL)
+    and ``bf16_compiled`` (live compiled-BF16 NLL on the same checkpoints). ``frontier`` is the primary
+    non-dominated set (with compiled BF16); ``frontier_vs_bf16_graph`` leaves the compiled point out.
+    """
+    cells = c6_01_cells()
+    trained = part_c["compiled_bf16_trained_eval"]
     out = {}
     for preset, cell in cells.items():
         if preset not in part_c["models"]:
             continue
         table = part_c["models"][preset]["summary"]["methods"]
+        rows = dict(cell["methods"])
+        rows["bf16_compiled"] = {"test_nll": trained[preset]["mean_test_nll"],
+                                 "test_delta_nll": trained[preset]["mean_delta_vs_c6_01_bf16"],
+                                 "nll_source": "live_compiled_bf16"}
         points = []
-        for point, row in cell["methods"].items():
+        for point in PARETO_POINTS:
+            if point not in rows:
+                continue
             method = PARETO_POINTS[point][0]
             c6_01_path = PARETO_C6_01_PATH.get(point)
+            parity = part_c["models"][preset]["fused_cross_mix_parity"].get(c6_01_path.removeprefix("c6_01_")) \
+                if c6_01_path else None
             points.append({"method": point, "part_c_method": method, "latency_ms": table[method]["ms"],
                            "c6_01_path_latency_ms": table[c6_01_path]["ms"] if c6_01_path else None,
-                           "test_nll": row["test_nll"], "test_delta_nll": row["test_delta_nll"]})
+                           "fused_logits_bitwise_equal_c6_01": parity["logits_bitwise_equal_c6_01"] if parity else None,
+                           "test_nll": rows[point]["test_nll"], "test_delta_nll": rows[point]["test_delta_nll"],
+                           "nll_source": rows[point]["nll_source"]})
         points.sort(key=lambda p: (p["latency_ms"], p["test_nll"]))
-        frontier, best = [], math.inf
-        for p in points:
-            if p["test_nll"] < best:
-                frontier.append(p["method"])
-                best = p["test_nll"]
+        frontier = _frontier(points)
+        graph_frontier = _frontier([p for p in points if p["method"] != "bf16_compiled"])
+        comp = next(p for p in points if p["method"] == "bf16_compiled")
         for p in points:
             p["on_frontier"] = p["method"] in frontier
-        out[preset] = {"c6_01_cell": cell["cell"], "points": points, "frontier": frontier}
+            p["on_frontier_vs_bf16_graph"] = p["method"] in graph_frontier
+            p["dominated_by_bf16_compiled"] = (p["method"] != "bf16_compiled" and p["latency_ms"] >= comp["latency_ms"]
+                                               and p["test_nll"] >= comp["test_nll"])
+        wide = [p for p in PARETO_C6_01_PATH if any(q_["method"] == p for q_ in points)]
+        out[preset] = {"c6_01_cell": cell["cell"], "points": points, "frontier": frontier,
+                       "frontier_vs_bf16_graph": graph_frontier,
+                       "wide_on_frontier": [p for p in wide if p in frontier],
+                       "wide_dominated_by_bf16_compiled": [p["method"] for p in points
+                                                           if p["method"] in wide and p["dominated_by_bf16_compiled"]],
+                       "wide_faster_than_bf16_compiled": [p["method"] for p in points
+                                                          if p["method"] in wide and p["latency_ms"] < comp["latency_ms"]]}
     return out
 
 
@@ -694,14 +855,19 @@ def part_c(device, protocol: dict, flush: Tensor, log) -> dict:
     rows = {name: part_c_model(device, name, batch, t, flush, protocol["seed"], log)
             for name, batch in protocol["part_c"]["models"].items()}
     torch._dynamo.reset()
+    trained = compiled_bf16_trained_eval(device, protocol["part_c"]["trained_eval_presets"], log)
     return {"design": "random-init BF16 weights and tokens; every block linear (qkv, out, gate, up, down) replaced by "
-                      "an RTN NVFP4 layer. Variants: c5_03_* nvfp4_inference_blackwell, c6_02_* FastNVFP4Linear on "
-                      "the same weights. Wide families: c6_01_* = rotated_qat.CrossInput (FP32 PyTorch cross-block "
-                      "mix) over the C5-03 layer (the C6-01 hardware path), c6_02_crossinput_* the same over "
-                      "FastNVFP4Linear, c6_02_fused_* FastCrossInput (one Triton cross-mix kernel). One CUDA graph "
-                      "per forward (shared memory pool), Williams-balanced, 4x L2 flush. Embedding, norms, "
-                      "attention and the tied head stay BF16.",
-            "models": rows}
+                      "an RTN NVFP4 layer. bf16_graph: one CUDA graph of the eager BF16 forward; bf16_compiled: "
+                      "torch.compile(model) with default Inductor settings under inference mode, 3 warm-up calls, "
+                      "timed eagerly (the C5-03 primary BF16 comparator). Variants: c5_03_* nvfp4_inference_blackwell, "
+                      "c6_02_* FastNVFP4Linear on the same weights. Wide families: c6_01_* = rotated_qat.CrossInput "
+                      "(FP32 PyTorch cross-block mix) over the C5-03 layer (the C6-01 hardware path), "
+                      "c6_02_crossinput_* the same over FastNVFP4Linear, c6_02_fused_* FastCrossInput (exact=False: "
+                      "one Triton cross-mix kernel, a latency path whose logits parity is measured per model). One CUDA "
+                      "graph per forward (shared memory pool), every method in one Williams-balanced session, 4x L2 "
+                      "flush. Embedding, norms, attention and the tied head stay BF16. compiled_bf16_trained_eval: the "
+                      "compiled BF16 forward on the six pinned trained C6-01 checkpoints (full test split).",
+            "models": rows, "compiled_bf16_trained_eval": trained}
 
 
 # ======================================================================================
@@ -862,19 +1028,40 @@ def summarize(payload: dict) -> dict:
               "heuristic_algorithms": b["heuristic"]["returned"],
               "gemm_only_cuda_graph": {r["label"] or str(r["mnk"]): r["gemm_only"] for r in shapes}}
     part_c = {name: {"variants": m["summary"]["variants"], "wide": m["summary"]["wide"],
-                     "bf16_graph_ms": m["summary"]["methods"]["bf16_graph"]["ms"],
+                     "bf16_graph_ms": m["summary"]["bf16_graph_ms"], "bf16_compiled_ms": m["summary"]["bf16_compiled_ms"],
+                     "bf16_compiled_parity": m["bf16_compiled_parity"],
                      "fused_cross_mix_parity": {f: {k: v for k, v in p.items() if k in (
                          "logits_bitwise_equal_c6_01", "logits_mismatches", "logits_max_abs_diff",
-                         "mixed_mismatch_fraction", "layers_exact", "layers")} for f, p in
-                         m["fused_cross_mix_parity"].items()}} for name, m in c["models"].items()}
+                         "logits_rel_diff_vs_c6_01", "mixed_mismatch_fraction", "layers_exact", "layers")} for f, p in
+                         m["fused_cross_mix_parity"].items()},
+                     "fused_cross_mix_fidelity": {f: _fidelity(name, p) for f, p in m["fused_cross_mix_parity"].items()}}
+              for name, m in c["models"].items()}
+    trained = {preset: {"seeds": [r["test_nll"] for r in e["seeds"]], "mean_test_nll": e["mean_test_nll"],
+                        "c6_01_bf16_mean_test_nll": e["c6_01_bf16_mean_test_nll"]}
+               for preset, e in c["compiled_bf16_trained_eval"].items()}
+    conclusions = {preset: {k: p[k] for k in ("frontier", "frontier_vs_bf16_graph", "wide_on_frontier",
+                                             "wide_dominated_by_bf16_compiled", "wide_faster_than_bf16_compiled")}
+                   for preset, p in payload["pareto"].items()}
     return {"part_a_cuda_graph_cells_beating_bf16": [len(beats), len(cells)],
             "part_a_cuda_graph_trailing_bf16": trailing, "part_a_cuda_graph_regressions_vs_c5_03": regressions,
             "part_a_cuda_graph_delegated_cells": delegated,
             "part_a": shapes, "part_a_1024x512x1408_kernel_us": profile,
             "part_a_ablation": [{"mnk": [x["m"], x["n"], x["k"]], "ms": {k: v["ms"] for k, v in x["summary"].items()}}
                                 for x in a["ablation"]],
-            "part_b": part_b, "part_c": part_c, "pareto": payload["pareto"],
+            "part_b": part_b, "part_c": part_c, "compiled_bf16_trained_test_nll": trained,
+            "pareto_conclusions": conclusions, "pareto": payload["pareto"],
             "kernel_parity": [payload["kernel_parity"]["cases"], len(payload["kernel_parity"]["bitwise_failures"])]}
+
+
+def _fidelity(model: str, parity: dict) -> str:
+    """How far the fused-mix logits of a Part C model may stand in for the C6-01 hardware path."""
+    if parity["logits_mismatches"] == 0:
+        return "logits_bitwise_equal_c6_01" if model in PARETO_CELLS else "logits_bitwise_equal_c6_01_no_trained_cell"
+    return "latency_only_non_exact"
+
+
+def _ms(x: float) -> str:
+    return f"{x:.3f} ms"
 
 
 def caveats(payload: dict) -> list[str]:
@@ -898,21 +1085,69 @@ def caveats(payload: dict) -> list[str]:
         "cublasLtMatmul with PyTorch's descriptor (1 MiB heuristic limit, device pointer mode). Equality with "
         "nvfp4_scaled_mm_public is measured bit for bit, not derived; it holds for the cuBLASLt build of this torch "
         "wheel. The direct call runs through ctypes (host cost in eager mode).",
-        "Part C models use random weights: latency does not depend on the weight values, but the NLL axis of the Pareto "
-        "comes from the C6-01 three-seed test means (pinned C6-01 result), not from these models.",
-        "The fused cross-mix (FastCrossInput) reproduces the two-half FMA order of the cuBLAS gemmSN kernels that "
-        "torch.matmul picks for most shapes; where cuBLAS picks another kernel the mixed FP32 values differ by "
-        "rounding. Its parity against rotated_qat.CrossInput (mixed-value and logits mismatches) is measured per model "
-        "and family, so the C6-01 NLLs carry over approximately (near-0 parity), not bit for bit, for the full mix.",
+        "Part C models use random weights: latency does not depend on the weight values. The NLL axis of the Pareto "
+        "comes from the C6-01 three-seed test means (pinned C6-01 result) for the quantized methods and bf16_graph, "
+        "and from this run's compiled BF16 scoring of the same six trained checkpoints for bf16_compiled.",
+        *_compiled_caveats(payload),
+        *_fidelity_caveats(payload),
         "Every wide-family linear computes its own cross-mix as in the C6-01 hardware path (gate and up mix the same "
         "input twice); sharing it would be a further model-level change, not measured here.",
         "The butterfly coefficients of FastNVFP4Linear live in a non-persistent (16, G, 4) buffer derived from the "
         "(cos, sin) tables; the public quantize_activation keeps the (G, 4, 8) table API.",
-        f"Study history: a first canonical attempt from {SUPERSEDED_ATTEMPT['producer_git_sha'][:7]} was rejected by "
-        f"its validator ({SUPERSEDED_ATTEMPT['rejected_by']}: delegated layers were not counted); this result was "
-        "measured again after that rule and the per-rotation delegation limits were corrected. The rejected payload "
-        "and log are retained outside git with the SHA-256 values in SUPERSEDED_ATTEMPT.",
+        "The delegation limits (fs.DELEGATE_FROM, fs.DELEGATE_MIN_K) were changed after the first canonical attempt, "
+        "from RTX 5080 sweeps on shapes that overlap this grid: they are performance-informed routing for the "
+        "measured shapes. The zero count of non-delegated regressions does not show a uniformly faster native "
+        "quantizer and does not predict the crossover on unseen shapes.",
+        *(f"Study history: attempt {i + 1} (producer {a['producer_git_sha'][:7]}"
+          + (f", result commit {a['result_commit'][:7]}" if a["result_commit"] else "") + f") {a['outcome']}. "
+          "Receipts: " + ", ".join(f"{k} {v[:12]}" for k, v in a["receipts"].items()) + "."
+          for i, a in enumerate(SUPERSEDED_ATTEMPTS)),
     ]
+    return out
+
+
+def _compiled_caveats(payload: dict) -> list[str]:
+    """The BF16 reference statements: both BF16 paths per model, and one Pareto conclusion per trained preset."""
+    s = payload["summary"]
+    out = ["Two BF16 references: bf16_graph (a CUDA graph of the eager forward: launch overhead removed, no "
+           "fusion) and bf16_compiled (torch.compile default Inductor, timed eagerly in the same session: fused "
+           "elementwise work). bf16_compiled is the primary reference, as in C5-03. Medians: " + "; ".join(
+               f"{name} graph {_ms(m['bf16_graph_ms'])}, compiled {_ms(m['bf16_compiled_ms'])}"
+               for name, m in s["part_c"].items()) + "."]
+    for preset, cc in s["pareto_conclusions"].items():
+        wide = list(PARETO_C6_01_PATH)
+        dominated, faster = cc["wide_dominated_by_bf16_compiled"], cc["wide_faster_than_bf16_compiled"]
+        t = s["compiled_bf16_trained_test_nll"][preset]
+        verdict = (f"compiled BF16 dominates all {len(wide)} wide paths (each is slower and has a higher test NLL)"
+                   if sorted(dominated) == sorted(wide) else
+                   f"compiled BF16 dominates {dominated or 'none'} of the wide paths; {faster or 'none'} run faster "
+                   f"than compiled BF16, and {cc['wide_on_frontier'] or 'none'} stay on the primary frontier")
+        out.append(f"Pareto {preset} (trained compiled BF16 test NLL {t['mean_test_nll']:.6f}, three seeds; C6-01 "
+                   f"BF16 {t['c6_01_bf16_mean_test_nll']:.6f}): {verdict}. Primary frontier (with bf16_compiled): "
+                   f"{cc['frontier']}; frontier against bf16_graph only: {cc['frontier_vs_bf16_graph']}.")
+    return out
+
+
+def _fidelity_caveats(payload: dict) -> list[str]:
+    """Per model: whether the fused cross-mix may carry the C6-01 NLL, or is a latency-only path."""
+    out = ["The fused cross-mix (FastCrossInput, exact=False) follows the two-half FMA order of the cuBLAS gemmSN "
+           "kernels; where cuBLAS picks another kernel single mixed FP32 values differ by rounding (about 1e-6), "
+           "which can flip packed FP4 codes. Later blocks amplify such flips, so a small mixed-value difference does "
+           "not bound the logits error. FastCrossInput(exact=True) runs the reference mix bit for bit at any shape."]
+    for name, m in payload["summary"]["part_c"].items():
+        parts = []
+        for f, p in m["fused_cross_mix_parity"].items():
+            fid = m["fused_cross_mix_fidelity"][f]
+            if fid == "latency_only_non_exact":
+                parts.append(f"{f} latency only, not exact ({p['logits_mismatches']} logits differ, relative L2 "
+                             f"{p['logits_rel_diff_vs_c6_01']:.4f}; no trained NLL qualification)")
+            else:
+                parts.append(f"{f} logits bit-identical to the C6-01 path on these weights ({p['layers_exact']}/"
+                             f"{p['layers']} layers with bit-identical mixed values)")
+        scope = ("the C6-01 test NLL is assigned to the fused paths that match bit for bit; the timing tokens are not "
+                 "the test windows, so this is a random-weight parity check, not a trained-weight proof"
+                 if name in PARETO_CELLS else "no C6-01 trained cell exists for this model: latency only")
+        out.append(f"Fused cross-mix fidelity, {name}: " + "; ".join(parts) + f". Scope: {scope}.")
     return out
 
 
@@ -1013,7 +1248,11 @@ def verify_canonical_output_path(path: Path) -> Path:
 
 
 def write_json_atomic(path: Path, payload: dict, *, canonical_dest: bool = False) -> dict:
-    """Lossless atomic write through one verified ``dir_fd`` and an ``O_EXCL`` same-directory temp file."""
+    """Lossless atomic write through one verified ``dir_fd`` and an ``O_EXCL`` same-directory temp file.
+
+    ``canonical_dest``: atomic no-replace publication (``os.link`` of the verified temp file, then unlink), so a
+    second producer gets ``FileExistsError`` instead of replacing the result. Other paths use ``os.replace``.
+    """
     path = Path(path)
     guarded = canonical_dest or reserved(path)
     text = e2e._dumps_json(payload) + "\n"
@@ -1038,7 +1277,11 @@ def write_json_atomic(path: Path, payload: dict, *, canonical_dest: bool = False
             raise ValueError("JSON round trip is not lossless")
         if guarded:
             c503._check_not_symlink(filename, dir_fd, path, path)
-        os.replace(tmp_name, filename, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        if canonical_dest:  # no-replace publication: link fails with FileExistsError if the name exists
+            os.link(tmp_name, filename, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        else:
+            os.replace(tmp_name, filename, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         tmp_name = None
         os.fsync(dir_fd)
     finally:
@@ -1118,6 +1361,35 @@ def run(args) -> dict:
     return payload
 
 
+def verify_superseded_receipts(directory: Path | None = None) -> dict:
+    """SHA-256 of every retained receipt of ``SUPERSEDED_ATTEMPTS`` that exists in ``directory`` (default
+    ``artifacts/c6_02_run_evidence``), and of the v1 result blob at its result commit when git has it.
+
+    Returns {name: "verified" | "absent"}; raises ``ValueError`` on any mismatch.
+    """
+    directory = ROOT / SUPERSEDED_EVIDENCE_DIR if directory is None else Path(directory)
+    out = {}
+    for attempt in SUPERSEDED_ATTEMPTS:
+        for name, digest in attempt["receipts"].items():
+            path = directory / name
+            if not path.is_file():
+                out[name] = "absent"
+                continue
+            _require(c503.file_sha256(path) == digest, f"{path}: SHA-256 differs from the superseded-attempt receipt")
+            out[name] = "verified"
+        commit = attempt["result_commit"]
+        if commit is not None:
+            key = f"{commit[:7]}:{RESULT_REPO_PATH}"
+            blob = c503._git("show", f"{commit}:{RESULT_REPO_PATH}")
+            if blob.returncode != 0:
+                out[key] = "absent"
+                continue
+            want = next(v for k, v in attempt["receipts"].items() if k.endswith(".json"))
+            _require(hashlib.sha256(blob.stdout).hexdigest() == want, f"{key}: SHA-256 differs from the receipt")
+            out[key] = "verified"
+    return out
+
+
 def rejected_path(output: Path) -> Path:
     output = Path(output)
     name = output.name.replace("cycle6_c6_02", "rejected_c6_02")
@@ -1180,6 +1452,13 @@ def _close(a, b, where: str) -> None:
 
 
 def _validate_profile(method: str, kernels: dict, delegated: bool, where: str) -> None:
+    _require(isinstance(kernels, dict) and kernels, f"{where}/{method}: empty kernel profile")
+    for name, entry in kernels.items():
+        count = entry["count"]
+        _require(set(entry) == {"us", "launches", "count", "kind"} and entry["kind"] == kernel_kind(name)
+                 and _finite_positive(entry["us"]) and type(count) is int and count >= 1
+                 and abs(entry["launches"] - count / PROFILE_REPS_A) <= TOL,
+                 f"{where}/{method}/{name}: invalid kernel record")
     kinds = _kinds(kernels)
     _require(kinds.get("fp4_gemm", 0) == 1 and kinds.get("gemm", 0) == 0, f"{where}/{method}: one FP4 GEMM expected")
     uses_mul = method.startswith("c5_03") or method == GEMM_ONLY[0] or (delegated and method.startswith("c6_02"))
@@ -1222,6 +1501,7 @@ def _validate_part_a(payload: dict) -> None:
              "part_a ablation shapes differ")
     for x in a["ablation"]:
         where = f"part_a ablation {x['m']}x{x['n']}x{x['k']}"
+        _require(x["delegated_to_c5_03"] == _delegation(x["m"], x["k"]), f"{where}: delegation record")
         _require(set(x["checks"]) == {f"{v}_{n}_equals_c5_03_bitwise" for v in ABLATION_VARIANTS
                                       for n in ABLATION_OPTIONS} and all(v is True for v in x["checks"].values()),
                  f"{where}: an ablation output is not bit-identical")
@@ -1230,9 +1510,22 @@ def _validate_part_a(payload: dict) -> None:
         _close(c503._timing_table(x["timing"], "bf16_cublas"), x["summary"], f"{where}.summary")
 
 
+TRACES = ("torch_scaled_mm_v2", "cublaslt_fused_alpha", "c5_03_layer", "c6_02_layer")
+
+
 def _validate_part_b(payload: dict) -> None:
     b, protocol = payload["part_b"], payload["protocol"]
     tr = b["traces"]
+    _require(set(tr) == set(TRACES), "part_b: trace set")
+    for name in TRACES:
+        trace = tr[name]
+        _require(isinstance(trace["kernels"], list) and len(trace["kernels"]) >= 1
+                 and [kernel_kind(k) for k in trace["kernels"]] == trace["kernel_kinds"]
+                 and isinstance(trace["aten_ops"], list), f"part_b {name}: raw kernels and their kinds differ")
+    for name in ("cublaslt_fused_alpha", "c6_02_layer"):
+        _require("aten::mul" not in tr[name]["aten_ops"], f"part_b {name}: the direct path must not run aten::mul")
+    for name in ("torch_scaled_mm_v2", "c5_03_layer"):
+        _require("aten::mul" in tr[name]["aten_ops"], f"part_b {name}: the torch._scaled_mm_v2 path runs aten::mul")
     _require("aten::mul" in tr["torch_scaled_mm_v2"]["aten_ops"]
              and tr["torch_scaled_mm_v2"]["kernel_kinds"].count("scale_product") == 1,
              "part_b: the torch._scaled_mm_v2 trace must show the aten::mul scale product")
@@ -1249,11 +1542,19 @@ def _validate_part_b(payload: dict) -> None:
     _require(hz["mnk"] == protocol["part_b"]["algo_shape"] and hz["returned"] == len(hz["algorithms"]) >= 1,
              "part_b: heuristic record")
     _require(hz["algorithms"][0]["config"] == hz["selected"], "part_b: the selected algorithm is heuristic result 0")
+    _require([r["index"] for r in hz["algorithms"]] == list(range(hz["returned"])), "part_b: heuristic indices")
+    for r in hz["algorithms"]:
+        ws = r["workspace_bytes"]
+        _require(r["bitwise_equal_public"] is True and _finite_positive(r["cuda_graph_ms"])
+                 and type(ws) is int and ws >= 0 and r["direct"] is (ws == 0)
+                 and isinstance(r["config"], dict) and r["config"] and set(r["config"]) == set(fs._ALGO_CONFIG),
+                 f"part_b: heuristic algorithm {r['index']} record")
 
 
 def _validate_part_c(payload: dict) -> None:
     c, protocol = payload["part_c"], payload["protocol"]
     t = protocol["timing"]
+    _require(set(c) == {"design", "models", "compiled_bf16_trained_eval"}, "part_c keys differ")
     _require(list(c["models"]) == list(protocol["part_c"]["models"]), "part_c models differ")
     for name, row in c["models"].items():
         where = f"part_c {name}"
@@ -1265,15 +1566,40 @@ def _validate_part_c(payload: dict) -> None:
         _require(set(row["checks"]) == expected and all(v is True for v in row["checks"].values()),
                  f"{where}: a bitwise logits check failed")
         _require(set(row["fused_cross_mix_parity"]) == set(WIDE_FAMILIES), f"{where}: parity records")
+        cfg = row["config"]
+        logits_numel = row["tokens_per_call"] * cfg["vocab_size"]
+        mixed_values = row["tokens_per_call"] * (4 * cfg["width"] + cfg["hidden"]) * cfg["layers"]
         for f, p in row["fused_cross_mix_parity"].items():
-            _require(p["layers"] == row["nvfp4_layers"] and 0 <= p["mixed_mismatches"] <= p["mixed_values"]
-                     and p["logits_bitwise_equal_c6_01"] == (p["logits_mismatches"] == 0)
+            _require(_is_count(p["logits_numel"]) and p["logits_numel"] == logits_numel
+                     and _is_count(p["logits_mismatches"]) and p["logits_mismatches"] <= p["logits_numel"]
+                     and _is_count(p["mixed_values"]) and p["mixed_values"] == mixed_values
+                     and _is_count(p["mixed_mismatches"]) and p["mixed_mismatches"] <= p["mixed_values"]
+                     and _is_count(p["layers"]) and p["layers"] == row["nvfp4_layers"]
+                     and _is_count(p["layers_exact"]) and p["layers_exact"] <= p["layers"]
+                     and all(_finite_nonneg(p[k]) for k in ("logits_max_abs_diff", "logits_rel_diff_vs_c6_01",
+                                                            "mixed_max_abs_diff"))
+                     and p["logits_bitwise_equal_c6_01"] is (p["logits_mismatches"] == 0)
+                     and (p["logits_mismatches"] == 0) == (p["logits_max_abs_diff"] == 0.0)
+                     == (p["logits_rel_diff_vs_c6_01"] == 0.0)
+                     and (p["mixed_mismatches"] == 0) == (p["mixed_max_abs_diff"] == 0.0)
+                     == (p["layers_exact"] == p["layers"])
                      and abs(p["mixed_mismatch_fraction"] - p["mixed_mismatches"] / p["mixed_values"]) <= TOL,
                      f"{where}/{f}: inconsistent parity record")
+        cp = row["bf16_compiled_parity"]
+        _require(set(cp) == {"logits_finite", "logits_numel", "logits_rel_diff_vs_bf16_graph",
+                             "logits_max_abs_diff_vs_bf16_graph"} and cp["logits_finite"] is True
+                 and cp["logits_numel"] == logits_numel and _finite_nonneg(cp["logits_rel_diff_vs_bf16_graph"])
+                 and _finite_nonneg(cp["logits_max_abs_diff_vs_bf16_graph"]) and cp["logits_rel_diff_vs_bf16_graph"] < 1.0,
+                 f"{where}: compiled BF16 logits record")
+        _require(_finite_positive(row["compile_seconds"]), f"{where}: compile time")
         _validate_timing(row["timing"], PART_C_METHODS, t["squares_c"], t["iters"], t["wall_iters"],
                          row["williams_orders"], where)
         kinds = row["kernel_kinds_per_forward"]
         layers = row["nvfp4_layers"]
+        _require(list(kinds) == list(PART_C_PROFILED), f"{where}: profiled methods")
+        for m in BF16_METHODS:
+            _require(all(kinds[m].get(k, 0) == 0 for k in ("fp4_gemm", "amax", "quant", "cross_mix"))
+                     and kinds[m].get("gemm", 0) >= 1 + cfg["layers"] * 4, f"{where}: {m} kernel profile")
         old, new = kinds["c5_03_had_b16"], kinds["c6_02_had_b16"]
         fused, c601 = kinds["c6_02_fused_cross_full_butterfly_b16"], kinds["c6_01_cross_full_butterfly_b16"]
         had, bfly = _delegated_layers(row, "hadamard_b16"), _delegated_layers(row, "adaptive_butterfly_b16")
@@ -1286,6 +1612,48 @@ def _validate_part_c(payload: dict) -> None:
                  and old.get("quant") == new.get("quant") == fused.get("quant") == layers,
                  f"{where}: kernel launches per forward")
         _close(summarize_part_c_model(row), row["summary"], f"{where}.summary")
+    _validate_trained(c["compiled_bf16_trained_eval"], protocol)
+
+
+def _is_count(x) -> bool:
+    return type(x) is int and x >= 0
+
+
+def _finite_nonneg(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and x >= 0
+
+
+def _validate_trained(trained: dict, protocol: dict) -> None:
+    """The compiled BF16 trained-checkpoint scores: checkpoint and split identities from the pinned C6-01 result,
+    window counts, and agreement with the archived C6-01 BF16 score of each seed."""
+    presets = [p for p in protocol["part_c"]["trained_eval_presets"] if p in protocol["part_c"]["models"]]
+    _require(list(trained) == presets and protocol["part_c"]["trained_seeds"] == list(TRAINED_SEEDS),
+             "part_c: compiled BF16 trained presets")
+    if not presets:
+        return
+    result = _c6_01_result()
+    cells = c6_01_cells()
+    split_tokens = result["data"]["splits"]["test"]["tokens"]
+    for preset, e in trained.items():
+        where = f"part_c compiled_bf16_trained_eval {preset}"
+        seq = PART_C_CONFIGS[preset].sequence_length
+        _require(e["c6_01_cell"] == PARETO_CELLS[preset] and e["test_split_sha256"] == C6_01_TEST_SHA256
+                 and e["checkpoint_dir"] == CHECKPOINT_DIRS[preset] and [r["seed"] for r in e["seeds"]] == list(TRAINED_SEEDS),
+                 f"{where}: identity")
+        for r in e["seeds"]:
+            unit = _c6_01_unit(result, preset, r["seed"])
+            rec = unit["training"]
+            windows = (split_tokens - 1) // seq
+            _require(all(r[k] == rec[k] for k in ("checkpoint_file", "checkpoint_sha256", "checkpoint_file_sha256"))
+                     and r["split_tokens"] == split_tokens and r["windows"] == windows and r["tokens"] == windows * seq
+                     and _finite_positive(r["test_nll"]) and _finite_positive(r["seconds"])
+                     and r["c6_01_bf16_test_nll"] == unit["baseline_test"]["nll"]
+                     and abs(r["test_nll"] - r["c6_01_bf16_test_nll"]) <= COMPILED_BF16_NLL_TOL,
+                     f"{where} seed {r['seed']}: record")
+        mean = math.fsum(r["test_nll"] for r in e["seeds"]) / len(e["seeds"])
+        _require(abs(e["mean_test_nll"] - mean) <= TOL and e["c6_01_bf16_mean_test_nll"] == cells[preset]["bf16_test_nll"]
+                 and abs(e["mean_delta_vs_c6_01_bf16"] - (mean - e["c6_01_bf16_mean_test_nll"])) <= TOL,
+                 f"{where}: mean")
 
 
 def _delegated_layers(row: dict, rotation: str) -> int:
@@ -1320,6 +1688,9 @@ def _validate_meta(payload: dict, canonical: bool, output) -> None:
                  "meta.code_sha256 differs from the committed git blobs")
         _require(_matches_current_summary_code(meta["git_sha"]),
                  "meta.git_sha summary code differs from the validating checkout")
+        listing = c503._git("ls-tree", "--name-only", meta["git_sha"], "--", RESULT_REPO_PATH)
+        _require(listing.returncode == 0 and not listing.stdout.strip(),
+                 f"meta.git_sha already contains {RESULT_REPO_PATH}: the producer is the commit before the result")
         _require(meta["argv"] == [] and meta["command"][1:] == [SCRIPT_REPO_PATH],
                  "the canonical command takes no arguments")
         if output is not None:
@@ -1340,7 +1711,15 @@ def _validate_meta(payload: dict, canonical: bool, output) -> None:
 
 
 def validate_results(payload: dict, canonical: bool | None = None, output=None) -> dict:
-    """Structure, provenance, bitwise checks and every derived number of a C6-02 result. Raises ``ValueError``."""
+    """Structure, provenance, bitwise checks and every derived number of a C6-02 result. Raises ``ValueError``.
+
+    Offline scope: this reads the payload, the pinned inputs, the C6-01 result and git (the producer commit's
+    blobs and tree). It recomputes every derived number and checks raw records (kernel names, operator
+    traces, counts) against their classifications. It does not rerun GPU work, and it cannot tell two runs of
+    the same code apart: the canonical file's identity is its SHA-256 (pinned by the tests). The producer must
+    be a commit without the result file. Retained evidence of earlier attempts is checked separately by
+    ``verify_superseded_receipts``.
+    """
     try:
         return _validate(payload, canonical, output)
     except (KeyError, TypeError, IndexError, AttributeError, StopIteration) as exc:
