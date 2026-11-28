@@ -37,8 +37,8 @@ if CUDA:
 CANONICAL_RESULT = ROOT / "results" / "cycle6_c6_02_nvfp4_small_shape_fusion.json"
 # The v3 canonical result and its producer commit. ``None`` only in the producer commit itself, before the
 # canonical run (the result file does not exist there); the result commit pins both.
-CANONICAL_SHA256 = None
-CANONICAL_PRODUCER = None
+CANONICAL_SHA256 = "eefdda21cb9caff0660b52e2fe94bb4a99b690fcff70a1c1d874009df368bcbc"
+CANONICAL_PRODUCER = "87f1e9223048a70f8f6cd09faf2bf04dd7523940"
 ROTS = ("none", "hadamard_b16", "adaptive_butterfly_b16")
 M_SIZES = (1, 37, 128, 129, 256, 512)
 K_SIZES = (64, 80, 512, 768, 1408, 2048)
