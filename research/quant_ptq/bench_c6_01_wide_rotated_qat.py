@@ -19,8 +19,28 @@ Part C  120m. The three preserved C5-03 checkpoints (640 steps, digests pinned),
 
 Split hygiene. One freeze for the whole study: every training run, calibration, static scale, AWQ
 alpha, and every selection (wide family, best PTQ methods, transfer arm) uses train.bin and val.bin.
-``Shards.open`` maps test.bin only after the freeze, and ``ScoringLedger`` refuses a test scoring
-before it and a val scoring after it. Only two modes exist:
+The guarantee is zero pre-freeze test scoring or selection: ``ScoringLedger`` refuses a test scoring
+before the freeze and a val scoring after it, and the scoring view (``Shards.open``) maps test.bin
+only after the freeze. It is not a guarantee that no test.bin byte is read earlier: the manifest
+verification of ``real_text_data.py`` hashes and memory-maps test.bin before the freeze, and
+``splits_opened_before_freeze`` and the test-access log count the scoring interface only.
+
+Freeze coverage. A ``cycle6_c6_01.v2`` run puts the AWQ choice of every (part, seed, arm, method) into
+the freeze: the selected alpha, the val.bin scores of every alpha and the SHA-256 of the selected
+effective weights. ``selections_sha256`` covers them, and the run appends that digest to the
+test-access log before it maps test.bin. The preserved ``cycle6_c6_01.v1`` result (producer 1b4ea1c)
+differs: its pre-test ``selections_sha256`` covered the family, arm and method names only, not the AWQ
+alphas. The validator binds the v1 AWQ selections with ``HISTORICAL_V1_AWQ_SELECTIONS_SHA256``. That
+is an anti-tamper pin computed after the run, not a contemporaneous freeze, and the validation receipt
+says so (``awq_in_contemporaneous_freeze``: False for v1, True for v2).
+
+Method menus. At 50m the plain Muon arm chooses its best method from all probe methods, including the
+cross-mix butterfly composites (the v1 run selected ``cross_full_butterfly_b16_gptq``). The 50m QAT
+arms are not offered those composites. A 50m best-vs-best contrast therefore compares deployment
+pipelines; use the same-method contrasts for claims about the effect of training. At 120m the winning
+method of the v1 run was offered to both the QAT arm and its token-matched control.
+
+Only two modes exist:
 
 * the canonical run (no flag): real FineWeb-Edu shards with pinned SHA-256 values, an sm_120+ device,
   a clean committed tree, and the canonical output path, which must not exist yet;
@@ -28,7 +48,9 @@ before it and a val scoring after it. Only two modes exist:
 
 There is no real-data smoke mode, so no development run can score the real test.bin. A canonical run
 appends one line to ``artifacts/c6_01_run_evidence/test_access_log.jsonl`` before it maps test.bin and
-records the earlier lines in the result.
+records the earlier lines in the result. A shakedown keeps the same record for its synthetic test.bin
+in ``<output>.work/run_evidence``. ``verify_external_evidence`` checks a result against the retained
+checkpoint files and that log.
 
 Run (canonical, alone on the GPU, from a clean commit; about three hours on an RTX 5080):
     PYTHONPATH=. .venv/bin/python research/quant_ptq/bench_c6_01_wide_rotated_qat.py
@@ -55,6 +77,7 @@ import sys
 import time
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import asdict
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -73,7 +96,13 @@ from research.quant_ptq import nvfp4_inference_blackwell as nb
 from research.quant_ptq import rotated_qat as rq
 
 ROOT = Path(__file__).resolve().parents[2]
-SCHEMA_VERSION = "cycle6_c6_01.v1"
+SCHEMA_VERSION = "cycle6_c6_01.v2"
+# The preserved canonical result of producer 1b4ea1c. It stays valid, with every check that its records allow.
+HISTORICAL_SCHEMA_V1 = "cycle6_c6_01.v1"
+SCHEMAS = (HISTORICAL_SCHEMA_V1, SCHEMA_VERSION)
+# SHA-256 of ``awq_freeze`` of the v1 result (alpha, val.bin scores and effective-weight digest of all 36 AWQ
+# selections). The v1 freeze digest did not cover them; this pin was computed after the run.
+HISTORICAL_V1_AWQ_SELECTIONS_SHA256 = "2b8a654c4a356c90e151f439ae3134051d2929c213cce8cce19d636338a43347"
 TASK = ("Cycle 6 C6-01: wide Hadamard-rotated Muon W4A4 QAT and cross-block activation quantization mitigation "
         "(50m three-seed study, 120m real-checkpoint hardware NVFP4 transfer) on Blackwell")
 DRIVER_MODULE = "research.quant_ptq.bench_c6_01_wide_rotated_qat"
@@ -82,8 +111,12 @@ RESULT_REPO_PATH = "results/cycle6_c6_01_wide_rotated_qat.json"
 CANONICAL_OUTPUT = ROOT / RESULT_REPO_PATH
 RESERVED_PATTERN = "cycle6_c6_01*.json"
 CANONICAL_CHECKPOINT_DIR = ROOT / "artifacts" / "c6_01_checkpoints"
-TEST_ACCESS_LOG = ROOT / "artifacts" / "c6_01_run_evidence" / "test_access_log.jsonl"
+TEST_ACCESS_LOG_NAME = "test_access_log.jsonl"
+TEST_ACCESS_LOG = ROOT / "artifacts" / "c6_01_run_evidence" / TEST_ACCESS_LOG_NAME
 TEST_ACCESS_LOG_REPO_PATH = "artifacts/c6_01_run_evidence/test_access_log.jsonl"
+SHAKEDOWN_TEST_ACCESS_LOG = "<output>.work/run_evidence/test_access_log.jsonl"  # the synthetic test.bin only
+EXPECTED_ROLES = {"training": "train", "calibration": "train", "static_scales": "train",
+                  "awq_alpha_selection": "val", "method_and_arm_selection": "val", "evaluation": "test"}
 C5_03_RESULT_REPO_PATH = c503.RESULT_REPO_PATH
 # The modules that measure, analyze, summarize and validate. ``meta.git_sha`` must hold these bytes.
 SUMMARY_MODULES = (
@@ -159,6 +192,7 @@ ARMS_AB = {
     "qat_wide_dual_cooldown": ("@wide", "cooldown", "dual"),
 }
 QAT_ARMS = tuple(a for a in ARMS_AB if a != MUON)
+COOLDOWN_ARMS = tuple(a for a, spec in ARMS_AB.items() if spec is not None and spec[1] == "cooldown")
 TRANSFER_CANDIDATES = ("qat_b16_cooldown", "qat_wide_cooldown", "qat_wide_dual_cooldown")  # rotated cooldowns
 WIDE_QAT_FAMILIES = ("hadamard_b64", "kron_hadamard_full")
 # Part C arms (120m)
@@ -298,6 +332,18 @@ def selections_sha256(selections: dict) -> str:
     return hashlib.sha256(json.dumps(selections, sort_keys=True).encode()).hexdigest()
 
 
+def awq_freeze(units: list[dict]) -> list[dict]:
+    """The AWQ choice of every (part, seed, arm, method), from the val.bin records alone.
+
+    A v2 run stores this list in ``selections["awq_selections"]`` before it maps test.bin, so
+    ``selections_sha256`` covers it.
+    """
+    return [{"part": u["part"], "seed": u["seed"], "arm": u["arm"], "method": a["method"],
+             "selected_alpha": a["selected_alpha"], "val_nll_hw_dynamic": list(a["val_nll_hw_dynamic"]),
+             "effective_weight_sha256": _row(u, a["method"], "w4a16_fakequant")["effective_weights_sha256"]}
+            for u in units for a in u["awq_selection"]]
+
+
 # ======================================================================================
 # Training
 # ======================================================================================
@@ -378,9 +424,41 @@ def _cpu_snapshot(snapshot: dict) -> dict:
     return cpu(snapshot)
 
 
+def optimizer_snapshot_sha256(snapshot: dict) -> str:
+    """SHA-256 of the optimizer state of a ``c502._snapshot``: Muon momentum and the auxiliary AdamW state dict.
+
+    Keys in sorted order; every tensor with its dtype, shape and bytes; every other value by ``repr``.
+    """
+    digest = hashlib.sha256()
+
+    def feed(obj) -> None:
+        if isinstance(obj, Tensor):
+            t = obj.detach().cpu().contiguous()
+            digest.update(f"tensor:{t.dtype}:{tuple(t.shape)}\0".encode())
+            digest.update(t.reshape(-1).view(torch.uint8).numpy().tobytes())
+        elif isinstance(obj, dict):
+            digest.update(f"dict:{len(obj)}\0".encode())
+            for key in sorted(obj, key=str):
+                digest.update(f"{key!r}\0".encode())
+                feed(obj[key])
+        elif isinstance(obj, (list, tuple)):
+            digest.update(f"list:{len(obj)}\0".encode())
+            for item in obj:
+                feed(item)
+        else:
+            digest.update(f"{type(obj).__name__}:{obj!r}\0".encode())
+
+    feed({"momentum": snapshot["momentum"], "auxiliary": snapshot["auxiliary"]})
+    return digest.hexdigest()
+
+
 def train_ab_arm(arm: str, qat: dict | None, config, train, device, protocol: dict, seed: int, init: dict,
                  snapshot: dict | None, path: Path):
-    """One 50m arm. Cooldown arms branch from ``snapshot`` and run the same last batches as the Muon run."""
+    """One 50m arm. Cooldown arms branch from ``snapshot`` and run the same last batches as the Muon run.
+
+    A cooldown records the digests of the state it starts from, measured after the restore: the weights
+    (``snapshot_sha256``) and the optimizer (``optimizer_snapshot_sha256``). Both must equal the snapshot.
+    """
     spec = protocol["part_ab"]
     total, first = spec["steps"], 0
     multiplier = lambda step: c502.schedule_multiplier(step, total)  # noqa: E731
@@ -389,7 +467,12 @@ def train_ab_arm(arm: str, qat: dict | None, config, train, device, protocol: di
         first = spec["cooldown_from"]
         model, optimizer = c502._restore(config, device, _muon_protocol(spec), snapshot)
         stream = c502._stream_at(train, config, seed, device, first)
-        branch = {"from_arm": MUON, "from_step": first, "snapshot_sha256": snapshot["sha256"]}
+        branch = {"from_arm": MUON, "from_step": first, "snapshot_sha256": e2e._checkpoint_sha256(model),
+                  "optimizer_snapshot_sha256": optimizer_snapshot_sha256(
+                      {"momentum": optimizer.momentum, "auxiliary": optimizer.auxiliary.state_dict()})}
+        if (branch["snapshot_sha256"], branch["optimizer_snapshot_sha256"]) != \
+                (snapshot["sha256"], snapshot["optimizer_sha256"]):
+            raise RuntimeError(f"{arm} seed {seed}: the restored state differs from the step-{first} snapshot")
     else:
         model = _new_model(config, device, init)
         optimizer, _ = c502._muon_optimizer(model, _muon_protocol(spec), device)
@@ -398,6 +481,7 @@ def train_ab_arm(arm: str, qat: dict | None, config, train, device, protocol: di
     def at_step(step: int) -> None:
         if qat is None and step == spec["cooldown_from"]:
             snapshots[step] = _cpu_snapshot(c502._snapshot(model, optimizer))
+            snapshots[step]["optimizer_sha256"] = optimizer_snapshot_sha256(snapshots[step])
 
     losses, seconds = run_arm_steps(model, optimizer, stream, first, total, multiplier, f"{arm} seed {seed}", qat,
                                     protocol["dual_bf16_weight"], at_step)
@@ -448,7 +532,9 @@ def train_c_arm(arm: str, qat: dict | None, config, train, device, protocol: dic
     stream = c502._stream_at(train, config, seed, device, first)
     losses, seconds = run_arm_steps(model, optimizer, stream, first, total, lambda step: protocol["min_lr_ratio"],
                                     f"{arm} seed {seed}", qat, protocol["dual_bf16_weight"])
-    branch = {"from_arm": BASELINE, "from_step": first, "snapshot_sha256": baseline["checkpoint_sha256"]}
+    # No optimizer snapshot exists: both continuations start a fresh optimizer from the same weights.
+    branch = {"from_arm": BASELINE, "from_step": first, "snapshot_sha256": baseline["checkpoint_sha256"],
+              "optimizer_snapshot_sha256": None}
     return model, training_record("c", arm, seed, config, train, model, path, optimizer=spec["optimizer"],
                                   lr=spec["lr"], auxiliary_lr=spec["auxiliary_lr"], steps=total, first_step=first,
                                   losses=losses, step_seconds=seconds, qat=qat, branch=branch, init_fingerprint=None,
@@ -521,7 +607,8 @@ class Unit:
 
     def record_phase1(self) -> dict:
         """The val.bin view of the unit, for the selection rules (no test field exists yet)."""
-        return {"part": self.part, "seed": self.seed, "arm": self.arm, "grid": list(self.rows.values())}
+        return {"part": self.part, "seed": self.seed, "arm": self.arm, "grid": list(self.rows.values()),
+                "awq_selection": list(self.awq_selection)}
 
     def record(self) -> dict:
         return {"part": self.part, "seed": self.seed, "arm": self.arm, "training": self.training,
@@ -845,10 +932,10 @@ class Study:
 # The study pipeline
 # ======================================================================================
 def run_study(protocol: dict, shards, device, checkpoint_dir: Path, baseline_dir: Path | None, log,
-              before_test=lambda: None) -> dict:
+              before_test=lambda frozen_sha: None) -> dict:
     """Stages A, B and C on train.bin and val.bin, the freeze, then every test.bin scoring.
 
-    ``before_test()`` runs after the freeze and before test.bin is mapped (the canonical access log).
+    ``before_test(selections_sha256)`` runs after the freeze and before test.bin is mapped (the access log).
     """
     began = time.perf_counter()
     seeds, stage_seconds = protocol["seeds"], {}
@@ -926,10 +1013,12 @@ def run_study(protocol: dict, shards, device, checkpoint_dir: Path, baseline_dir
 
     # Freeze, then test.bin.
     phase1_opened = study.freeze()
+    selections["awq_selections"] = awq_freeze([u.record_phase1() for u in study.units])
     frozen = copy.deepcopy(selections)
     frozen_sha = selections_sha256(frozen)
-    log(f"freeze after {study.ledger.counts['val']} val.bin scorings; selections {frozen_sha[:16]}")
-    before_test()
+    log(f"freeze after {study.ledger.counts['val']} val.bin scorings; selections {frozen_sha[:16]} "
+        f"({len(frozen['awq_selections'])} AWQ selections)")
+    before_test(frozen_sha)
     study.open_test()
     t0 = time.perf_counter()
     for unit in study.units:
@@ -1211,7 +1300,7 @@ def summarize(payload: dict) -> dict:
     }
 
 
-def caveats(payload: dict) -> list[str]:
+def _caveats_v1(payload: dict) -> list[str]:
     protocol, sel, data = payload["protocol"], payload["selections"], payload["data"]
     ab, pc = protocol["part_ab"], protocol["part_c"]
     cfg_ab, cfg_c = PRESETS[ab["preset"]], PRESETS[pc["preset"]]
@@ -1276,6 +1365,64 @@ def caveats(payload: dict) -> list[str]:
         f"The {BASELINE} rows re-measure C5-03 methods on the same checkpoints in this session (max |NLL difference| "
         f"to the published C5-03 rows: {rep['max_abs_nll_difference']:.2e} nats). The contrasts use the rows of this "
         "run, not the published values.")
+    return notes
+
+
+_V1_HELD_OUT_NOTE = "test.bin is held out from every selection of this run (it is mapped once, after the freeze)"
+
+
+def caveats(payload: dict) -> list[str]:
+    """The caveats of a result. ``_caveats_v1`` is the retained v1 list: the preserved result reproduces it verbatim.
+
+    A v2 result has the same notes with the held-out note reworded (the scoring view maps test.bin after the
+    freeze; the manifest verification reads it earlier) and three more: unequal method menus, the exact
+    split-hygiene guarantee, and what the freeze digest covers in v1 and in v2.
+    """
+    notes = _caveats_v1(payload)
+    if payload["schema_version"] == HISTORICAL_SCHEMA_V1:
+        return notes
+    protocol, sel = payload["protocol"], payload["selections"]
+    ab, pc = protocol["part_ab"], protocol["part_c"]
+    best_ab, best_c = sel["arm_best_method"]["ab"], sel["arm_best_method"]["c"]
+    held = [i for i, note in enumerate(notes) if note.startswith(_V1_HELD_OUT_NOTE)]
+    if len(held) != (0 if payload["shakedown"] else 1):
+        raise RuntimeError("the v1 held-out note is not where the v2 caveats expect it")
+    for i in held:
+        notes[i] = (
+            "test.bin is held out from every selection of this run: the scoring view maps it once, after the "
+            "freeze. It is not an unseen holdout at study level: earlier cycles scored it, and C5-03 scored the "
+            f"same preserved 120m checkpoints with {C5_HADAMARD} and {C5_BEST}.")
+    composites = [m for m in PROBE_METHODS if m.startswith("cross_")]
+    qat_menu = max(len(unit_methods("ab", arm, sel)) for arm in QAT_ARMS)
+    shared = set(unit_methods("c", QAT_C, sel)) & set(unit_methods("c", CONTINUE, sel))
+    notes.append(
+        f"Method menus differ in Part B ({ab['preset']}). {MUON} chooses its best method from all "
+        f"{len(PROBE_METHODS)} probe methods (chosen: {best_ab[MUON]}), which include the cross-mix butterfly "
+        f"composites ({', '.join(composites)}). Every Part B QAT arm chooses from its own RTN and GPTQ methods, "
+        f"{C5_HADAMARD} and {C5_BEST} (at most {qat_menu} methods) and is not offered those composites. A Part B "
+        "best-vs-best contrast therefore compares deployment pipelines with unequal menus; use the same-method "
+        "contrasts (*_own_gptq_vs_muon_same_method, *_own_rtn_vs_muon_same_method) for claims about the effect of "
+        f"training. In Part C ({pc['preset']}), the best methods of {QAT_C} ({best_c[QAT_C]}) and {CONTINUE} "
+        f"({best_c[CONTINUE]}) are " + (
+            "offered to both arms." if {best_c[QAT_C], best_c[CONTINUE]} <= shared
+            else "not offered to both arms, so the same caution applies there."))
+    notes.append(
+        "Split hygiene is a guarantee of zero pre-freeze test scoring or selection: the scoring ledger refuses a "
+        "test.bin scoring before the freeze, and no selection reads a test.bin score. It is not a guarantee that no "
+        "test.bin byte is read earlier: " + (
+            "the run writes and hashes its synthetic test.bin when it generates the shards"
+            if payload["shakedown"] else
+            "the manifest verification of real_text_data.py hashes and memory-maps test.bin (SHA-256, token range, "
+            "document counts) before the freeze") +
+        ". splits_opened_before_freeze and the test-access log count the scoring interface only.")
+    notes.append(
+        f"Freeze coverage ({SCHEMA_VERSION}): selections_sha256 covers the wide family, the transfer arm, the best "
+        f"method of every arm and all {len(sel['awq_selections'])} AWQ selections (the selected alpha, the val.bin "
+        "score of every alpha and the SHA-256 of the selected effective weights). The run appends that digest to "
+        f"the test-access log before it maps test.bin. The historical {HISTORICAL_SCHEMA_V1} result differs: its "
+        "pre-test digest covered the family, arm and method names only, not the AWQ alphas. The validator binds "
+        "the v1 AWQ selections with a digest that was pinned after the run (an anti-tamper pin, not a "
+        "contemporaneous freeze).")
     return notes
 
 
@@ -1358,14 +1505,68 @@ def _schema_at_commit(git_sha: str) -> str | None:
     return None
 
 
+# The driver definitions that recompute a result from its rows: the constants, the method grids, the selection
+# rules, ``analyze`` and ``summarize``. A validating checkout must hold the producer's AST of every one of them.
+SUMMARY_DEFINITIONS = (
+    "TASK", "TOL", "N_SEEDS", "SIGN_FLIP_MIN_P", "SPLITS", "ENDPOINTS", "PINNED_BASELINES", "PRESETS", "MODES",
+    "HW_MODES", "DYNAMIC", "EMULATED_MODE", "BF16", "MUON", "ARMS_AB", "QAT_ARMS", "TRANSFER_CANDIDATES",
+    "WIDE_QAT_FAMILIES", "BASELINE", "CONTINUE", "QAT_C", "ARMS_C", "PARTS", "C5_HADAMARD", "C5_BUTTERFLY",
+    "C5_BEST", "PROBE_FAMILIES", "PROBE_METHODS", "PROBE_EMULATED", "CANONICAL", "SHAKEDOWN",
+    "C5_03_RESULT_REPO_PATH", "_dedupe", "arm_qat", "unit_methods", "emulated_method", "expected_grid", "_units",
+    "_row", "summed_nll", "best_method", "select_probe", "select_transfer", "select_part_c", "selections_sha256",
+    "throughput", "contrast_specs", "_series", "verdict", "analyze", "c5_03_reference", "summarize")
+
+
+def _definitions(source: str) -> dict[str, str]:
+    """``ast.dump`` of every top-level assignment (its value) and function (arguments and body, not its name)."""
+    out = {}
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.FunctionDef):
+            out[node.name] = ast.dump(node.args) + "".join(ast.dump(stmt) for stmt in node.body)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                names = [target] if isinstance(target, ast.Name) else getattr(target, "elts", [])
+                for name in names:
+                    if isinstance(name, ast.Name):
+                        out[name.id] = ast.dump(target) + ast.dump(node.value)
+    return out
+
+
+def _same_summary_definitions(committed: str, current: str, schema: str | None) -> bool:
+    """True iff ``current`` recomputes a result of ``schema`` with the definitions of the ``committed`` driver.
+
+    The caveats belong to the schema: the v1 list is ``caveats`` in a v1 driver and ``_caveats_v1`` here.
+    """
+    if schema == HISTORICAL_SCHEMA_V1:
+        pairs = [("caveats", "_caveats_v1")]
+    elif schema == SCHEMA_VERSION:
+        pairs = [("caveats", "caveats"), ("_caveats_v1", "_caveats_v1")]
+    else:
+        return False
+    theirs, mine = _definitions(committed), _definitions(current)
+    return all(a in theirs and b in mine and theirs[a] == mine[b]
+               for a, b in [*((name, name) for name in SUMMARY_DEFINITIONS), *pairs])
+
+
 def _matches_current_summary_code(git_sha: str) -> bool:
-    """True iff the committed ``SUMMARY_MODULES`` at ``git_sha`` have the bytes of the validating checkout."""
-    return all(c503._git_blob(git_sha, c503._module_repo_path(m)) == _module_path(m).read_bytes()
-               for m in SUMMARY_MODULES)
+    """True iff the validating checkout recomputes a result with the code of its producer commit ``git_sha``.
+
+    Every ``SUMMARY_MODULES`` file must have the committed bytes, with one exception. The driver may
+    differ, because validator corrections land after a canonical run. Then every ``SUMMARY_DEFINITIONS``
+    entry and the caveats of the producer's schema must have the committed AST.
+    """
+    for module in SUMMARY_MODULES:
+        committed, current = c503._git_blob(git_sha, c503._module_repo_path(module)), _module_path(module).read_bytes()
+        if committed != current and (module != DRIVER_MODULE or not _same_summary_definitions(
+                committed.decode(), current.decode(), _schema_at_commit(git_sha))):
+            return False
+    return True
 
 
-def run_config_hash(shakedown: bool, protocol: dict, code: str, git_sha, env: dict, data_sha256: dict) -> str:
-    return c503._digest({"schema": SCHEMA_VERSION, "shakedown": shakedown, "protocol": protocol, "code_sha256": code,
+def run_config_hash(shakedown: bool, protocol: dict, code: str, git_sha, env: dict, data_sha256: dict,
+                    schema: str = SCHEMA_VERSION) -> str:
+    """``schema`` is the schema version of the run that measured."""
+    return c503._digest({"schema": schema, "shakedown": shakedown, "protocol": protocol, "code_sha256": code,
                          "git_sha": git_sha, "env": {k: env.get(k) for k in c503.ENV_KEYS},
                          "data_sha256": data_sha256})
 
@@ -1443,23 +1644,41 @@ def write_json_atomic(path: Path, payload: dict, *, canonical_dest: bool = False
     return reloaded
 
 
-def record_test_access(git: dict, cfg_hash: str, log_path: Path | None = None) -> dict:
-    """Append this run to the test-access log before test.bin is mapped; return the earlier lines."""
+def _read_access_log(log_path: Path) -> list[dict]:
+    return [json.loads(line) for line in Path(log_path).read_text().splitlines() if line.strip()]
+
+
+def record_test_access(git: dict, cfg_hash: str, frozen_sha: str, log_path: Path | None = None,
+                       label: str = TEST_ACCESS_LOG_REPO_PATH) -> dict:
+    """Append this run and its freeze digest to the test-access log before test.bin is mapped.
+
+    Returns the record for ``data.test_access``, with the earlier lines of the log.
+    """
     log_path = TEST_ACCESS_LOG if log_path is None else log_path
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    prior = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()] if log_path.exists() else []
-    entry = {"git_sha": git["git_sha"], "run_config_hash": cfg_hash, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    prior = _read_access_log(log_path) if log_path.exists() else []
+    entry = {"git_sha": git["git_sha"], "run_config_hash": cfg_hash, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+             "selections_sha256": frozen_sha}
     with log_path.open("a") as handle:
         handle.write(json.dumps(entry) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
-    return {"log": TEST_ACCESS_LOG_REPO_PATH, "prior_openings": prior, "this_opening": entry}
+    return {"log": label, "prior_openings": prior, "this_opening": entry}
+
+
+def _artifact_dir(name: str) -> Path:
+    """``artifacts/<name>`` here, else in the main checkout of this worktree."""
+    local = ROOT / "artifacts" / name
+    return local if local.exists() else q.default_data_dir().parent / name
 
 
 def default_baseline_dir() -> Path:
     """``artifacts/c5_03_checkpoints`` here, else in the main checkout of this worktree."""
-    local = ROOT / "artifacts" / "c5_03_checkpoints"
-    return local if local.exists() else q.default_data_dir().parent / "c5_03_checkpoints"
+    return _artifact_dir("c5_03_checkpoints")
+
+
+def shakedown_evidence_dir(work_dir: Path) -> Path:
+    return Path(work_dir) / "run_evidence"
 
 
 # ======================================================================================
@@ -1496,9 +1715,7 @@ def run(args) -> dict:
     if args.canonical and (synthetic or found_sha != q.EXPECTED_SHA256):
         raise RuntimeError("The canonical run reads the pinned FineWeb-Edu shards only")
     data = {**summary, "directory": str(data_dir), "sha256_verified": not args.shakedown, "synthetic": synthetic,
-            "roles": {"training": "train", "calibration": "train", "static_scales": "train",
-                      "awq_alpha_selection": "val", "method_and_arm_selection": "val", "evaluation": "test"},
-            "test_access": None}
+            "roles": dict(EXPECTED_ROLES), "test_access": None}
     cfg_hash = run_config_hash(args.shakedown, protocol, code, git["git_sha"], env, found_sha)
     meta = {**git, "command": _invocation(args.argv), "argv": list(args.argv), "environment": env, "numerics": numerics,
             "code_sha256": code, "code_modules": list(code_modules()), "timestamp_start": timestamp_start,
@@ -1514,9 +1731,13 @@ def run(args) -> dict:
     if not (payload["kernel_parity"]["passed"] and payload["cross_mix_parity"]["passed"]):
         raise RuntimeError("The NVFP4 quantizer is not bit-exact on this host")
 
-    def before_test() -> None:
-        if args.canonical:
-            data["test_access"] = record_test_access(git, cfg_hash)
+    # The canonical log is for the real test.bin; a shakedown keeps the same record in its work directory.
+    evidence_dir = TEST_ACCESS_LOG.parent if args.canonical else shakedown_evidence_dir(args.work_dir)
+
+    def before_test(frozen_sha: str) -> None:
+        data["test_access"] = record_test_access(
+            git, cfg_hash, frozen_sha, evidence_dir / TEST_ACCESS_LOG_NAME,
+            TEST_ACCESS_LOG_REPO_PATH if args.canonical else SHAKEDOWN_TEST_ACCESS_LOG)
 
     baseline_dir = None if args.shakedown else args.baseline_checkpoint_dir
     study = run_study(protocol, shards, device, args.checkpoint_dir, baseline_dir, log, before_test)
@@ -1532,7 +1753,8 @@ def run(args) -> dict:
     payload["caveats"] = caveats(payload)
     payload = json.loads(json.dumps(payload, allow_nan=False))
     try:
-        validate_results(payload, canonical=args.canonical)
+        validate_results(payload, canonical=args.canonical, verify_external=True, checkpoint_dir=args.checkpoint_dir,
+                         baseline_dir=baseline_dir, evidence_dir=evidence_dir)
     except Exception:
         # Keep the measurements of a long run: the rejected payload goes next to the output, never to it.
         write_json_atomic(rejected_path(args.output), payload)
@@ -1571,6 +1793,25 @@ TRAINED_KEYS = {"source", "part", "arm", "seed", "optimizer", "lr", "auxiliary_l
                 "qat", "branch", "checkpoint_file", "checkpoint_sha256", "checkpoint_file_sha256"}
 PRESERVED_KEYS = {"source", "part", "arm", "seed", "checkpoint_file", "checkpoint_sha256", "checkpoint_file_sha256"}
 STAGES = ("stage_a", "stage_b", "stage_c", "test_scoring")
+# A v2 run adds the freeze digest to its test-access line, the AWQ selections to the frozen selections and the
+# optimizer snapshot digest to a branch.
+OPENING_KEYS = {HISTORICAL_SCHEMA_V1: {"git_sha", "run_config_hash", "timestamp"},
+                SCHEMA_VERSION: {"git_sha", "run_config_hash", "timestamp", "selections_sha256"}}
+BRANCH_KEYS = {HISTORICAL_SCHEMA_V1: {"from_arm", "from_step", "snapshot_sha256"},
+               SCHEMA_VERSION: {"from_arm", "from_step", "snapshot_sha256", "optimizer_snapshot_sha256"}}
+AWQ_SELECTION_KEYS = {"method", "alphas", "val_nll_hw_dynamic", "selected_alpha", "selected_on", "seconds"}
+ROW_COUNTERS = ("fp4_gemms_per_forward", "nvfp4_modules", "bf16_block_linears", "emulated_modules",
+                "cross_mix_modules")
+# Range of a per-layer metric: (lower bound, the bound is exclusive), and an upper bound where one exists.
+METRIC_LOW = {"weight_stable_rank": (0.0, True), "signal_alignment": (0.0, True), "excess_kurtosis": (-2.0, False),
+              "max_over_rms": (1.0, False), "group16_max_over_rms": (1.0, False),
+              "group16_outlier_share": (0.0, False), "nvfp4_relative_sq_error": (0.0, False)}
+METRIC_HIGH = {"group16_outlier_share": 1.0}
+
+
+def _is_count(x) -> bool:
+    """A kernel, dispatch or module count: a JSON integer >= 0 (``True`` is not a count)."""
+    return type(x) is int and x >= 0
 
 
 def _parsed_command(command, label: str) -> argparse.Namespace:
@@ -1631,7 +1872,8 @@ def _validate_meta(payload: dict, canonical: bool) -> None:
                  "meta.code_modules differ from the import closure at meta.git_sha")
         _require(meta["code_sha256"] == c503._code_sha256_at_commit(meta["git_sha"], tuple(modules)),
                  "meta.code_sha256 differs from the committed git blobs")
-        _require(_schema_at_commit(meta["git_sha"]) == SCHEMA_VERSION, "meta.git_sha declares another schema")
+        _require(_schema_at_commit(meta["git_sha"]) == payload["schema_version"],
+                 "meta.git_sha declares another schema than the payload")
         _require(_matches_current_summary_code(meta["git_sha"]),
                  "meta.git_sha summary code differs from the validating checkout")
     else:
@@ -1639,13 +1881,62 @@ def _validate_meta(payload: dict, canonical: bool) -> None:
         _require(meta["code_sha256"] == code_sha256(), "meta.code_sha256 differs from this checkout")
     data_sha = {k: v["sha256"] for k, v in payload["data"]["splits"].items()}
     _require(payload["run_config_hash"] == run_config_hash(payload["shakedown"], payload["protocol"],
-                                                           meta["code_sha256"], meta["git_sha"], env, data_sha),
+                                                           meta["code_sha256"], meta["git_sha"], env, data_sha,
+                                                           payload["schema_version"]),
              "run_config_hash differs")
+
+
+def _opening_time(entry, where: str, canonical: bool):
+    """One line of the test-access log (written by a v1 or a v2 run). Returns its timestamp."""
+    _require(isinstance(entry, dict) and any(set(entry) == keys for keys in OPENING_KEYS.values()),
+             f"{where}: keys differ from a test-access log entry")
+    _require((_is_hex(entry["git_sha"], 40) or (entry["git_sha"] is None and not canonical))
+             and _is_hex(entry["run_config_hash"], 16)
+             and ("selections_sha256" not in entry or _is_hex(entry["selections_sha256"], 64)),
+             f"{where}: git_sha, run_config_hash or selections_sha256 invalid")
+    return c502._timestamp(entry["timestamp"], f"{where}.timestamp")
+
+
+def _validate_test_access(payload: dict, canonical: bool) -> None:
+    """``data.test_access``: the line this run appended before it mapped test.bin, and the earlier lines.
+
+    The opening names this run, carries the freeze digest (v2), lies inside the run interval, after stages
+    A-C and before the test scoring. ``verify_external_evidence`` compares the record with the log file.
+    """
+    access, meta = payload["data"]["test_access"], payload["meta"]
+    _require(isinstance(access, dict) and set(access) == {"log", "prior_openings", "this_opening"}
+             and access["log"] == (TEST_ACCESS_LOG_REPO_PATH if canonical else SHAKEDOWN_TEST_ACCESS_LOG)
+             and isinstance(access["prior_openings"], list) and isinstance(access["this_opening"], dict),
+             "data.test_access must record this run and the earlier openings of test.bin")
+    this = access["this_opening"]
+    _require(set(this) == OPENING_KEYS[payload["schema_version"]],
+             "data.test_access.this_opening keys differ from the schema")
+    opened = _opening_time(this, "data.test_access.this_opening", canonical)
+    _require(this["git_sha"] == meta["git_sha"] and this["run_config_hash"] == payload["run_config_hash"],
+             "data.test_access.this_opening must name this run (git_sha, run_config_hash)")
+    if "selections_sha256" in this:
+        _require(this["selections_sha256"] == payload["selections_sha256"],
+                 "data.test_access.this_opening.selections_sha256 differs from the freeze digest selections_sha256")
+    start = c502._timestamp(meta["timestamp_start"], "meta.timestamp_start")
+    end = c502._timestamp(meta["timestamp_end"], "meta.timestamp_end")
+    _require(start - timedelta(seconds=1) <= opened <= end + timedelta(seconds=1),
+             "data.test_access.this_opening.timestamp is outside the run interval "
+             "(meta.timestamp_start .. meta.timestamp_end)")
+    stages = payload["stage_seconds"]  # timestamps have a resolution of one second
+    _require((opened - start).total_seconds() >= sum(stages[k] for k in STAGES[:3]) - 2.0
+             and (end - opened).total_seconds() >= stages["test_scoring"] - 2.0,
+             "data.test_access.this_opening.timestamp must follow stages A-C and precede the test scoring")
+    for i, entry in enumerate(access["prior_openings"]):
+        where = f"data.test_access.prior_openings[{i}]"
+        _require(_opening_time(entry, where, canonical) <= opened, f"{where} is later than this opening")
 
 
 def _validate_data(payload: dict, canonical: bool) -> None:
     data = payload["data"]
     _require(isinstance(data, dict) and set(data) == DATA_KEYS, "data keys differ from the schema")
+    _require(_same(data["roles"], EXPECTED_ROLES),
+             "data.roles differs from the split roles of the protocol (train.bin: training, calibration and static "
+             "scales; val.bin: every selection; test.bin: evaluation only)")
     found = {k: v["sha256"] for k, v in data["splits"].items()}
     _require(set(found) == {"train", "val", "test"} and all(_is_hex(v, 64) for v in found.values()),
              "data.splits must hold the 64-hex SHA-256 of train, val and test")
@@ -1655,18 +1946,17 @@ def _validate_data(payload: dict, canonical: bool) -> None:
                  "canonical shards must be SHA-256 verified against the pinned FineWeb-Edu hashes")
         _require({k: v["tokens"] for k, v in data["splits"].items()} == c502.CANONICAL_DATA["tokens"],
                  "canonical split token counts differ")
-        access = data["test_access"]
-        _require(isinstance(access, dict) and set(access) == {"log", "prior_openings", "this_opening"}
-                 and access["log"] == TEST_ACCESS_LOG_REPO_PATH and isinstance(access["prior_openings"], list)
-                 and all(isinstance(e, dict) for e in access["prior_openings"])
-                 and isinstance(access["this_opening"], dict)
-                 and access["this_opening"].get("git_sha") == payload["meta"]["git_sha"]
-                 and access["this_opening"].get("run_config_hash") == payload["run_config_hash"],
-                 "data.test_access must record this run and the earlier openings of test.bin")
     else:
         _require(data["synthetic"] is True and data["source"].get("name") == rq.SYNTHETIC_SOURCE and not real
-                 and data["sha256_verified"] is False and data["test_access"] is None,
+                 and data["sha256_verified"] is False,
                  "a shakedown reads generated synthetic shards only (no pinned real-text hash)")
+    _validate_test_access(payload, canonical)
+
+
+@functools.cache
+def _expected_stream_fingerprint(train_tokens: int, preset: str, seed: int) -> str:
+    """``h.stream_fingerprint`` of a seed. The batch starts depend on the length of train.bin, not on its tokens."""
+    return h.stream_fingerprint(range(train_tokens), PRESETS[preset], seed)
 
 
 def _validate_training(u: dict, payload: dict, where: str) -> None:
@@ -1698,11 +1988,28 @@ def _validate_training(u: dict, payload: dict, where: str) -> None:
              and tr["tokens"] == total * config.step_tokens and tr["checkpoint_file"] == checkpoint_name(part, seed, arm),
              f"{where}: training record differs from the protocol")
     _assert_close(tr["train_epochs"], tr["tokens"] / train_tokens, f"{where}.train_epochs")
+    # Paired controls: the arms of a seed start from one initialization and read one batch stream.
+    _require(_is_hex(tr["init_fingerprint"], 16) if part == "ab" or arm == BASELINE else tr["init_fingerprint"] is None,
+             f"{where}: init_fingerprint must be 16-hex (a run from the seed's initial state) or None (a Part C "
+             "continuation)")
+    _require(tr["stream_fingerprint"] == _expected_stream_fingerprint(train_tokens, spec["preset"], seed),
+             f"{where}: stream_fingerprint differs from the batch stream of seed {seed}")
     seconds = tr["step_seconds"]
     _require(isinstance(seconds, list) and len(seconds) == total - first and all(_nonneg(s) and s > 0 for s in seconds),
              f"{where}: one positive wall time per optimizer step is required")
     _assert_close(tr["train_seconds"], math.fsum(seconds), f"{where}.train_seconds")
-    _require(tr["train_curve"][-1] == [total, tr["last_train_loss"]] and math.isfinite(tr["last_train_loss"]),
+    _require(tr["train_seconds"] >= math.fsum(seconds) - 1e-3, f"{where}: train_seconds is below the step times")
+    # The curve holds the first step, every tenth step and the last step, with a positive finite loss each.
+    curve, n = tr["train_curve"], total - first
+    _require(isinstance(curve, list) and curve and all(
+        isinstance(pt, list) and len(pt) == 2 and type(pt[0]) is int and first + 1 <= pt[0] <= total
+        and _is_number(pt[1]) and pt[1] > 0 for pt in curve),
+        f"{where}: train_curve must hold [step, loss] pairs with steps in {first + 1}..{total} and a positive loss")
+    steps = [pt[0] for pt in curve]
+    _require(steps[0] == first + 1 and steps[-1] == total and all(a < b for a, b in zip(steps, steps[1:]))
+             and steps == [first + i + 1 for i in range(n) if i == 0 or (i + 1) % 10 == 0 or i + 1 == n],
+             f"{where}: train_curve steps must increase from {first + 1} to {total} (first, every tenth, last)")
+    _require(curve[-1][1] == tr["last_train_loss"] and _is_number(tr["train_loss"]) and tr["train_loss"] > 0,
              f"{where}: training curve record invalid")
     if qat is None:
         _require(tr["qat"] is None, f"{where}: a BF16-trained arm has no QAT record")
@@ -1714,10 +2021,61 @@ def _validate_training(u: dict, payload: dict, where: str) -> None:
         _require(tr["branch"] is None, f"{where}: a full run has no branch")
     else:
         origin = next(x for x in payload["units"] if (x["part"], x["seed"], x["arm"]) == (part, seed, branch_arm))
-        _require(isinstance(tr["branch"], dict) and tr["branch"].get("from_arm") == branch_arm
-                 and tr["branch"].get("from_step") == first and _is_hex(tr["branch"].get("snapshot_sha256"), 64)
-                 and (part == "ab" or tr["branch"]["snapshot_sha256"] == origin["training"]["checkpoint_sha256"]),
+        branch = tr["branch"]
+        _require(isinstance(branch, dict) and set(branch) == BRANCH_KEYS[payload["schema_version"]]
+                 and branch["from_arm"] == branch_arm and type(branch["from_step"]) is int
+                 and branch["from_step"] == first and _is_hex(branch["snapshot_sha256"], 64)
+                 and (part == "ab" or branch["snapshot_sha256"] == origin["training"]["checkpoint_sha256"]),
                  f"{where}: a cooldown must branch from the {branch_arm} run of its seed")
+        if "optimizer_snapshot_sha256" in branch:  # Part C starts a fresh optimizer: no snapshot exists
+            _require(_is_hex(branch["optimizer_snapshot_sha256"], 64) if part == "ab"
+                     else branch["optimizer_snapshot_sha256"] is None,
+                     f"{where}: branch.optimizer_snapshot_sha256 must be 64-hex (Part B) or None (Part C)")
+
+
+def _validate_siblings(payload: dict) -> None:
+    """The paired controls of a seed: one initialization, one batch stream and one branch state.
+
+    Every Part A/B arm starts from the same initial weights. Every trained arm of a part reads the same
+    batch stream. The ``COOLDOWN_ARMS`` restore one step-``cooldown_from`` snapshot (weights and, in v2,
+    optimizer), and the two Part C continuations load one baseline checkpoint.
+    """
+    units, cooldown_from = payload["units"], payload["protocol"]["part_ab"]["cooldown_from"]
+    for seed in payload["protocol"]["seeds"]:
+        group = {(u["part"], u["arm"]): u["training"] for u in units if u["seed"] == seed}
+        _require(len({group[("ab", arm)]["init_fingerprint"] for arm in ARMS_AB}) == 1,
+                 f"seed {seed}: the Part A/B arms do not share one init_fingerprint")
+        for part in PARTS:
+            streams = {tr["stream_fingerprint"] for (p, _), tr in group.items()
+                       if p == part and tr["source"] == "trained_in_run"}
+            _require(len(streams) == 1, f"seed {seed}: the part {part} arms do not share one stream_fingerprint")
+        _require(all((group[("ab", arm)]["branch"] is not None) == (arm in COOLDOWN_ARMS) for arm in ARMS_AB),
+                 f"seed {seed}: the cooldown arms, and no other Part A/B arm, have a branch")
+        cooldowns = [group[("ab", arm)]["branch"] for arm in COOLDOWN_ARMS]
+        _require(all(_same(branch, cooldowns[0]) for branch in cooldowns),
+                 f"seed {seed}: the cooldown arms do not branch from one step-{cooldown_from} snapshot (sibling "
+                 "branch records differ)")
+        _require(isinstance(group[("c", CONTINUE)]["branch"], dict)
+                 and _same(group[("c", CONTINUE)]["branch"], group[("c", QAT_C)]["branch"]),
+                 f"seed {seed}: {CONTINUE} and {QAT_C} do not branch from one baseline checkpoint")
+
+
+def _validate_layer_summary(summary, metric: str, where: str) -> None:
+    """A ``_layer_summary``: finite numbers, ordered extrema, per-kind means inside them, the range of the metric."""
+    _require(isinstance(summary, dict) and set(summary) == {"all", "by_kind"} and isinstance(summary["all"], dict)
+             and set(summary["all"]) == {"mean", "median", "min", "max"} and isinstance(summary["by_kind"], dict)
+             and list(summary["by_kind"]) == list(q.LINEAR_KINDS)
+             and all(_is_number(v) for v in (*summary["all"].values(), *summary["by_kind"].values())),
+             f"{where}: summary keys or numbers invalid")
+    a, kinds = summary["all"], list(summary["by_kind"].values())
+    eps = 1e-9 * max(1.0, abs(a["min"]), abs(a["max"]))
+    inside = (a["mean"], a["median"], *kinds)
+    _require(a["min"] <= a["max"] and all(a["min"] - eps <= v <= a["max"] + eps for v in inside)
+             and abs(a["mean"] - math.fsum(kinds) / len(kinds)) <= eps,  # every kind has the same number of layers
+             f"{where}: summary bounds violated (min <= mean, median and per-kind means <= max)")
+    (low, exclusive), high = METRIC_LOW[metric], METRIC_HIGH.get(metric, math.inf)
+    _require((a["min"] > low if exclusive else a["min"] >= low - 1e-9) and a["max"] <= high + 1e-9,
+             f"{where}: values outside the range of {metric}")
 
 
 def _validate_unit(u: dict, payload: dict, coverage: dict) -> tuple[int, int]:
@@ -1736,8 +2094,9 @@ def _validate_unit(u: dict, payload: dict, coverage: dict) -> tuple[int, int]:
         base = u[f"baseline_{split}"]
         _require(all(base[k] == v for k, v in coverage[part][split].items()), f"{where}: {split} coverage differs")
         _assert_close(base["ppl"], math.exp(base["nll"]), f"{where}.baseline_{split}.ppl")
-    _require(u["bf16_fp4_gemms_per_forward"] == 0 and isinstance(u["bf16_cupti"], dict)
-             and set(u["bf16_cupti"]) == set(rq.CUPTI_KEYS) and u["bf16_cupti"]["fp4_gemm_kernels"] == 0
+    _require(_is_count(u["bf16_fp4_gemms_per_forward"]) and u["bf16_fp4_gemms_per_forward"] == 0
+             and isinstance(u["bf16_cupti"], dict) and set(u["bf16_cupti"]) == set(rq.CUPTI_KEYS)
+             and all(_is_count(v) for v in u["bf16_cupti"].values()) and u["bf16_cupti"]["fp4_gemm_kernels"] == 0
              and u["bf16_cupti"]["nvfp4_quant_kernels"] == 0 and u["bf16_cupti"]["nvfp4_amax_kernels"] == 0
              and _is_int(u["bf16_cupti"]["non_fp4_gemm_kernels"], n_layers),
              f"{where}: the BF16 model must run no FP4 GEMM and no NVFP4 quantizer kernel (CUPTI)")
@@ -1761,8 +2120,16 @@ def _validate_unit(u: dict, payload: dict, coverage: dict) -> tuple[int, int]:
             _assert_close(r[f"{split}_relative_delta_ppl_pct"], 100.0 * (r[f"{split}_ppl"] / base["ppl"] - 1.0),
                           f"{rw}.{split}_relative_delta_ppl_pct")
         cross = n_layers if family in rq.WIDE_FAMILIES else 0
+        cupti, decode = r["cupti"], (r["hw_weights_checked_matrices"], r["hw_weights_decode_exact_matrices"])
+        if r["mode"] == "w4a16_fakequant":  # the BF16 model with decoded weights: no module is swapped or profiled
+            _require(all(r[k] is None for k in ROW_COUNTERS) and cupti is None and all(_is_count(v) for v in decode),
+                     f"{rw}: a W4A16 row has int32 decode counts and no hardware counter")
+        else:
+            _require(all(_is_count(r[k]) for k in ROW_COUNTERS) and isinstance(cupti, dict)
+                     and set(cupti) == set(rq.CUPTI_KEYS) and all(_is_count(v) for v in cupti.values())
+                     and decode == (None, None),
+                     f"{rw}: the module, dispatch and CUPTI kernel counts must be integers >= 0")
         if r["mode"] in HW_MODES:
-            cupti = r["cupti"]
             _require(r["fp4_gemms_per_forward"] == n_layers and r["nvfp4_modules"] == n_layers
                      and r["bf16_block_linears"] == 0 and r["emulated_modules"] == 0
                      and r["cross_mix_modules"] == cross,
@@ -1776,13 +2143,18 @@ def _validate_unit(u: dict, payload: dict, coverage: dict) -> tuple[int, int]:
                           cupti["non_fp4_gemm_kernels"] == u["bf16_cupti"]["non_fp4_gemm_kernels"] - n_layers),
                      f"{rw}: CUPTI must show {n_layers} FP4 GEMM and quantizer kernels and no BF16 GEMM fallback")
         elif r["mode"] == EMULATED_MODE:
+            # FP32 GEMMs on the operands of the fused NVFP4 quantizer (dynamic scale): the quantizer and amax
+            # kernels run once per layer and no FP4 GEMM runs. An FP32 GEMM replaces every BF16 GEMM with one
+            # kernel or more (the count depends on the matrix size), and a wide row adds the cross mix.
             _require(r["fp4_gemms_per_forward"] == 0 and r["emulated_modules"] == n_layers
-                     and r["bf16_block_linears"] == 0 and r["nvfp4_modules"] == 0
-                     and isinstance(r["cupti"], dict) and r["cupti"]["fp4_gemm_kernels"] == 0,
-                     f"{rw}: the emulation must run no FP4 GEMM")
+                     and r["bf16_block_linears"] == 0 and r["nvfp4_modules"] == 0 and r["cross_mix_modules"] == cross
+                     and cupti["fp4_gemm_kernels"] == 0 and cupti["nvfp4_quant_kernels"] == n_layers
+                     and cupti["nvfp4_amax_kernels"] == n_layers
+                     and cupti["non_fp4_gemm_kernels"] >= u["bf16_cupti"]["non_fp4_gemm_kernels"],
+                     f"{rw}: the emulation must run no FP4 GEMM, {n_layers} NVFP4 quantizer and amax kernels and "
+                     "at least the GEMM kernels of the BF16 model")
         else:
-            _require(r["fp4_gemms_per_forward"] is None and r["cupti"] is None
-                     and r["hw_weights_checked_matrices"] == n_layers
+            _require(r["hw_weights_checked_matrices"] == n_layers
                      and r["hw_weights_decode_exact_matrices"] == n_layers
                      and _is_hex(r["effective_weights_sha256"], 64)
                      and r["effective_weights_sha256_test"] == r["effective_weights_sha256"],
@@ -1795,6 +2167,9 @@ def _validate_unit(u: dict, payload: dict, coverage: dict) -> tuple[int, int]:
     awq_methods = [m for m in methods if rq.parse_method(m)[2]]
     _require([a["method"] for a in u["awq_selection"]] == awq_methods, f"{where}: one AWQ selection per AWQ method")
     for a in u["awq_selection"]:
+        _require(set(a) == AWQ_SELECTION_KEYS and _nonneg(a["seconds"]) and isinstance(a["val_nll_hw_dynamic"], list)
+                 and all(_is_number(v) and v > 0 for v in a["val_nll_hw_dynamic"]),
+                 f"{where}: AWQ selection record invalid")
         _require(a["alphas"] == protocol["awq_alphas"] and a["selected_on"] == "val.bin, w4a4_hw_dynamic"
                  and len(a["val_nll_hw_dynamic"]) == len(a["alphas"])
                  and a["selected_alpha"] == c502.select_alpha(a["alphas"], a["val_nll_hw_dynamic"]),
@@ -1812,22 +2187,48 @@ def _validate_unit(u: dict, payload: dict, coverage: dict) -> tuple[int, int]:
             _require(set(fit) == c503.BUTTERFLY_FIT_KEYS and fit["steps"] == protocol["butterfly_steps"]
                      and fit["layers"] == config.layers and 0 <= fit["weight_sq_error_fitted"]
                      <= fit["weight_sq_error_hadamard_start"], f"{where}.butterfly_fits[{key}].{kind}: fit record")
-    for metric in ("weight_stable_rank", "signal_alignment"):
-        g = u["geometry"][metric]
-        _require(set(g) == {"all", "by_kind"} and list(g["by_kind"]) == list(q.LINEAR_KINDS)
-                 and all(_is_number(v) and v > 0 for v in (*g["all"].values(), *g["by_kind"].values())),
-                 f"{where}: geometry.{metric} invalid")
+    _require(isinstance(u["geometry"], dict) and list(u["geometry"]) == ["weight_stable_rank", "signal_alignment"],
+             f"{where}: geometry metrics differ")
+    for metric, summary in u["geometry"].items():
+        _validate_layer_summary(summary, metric, f"{where}: geometry.{metric}")
     if part == "ab" and arm == MUON:
         stats = u["activation_statistics"]
         _require(isinstance(stats, dict) and list(stats) == list(PROBE_FAMILIES)
-                 and all(list(v) == list(rq.ACTIVATION_METRICS) for v in stats.values())
-                 and all(_is_number(m["all"]["mean"]) for v in stats.values() for m in v.values()),
+                 and all(isinstance(v, dict) and list(v) == list(rq.ACTIVATION_METRICS) for v in stats.values()),
                  f"{where}: activation statistics of every rotation family are required")
+        for family, metrics in stats.items():
+            for metric, summary in metrics.items():
+                _validate_layer_summary(summary, metric, f"{where}: activation_statistics.{family}.{metric}")
     else:
         _require(u["activation_statistics"] is None, f"{where}: only the probe checkpoints have activation statistics")
     plain = sum(not rq.parse_method(m)[2] for m in methods)
     val = 1 + len(MODES) * plain + 1 + len(awq_methods) * (len(protocol["awq_alphas"]) + len(MODES) - 1)
     return val, 1 + len(MODES) * len(methods) + 1
+
+
+def _validate_c5_03_rows(units: list[dict], reference: dict) -> int:
+    """The baseline rows against the committed C5-03 result: exact, 0.0 nats on every comparator row.
+
+    The checkpoints, the calibration draw, the methods and the alpha are those of C5-03, and the scoring
+    is deterministic, so a re-measurement that differs is not the published comparator. Returns the row
+    count: seeds x splits x (BF16 + two methods x three modes) = 42 for the canonical study.
+    """
+    compared = 0
+    for u in _units(units, "c", BASELINE):
+        theirs = reference["seeds"][str(u["seed"])]
+        _require(_row(u, C5_BEST, DYNAMIC)["awq_alpha"] == theirs["awq_alpha"],
+                 f"C5-03 comparator seed {u['seed']}: the AWQ alpha differs from the committed C5-03 result")
+        for split in SPLITS:
+            pairs = [("bf16", u[f"baseline_{split}"]["nll"], theirs["bf16"][split])]
+            pairs += [(f"{method}/{mode}", _row(u, method, mode)[f"{split}_nll"], published[split])
+                      for method in (C5_HADAMARD, C5_BEST) for mode, published in theirs["methods"][method].items()]
+            for name, mine, published in pairs:
+                _require(_is_number(mine) and mine - published == 0.0,
+                         f"C5-03 comparator seed {u['seed']} {name} {split}: NLL {mine!r} differs from the committed "
+                         f"C5-03 value {published!r} (an exact reproduction is required)")
+            compared += len(pairs)
+    _require(compared == N_SEEDS * len(SPLITS) * (1 + 2 * len(MODES)), "C5-03 comparator rows are incomplete")
+    return compared
 
 
 def _validate_study(payload: dict, canonical: bool) -> None:
@@ -1840,7 +2241,9 @@ def _validate_study(payload: dict, canonical: bool) -> None:
                 + [("c", s, a) for s in seeds for a in ARMS_C])
     _require(isinstance(units, list) and [(u["part"], u["seed"], u["arm"]) for u in units] == expected,
              "units differ from the study order (stage A, stage B, stage C)")
-    _require(isinstance(sel, dict) and set(sel) == SELECTION_KEYS and sel["qat_wide_family"] in WIDE_QAT_FAMILIES
+    v1 = payload["schema_version"] == HISTORICAL_SCHEMA_V1
+    _require(isinstance(sel, dict) and set(sel) == SELECTION_KEYS | (set() if v1 else {"awq_selections"})
+             and sel["qat_wide_family"] in WIDE_QAT_FAMILIES
              and sel["transfer_arm"] in TRANSFER_CANDIDATES and sel["best_wide_ptq_method"] in PROBE_METHODS
              and rq.is_wide(sel["best_wide_ptq_method"]), "selections keys or values invalid")
     split_tokens = {k: v["tokens"] for k, v in payload["data"]["splits"].items()}
@@ -1860,6 +2263,7 @@ def _validate_study(payload: dict, canonical: bool) -> None:
     for u in units:
         val, test = _validate_unit(u, payload, coverage)
         val_scorings, test_scorings = val_scorings + val, test_scorings + test
+    _validate_siblings(payload)
     # Selections: recomputed from the val.bin rows, in the order the study made them.
     want = select_probe(units)
     _require(all(sel[k] == v for k, v in want.items()), "Part A selections differ from the val.bin results")
@@ -1869,6 +2273,14 @@ def _validate_study(payload: dict, canonical: bool) -> None:
              "Part B selections differ from the val.bin results")
     _require(_same(sel["arm_best_method"], {"ab": transfer["arm_best_method"]["ab"], "c": select_part_c(units, sel)}),
              "Part C best methods differ from the val.bin results")
+    # AWQ: the alpha, the val.bin scores and the effective-weight digest of every (part, seed, arm, method).
+    if v1:  # outside the v1 freeze digest: bound by a digest that was pinned after the run
+        _require(selections_sha256(awq_freeze(units)) == HISTORICAL_V1_AWQ_SELECTIONS_SHA256,
+                 f"the AWQ selections differ from the pinned selections of the preserved {HISTORICAL_SCHEMA_V1} result "
+                 "(HISTORICAL_V1_AWQ_SELECTIONS_SHA256)")
+    else:  # inside the freeze digest
+        _require(_same(sel["awq_selections"], awq_freeze(units)),
+                 "selections.awq_selections differ from the AWQ selections and effective-weight digests of the units")
     _require(payload["selections_sha256"] == selections_sha256(sel), "selections_sha256 differs")
     _require(payload["splits_opened_before_freeze"] == ["train", "val"],
              "only train.bin and val.bin may be mapped before the freeze")
@@ -1885,10 +2297,16 @@ def _validate_study(payload: dict, canonical: bool) -> None:
         _require(all(reference["seeds"][str(s)]["checkpoint_sha256"] == PINNED_BASELINES[s]["checkpoint_sha256"]
                      and reference["seeds"][str(s)]["checkpoint_file_sha256"] == PINNED_BASELINES[s]["checkpoint_file_sha256"]
                      for s in seeds), "the pinned baseline digests differ from the committed C5-03 result")
+        compared = _validate_c5_03_rows(units, reference)
     else:
         _require(reference is None, "a shakedown has no C5-03 reference")
     _assert_close(payload["analysis"], analyze(units, sel, protocol, reference), "analysis")
     a = payload["analysis"]
+    if reference is not None:
+        rep = a["c5_03_reproduction"]
+        _require(len(rep["rows"]) == compared and all(e["abs_diff"] == 0.0 for e in rep["rows"])
+                 and rep["max_abs_nll_difference"] == 0.0,
+                 "analysis.c5_03_reproduction must show an exact reproduction (0.0 nats on every comparator row)")
     _require(a["hardware_vs_emulation"]["passed"] is True and len(a["hardware_vs_emulation"]["rows"]) == 2 * len(units),
              "hardware W4A4 must match the FP32 emulation within the tolerance for every checkpoint and split")
     n_ab = PRESETS[ab["preset"]].layers * len(q.LINEAR_KINDS)
@@ -1900,17 +2318,93 @@ def _validate_study(payload: dict, canonical: bool) -> None:
              "hardware evidence incomplete: FP4 GEMM counts, fallback count or int32 decode checks")
 
 
-def validate_results(payload: dict, canonical: bool | None = None) -> dict:
+def verify_external_evidence(payload: dict, *, checkpoint_dir: Path | None = None, baseline_dir: Path | None = None,
+                             evidence_dir: Path | None = None) -> dict:
+    """Check a result against the files that its JSON cannot hold. Raises ``ValueError`` on any difference.
+
+    * Every checkpoint: the SHA-256 of the file (streamed) and the tensor SHA-256 of its state dict (sorted
+      names, shapes and FP32 bytes) against ``training.checkpoint_file_sha256`` and ``checkpoint_sha256``.
+      Checkpoints trained in the run are in ``checkpoint_dir`` (24 in the canonical study); the preserved
+      C5-03 checkpoints are in ``baseline_dir`` (3).
+    * The test-access log in ``evidence_dir``: its first lines are ``data.test_access.prior_openings`` and
+      then ``this_opening``. For a v2 result, that line holds the freeze digest that the run logged before
+      it mapped test.bin.
+
+    A directory that is not given is the one of the recorded command for a shakedown (``<output>.work``),
+    and ``artifacts/`` of this checkout or of its main checkout for a canonical result. The function reads
+    files only. It does not validate the payload: ``validate_results(..., verify_external=True)`` does both.
+    """
+    if payload["shakedown"]:
+        recorded = _parsed_command(payload["meta"]["command"], "meta.command")
+        checkpoint_dir = recorded.checkpoint_dir if checkpoint_dir is None else checkpoint_dir
+        evidence_dir = shakedown_evidence_dir(recorded.work_dir) if evidence_dir is None else evidence_dir
+    else:
+        checkpoint_dir = _artifact_dir(CANONICAL_CHECKPOINT_DIR.name) if checkpoint_dir is None else checkpoint_dir
+        baseline_dir = default_baseline_dir() if baseline_dir is None else baseline_dir
+        evidence_dir = _artifact_dir(TEST_ACCESS_LOG.parent.name) if evidence_dir is None else evidence_dir
+    directories = {"trained_in_run": checkpoint_dir, "c5_03_preserved": baseline_dir}
+    verified, recorded_files, size = dict.fromkeys(directories, 0), set(), 0
+    for u in payload["units"]:
+        tr, where = u["training"], f"unit {u['part']}/{u['seed']}/{u['arm']}"
+        name = tr["checkpoint_file"]
+        _require(directories.get(tr["source"]) is not None and isinstance(name, str) and Path(name).name == name,
+                 f"{where}: no directory for a {tr['source']!r} checkpoint named {name!r}")
+        file = Path(directories[tr["source"]]) / name
+        _require(file.is_file(), f"{where}: checkpoint file {file} is missing")
+        _require(c503.file_sha256(file) == tr["checkpoint_file_sha256"],
+                 f"{where}: the SHA-256 of {file} differs from training.checkpoint_file_sha256")
+        _require(c502.checkpoint_file_matches_sha256(file, tr["checkpoint_sha256"]),
+                 f"{where}: the tensor SHA-256 of {file} differs from training.checkpoint_sha256")
+        verified[tr["source"]] += 1
+        recorded_files.add(file)
+        size += file.stat().st_size
+    access = payload["data"]["test_access"]
+    log_path = Path(evidence_dir) / TEST_ACCESS_LOG_NAME
+    _require(log_path.is_file(), f"the external test-access log {log_path} is missing")
+    try:
+        lines = _read_access_log(log_path)
+    except ValueError as exc:
+        raise ValueError(f"the external test-access log {log_path} is not JSON lines") from exc
+    expected = [*access["prior_openings"], access["this_opening"]]
+    _require(len(lines) >= len(expected) and all(_same(line, entry) for line, entry in zip(lines, expected)),
+             f"data.test_access differs from the external test-access log {log_path}: its first {len(expected)} "
+             "line(s) must be the recorded prior openings and this opening")
+    return {"checkpoints_trained_in_run_verified": verified["trained_in_run"],
+            "checkpoints_c5_03_preserved_verified": verified["c5_03_preserved"],
+            "checkpoint_bytes_hashed": size,
+            "unrecorded_checkpoint_files": sorted(str(f) for d in {f.parent for f in recorded_files}
+                                                  for f in d.glob("*.pt") if f not in recorded_files),
+            "test_access_log": str(log_path), "test_access_log_sha256": c503.file_sha256(log_path),
+            "test_access_log_entries": len(lines), "test_access_log_verified": True}
+
+
+def validate_results(payload: dict, canonical: bool | None = None, *, verify_external: bool = False,
+                     checkpoint_dir: Path | None = None, baseline_dir: Path | None = None,
+                     evidence_dir: Path | None = None) -> dict:
     """Offline check of a C6-01 result. Recomputes every selection, statistic, summary and caveat from the rows.
 
     ``canonical`` states what the caller expects (None: the payload's label); a disagreement raises. A
-    canonical result is bound to ``meta.git_sha`` (import closure, blobs, schema and ``SUMMARY_MODULES``
-    equal to this checkout), to the pinned shard and baseline digests, to the committed C5-03 result and
-    to the canonical output path (no symlink, no alias). It cannot re-measure: it trusts the recorded
-    NLLs and timings that pass its consistency checks.
+    canonical result is bound to ``meta.git_sha`` (import closure, blobs, schema, and the summary code of
+    this checkout, see ``_matches_current_summary_code``), to the pinned shard and baseline digests, to the
+    committed C5-03 result (an exact reproduction of its comparator rows) and to the canonical output path
+    (no symlink, no alias). It cannot re-measure: it trusts the recorded NLLs and timings that pass its
+    consistency checks.
+
+    Two schemas are valid. ``cycle6_c6_01.v2`` is the schema of new runs: the freeze digest covers the AWQ
+    selections and is in the test-access line of the run. ``cycle6_c6_01.v1`` is valid for the preserved
+    canonical result only. Its freeze digest covered the family, arm and method names, not the AWQ alphas;
+    the validator binds its AWQ selections with ``HISTORICAL_V1_AWQ_SELECTIONS_SHA256``, a pin that was
+    computed after the run. The receipt reports this as ``awq_in_contemporaneous_freeze`` (False for v1).
+
+    ``verify_external=True``, or any of the three directories, also runs ``verify_external_evidence`` (the
+    checkpoint files and the test-access log) and adds its report as ``external_evidence``.
     """
     try:
-        return _validate_payload(payload, canonical)
+        receipt = _validate_payload(payload, canonical)
+        if verify_external or any(d is not None for d in (checkpoint_dir, baseline_dir, evidence_dir)):
+            receipt["external_evidence"] = verify_external_evidence(
+                payload, checkpoint_dir=checkpoint_dir, baseline_dir=baseline_dir, evidence_dir=evidence_dir)
+        return receipt
     except (KeyError, TypeError, IndexError, AttributeError, StopIteration) as exc:  # a record of the wrong shape
         raise ValueError(f"malformed payload: {type(exc).__name__}: {exc}") from exc
 
@@ -1918,7 +2412,8 @@ def validate_results(payload: dict, canonical: bool | None = None) -> dict:
 def _validate_payload(payload: dict, canonical: bool | None) -> dict:
     json.dumps(payload, allow_nan=False)
     _require(isinstance(payload, dict) and set(payload) == TOP_KEYS, "top-level keys differ from the schema")
-    _require(payload["schema_version"] == SCHEMA_VERSION and payload["task"] == TASK, "schema or task differs")
+    schema = payload["schema_version"]
+    _require(isinstance(schema, str) and schema in SCHEMAS and payload["task"] == TASK, "schema or task differs")
     _require(type(payload["shakedown"]) is bool and type(payload["canonical"]) is bool
              and payload["canonical"] is not payload["shakedown"],
              "a result is either the canonical run or a synthetic shakedown")
@@ -1928,6 +2423,8 @@ def _validate_payload(payload: dict, canonical: bool | None) -> dict:
     if canonical is False and payload["canonical"]:
         raise ValueError("the payload is labeled canonical: it cannot be validated with the noncanonical checks")
     canonical = payload["canonical"]
+    _require(canonical or schema == SCHEMA_VERSION,
+             f"{HISTORICAL_SCHEMA_V1} is valid for the preserved canonical result only: a shakedown is {SCHEMA_VERSION}")
     _require(_same(payload["protocol"], CANONICAL if canonical else SHAKEDOWN),
              "the protocol differs from the " + ("canonical C6-01 protocol" if canonical else "shakedown protocol"))
     _validate_data(payload, canonical)
@@ -1940,7 +2437,8 @@ def _validate_payload(payload: dict, canonical: bool | None) -> dict:
     _validate_study(payload, canonical)
     _assert_close(payload["summary"], summarize(payload), "summary")
     _require(payload["caveats"] == caveats(payload), "caveats differ from the recomputed caveats")
-    return {"certified_canonical": canonical, "shakedown": payload["shakedown"]}
+    return {"certified_canonical": canonical, "shakedown": payload["shakedown"], "schema_version": schema,
+            "awq_in_contemporaneous_freeze": schema == SCHEMA_VERSION}
 
 
 # ======================================================================================
