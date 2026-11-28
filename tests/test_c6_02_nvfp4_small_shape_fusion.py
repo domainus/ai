@@ -31,7 +31,7 @@ if CUDA:
     from research.quant_ptq import rotated_qat as rq
 
 CANONICAL_RESULT = ROOT / "results" / "cycle6_c6_02_nvfp4_small_shape_fusion.json"
-CANONICAL_SHA256 = "PENDING_CANONICAL_RUN"
+CANONICAL_SHA256 = "ceff189c3298905b355705dab89532d3a80bbeaf7343a7d27c804865f83949a2"
 ROTS = ("none", "hadamard_b16", "adaptive_butterfly_b16")
 M_SIZES = (1, 37, 128, 129, 256, 512)
 K_SIZES = (64, 80, 512, 768, 1408, 2048)
@@ -467,6 +467,10 @@ def test_shakedown_is_valid_and_complete(shakedown):
         b.validate_results(copy.deepcopy(s), canonical=True)
 
 
+def _flip(record: dict, key: str) -> None:
+    record[key] = not record[key]
+
+
 def _tamper(payload, fn):
     bad = copy.deepcopy(payload)
     fn(bad)
@@ -491,8 +495,8 @@ TAMPERS = {
     "part a raw sample": lambda p: p["part_a"]["shapes"][0]["cuda_graph"]["c6_02_none"]["gpu"]["event_samples_ms"][0]
     .__setitem__(0, 1e3),
     "part a median": lambda p: p["part_a"]["shapes"][0]["cuda_graph"]["c6_02_none"]["gpu"].__setitem__("median_ms", 1e-6),
-    "part a summary": lambda p: p["part_a"]["shapes"][0]["summary"]["cuda_graph"]["variants"]["none"]
-    .__setitem__("c6_02_beats_bf16", True),
+    "part a summary": lambda p: _flip(p["part_a"]["shapes"][0]["summary"]["cuda_graph"]["variants"]["none"],
+                                      "c6_02_beats_bf16"),
     "part a orders": lambda p: p["part_a"]["shapes"][0]["cuda_graph_williams_orders"].reverse(),
     "part a shapes": lambda p: p["part_a"]["shapes"].pop(),
     "part a delegation": lambda p: p["part_a"]["shapes"][0]["delegated_to_c5_03"].__setitem__("none", True),
