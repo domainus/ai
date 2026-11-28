@@ -367,3 +367,77 @@ PYTHONPATH=. /home/ryan/Documents/projects/ai/.venv/bin/pytest tests/test_c6_02_
 Exact live footer: `780 passed, 85 warnings in 905.83s (0:15:05)`. **780 passed, 0 failed, 0 skipped.** Warnings cover PyTorch sync-debug limits, deliberately empty graphs in capture-refusal tests, and a Triton AST deprecation.
 
 Implementation references include the [timing validator](../research/quant_ptq/bench_c6_02_nvfp4_small_shape_fusion.py#L1412), [Part C evidence checks](../research/quant_ptq/bench_c6_02_nvfp4_small_shape_fusion.py#L1554), [plan ownership and cache teardown](../research/quant_ptq/nvfp4_small_shape_blackwell.py#L980), [exact wrapper](../research/quant_ptq/nvfp4_small_shape_blackwell.py#L1229) and [reference wrapper](../research/quant_ptq/rotated_qat.py#L273).
+
+## Post-Remediation v3 Final Sign-Off
+
+**PASS — HOLD LIFTED.** All three v2 residuals are closed for the pinned C6-02 v3 result. I found no new blocker. I reviewed result commit `ddca5d80ee0dfbd73698212d78e1be5334846e2c` on the RTX 5080 (sm_120, driver 615.78.08).
+
+### Result identity and receipts
+
+The on-disk JSON matched the result commit byte for byte. Its SHA-256 was `eefdda21cb9caff0660b52e2fe94bb4a99b690fcff70a1c1d874009df368bcbc`. It declares `cycle6_c6_02.v3`, producer `87f1e9223048a70f8f6cd09faf2bf04dd7523940`, and `git_dirty: false`. The producer is the result commit’s parent and its tree has no C6-02 result file.
+
+All seven `SUMMARY_MODULES` matched the producer bytes, with an empty diff between producer and result. I traversed the producer’s Python imports independently. The 20 module names matched the recorded list, their files matched this checkout, and their aggregate SHA-256 was `d4db273980ad10b6276402a2df0296c92b4eae58ecb4fe4f5a1d3d4a35771f5c`.
+
+| Pinned input | SHA-256, identical in v2, the v3 producer, the result commit and this checkout |
+|---|---|
+| C5-03 inference module | `2b3a2af2615061d952216fa1691fdbd2f659961a5706f555c76bf35593053192` |
+| C5-03 fusion result | `e0e435ef2ea8598df22bace95ab76fd10c43b2ff394bf635ab8d1548d8bcad82` |
+| C6-01 wide rotated QAT result | `c490a415568244bd1e2489d0004adc025d856e92452cb976c05efc2dcdf66bf9` |
+
+`verify_superseded_receipts()` returned **8 verified** against the remediation worktree’s `artifacts/c6_02_run_evidence/`. These covered the JSON and log for each of `a4ebc54`, `47cdedd` and `411eaf0`, plus the committed v1 and v2 result blobs at `a716333` and `3e46141`. The unmodified v3 JSON passed full canonical validation.
+
+### Timing, Pareto frontiers and trained scores
+
+I recomputed round means, medians, inclusive-quartile IQRs and stall counts from the raw CUDA events in both retained runs. Each run contained 88 Part A CUDA-graph cells with 44 rounds each and 57 Part C cells with 76 rounds each. Every round contained ten events. The independent calculation and `_timing_anomalies` agreed on every flagged cell and its stall count. In v2, 24 Part A cells triggered the detector, including 25 affected rounds for `1024x512x1408 c5_03_had_b16`. In v3, **0 of 145 cells** triggered it. The maximum IQR divided by median was **0.0374** in Part A and **0.0095** in Part C.
+
+| Part A at (1024, 512, 1408), CUDA graph | Median (µs) | IQR (µs) | Baseline time / C6-02 time |
+|---|---:|---:|---:|
+| C6-02 dynamic Hadamard b16 | 20.686 | 0.232 | 1.000× |
+| C5-03 dynamic Hadamard b16 | 23.522 | 0.350 | 1.137× |
+| BF16 cuBLAS | 22.834 | 0.311 | 1.104× |
+
+I also repeated this one shape on the RTX 5080 after pytest finished. The 11-method Williams run used the canonical seed and 440 CUDA events per method. Fresh medians were 20.637 µs for C6-02, 23.712 µs for C5-03 and 22.952 µs for BF16. The corresponding speedups were **1.149×** and **1.112×**. All operand and output checks passed, and the detector flagged zero cells in the repeat.
+
+All 19 methods in each Part C preset matched the stored medians and IQRs. The rows below give the two BF16 baselines and the C6-02 methods used in the v2 timing comparison. Each entry gives the median / IQR in milliseconds.
+
+| Forward | 50m | 120m | w2048_6l |
+|---|---:|---:|---:|
+| Compiled BF16 | 11.773 / 0.084 | 10.794 / 0.056 | 16.688 / 0.158 |
+| BF16 CUDA graph | 14.551 / 0.083 | 12.844 / 0.088 | 17.632 / 0.123 |
+| Dynamic Hadamard b16 | 10.713 / 0.065 | 8.296 / 0.027 | 8.055 / 0.051 |
+| Fused Hadamard b64 | 12.644 / 0.031 | 9.334 / 0.037 | 9.054 / 0.048 |
+| Fused full Kron | 12.446 / 0.042 | 9.446 / 0.076 | 9.579 / 0.077 |
+| Fused full butterfly | 13.226 / 0.048 | 10.094 / 0.061 | 10.087 / 0.056 |
+
+I checked latency and quality for all nine 50m and six 120m Pareto points. Pairwise dominance reproduced both the primary and graph-only frontiers in each preset. At 50m, compiled BF16 beats all three wide methods on latency and test NLL. At 120m, full Kron and full butterfly remain on the primary frontier. The w2048_6l preset has timing data only.
+
+The six compiled BF16 seed scores matched v2 exactly. Their checkpoint identities, split counts and BF16 reference scores matched the pinned C6-01 evidence. Each seed covered 3,906 windows and 1,999,872 target tokens. The recomputed three-seed means were **5.3820340967** at 50m and **4.6242757733** at 120m. This sign-off checked the recorded scores against the previous live rescore.
+
+### Offline validator probes
+
+Each row below used a fresh in-memory copy and raised `ValueError` at the indicated check.
+
+| Change to the canonical record | Rejection |
+|---|---|
+| Kept 76 raw 50m compiled GPU rounds but retained one mean and updated its count, statistics, model summary, Pareto, top-level summary and caveats | GPU round count |
+| Set the compiled CUPTI `other` launch count to −1 | Compiled launch counts |
+| Set maximum absolute logits error to zero while keeping relative L2 positive | Compiled BF16 logits record |
+| Set the compiled entry in `logits_rel_diff_vs_bf16` negative | Logits errors |
+| Replaced the first trained seed with JSON `true` | Trained-evaluation identity |
+| Changed the computed timing caveat from zero affected cells to one | Caveats differ |
+| With a fresh configuration hash in each probe, replaced the protocol seed or a nested trained seed with `true`, or replaced the parity flag `false` with integer zero | Protocol differs in all three cases |
+| Substituted `ddca5d8` for the producer and recomputed the configuration hash | Producer tree already contains the result |
+
+In separate raw-event probes, four rounds above the stall threshold did not flag a cell. Five did. Events exactly at the 0.100 ms floor or exactly at three times the event median did not count as stalls.
+
+### Exact-mode autocast and live suite
+
+I wrapped the same FP32 `nn.Linear(1408, 192)` and full cross-mix in `FastCrossInput(exact=True)` and `rotated_qat.CrossInput`. With CUDA BF16 autocast active, both produced `torch.bfloat16` for an input of shape `(3, 29, 1408)`. Their 16-bit representations differed at **0 of 16,704 outputs**. A literal search for the old “near-0 parity” wording found zero matches under `research/` and `tests/`.
+
+I ran the requested five files on the RTX 5080 with the project venv, `PYTHONPATH=.`, private temporary storage and read-only access to the main checkout and retained artifacts.
+
+```bash
+PYTHONPATH=. /home/ryan/Documents/projects/ai/.venv/bin/pytest tests/test_c6_02_nvfp4_small_shape_fusion.py tests/test_nvfp4_inference.py tests/test_c5_03_nvfp4_120m_fusion.py tests/test_c5_02_isoloss_ptq_mitigation.py tests/test_c6_01_wide_rotated_qat.py -q
+```
+
+**800 passed, 0 failed, 0 skipped.** Pytest reported `800 passed, 85 warnings in 912.39s (0:15:12)`.
