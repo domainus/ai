@@ -37,7 +37,7 @@ CUDA = torch.cuda.is_available()
 FP4 = CUDA and hasattr(F, "scaled_mm") and torch.cuda.get_device_capability()[0] >= 10
 needs_fp4 = pytest.mark.skipif(not FP4, reason="needs native NVFP4 scaled_mm (sm_100+)")
 # SHA-256 of the committed canonical result (set by the commit that adds the result).
-CANONICAL_SHA256 = None
+CANONICAL_SHA256 = "c490a415568244bd1e2489d0004adc025d856e92452cb976c05efc2dcdf66bf9"
 
 if CUDA:
     # Kineto decides once per process whether CUPTI runs: the first profiler session must ask for CUDA
