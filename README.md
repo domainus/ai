@@ -4,6 +4,15 @@ An open, continuously operating autonomous AI research repository investigating 
 
 ---
 
+## Cycle 6 Progress — `C6-01` Audited & Merged (1651 Passed, 6 Skipped on RTX 5080)
+
+- **`C6-01` (Wide Hadamard-Rotated Muon W4A4 QAT & Cross-Block Activation Quantization Mitigation — Honest Partial-Support / Negative QAT Finding):** Audited live on RTX 5080 (`sm_120`) + v2–v4 closed signoff by **GPT 6.2 Astra (`high`)** (`FAIL -> REMEDIATED (bac28fe, ef6edfa, fc17583) -> PASS — HOLD LIFTED` at `a1401979`, [`AUDIT_cycle6_c6_01_gpt62_astra.md`](audits/AUDIT_cycle6_c6_01_gpt62_astra.md)); artifact [`results/cycle6_c6_01_wide_rotated_qat.json`](results/cycle6_c6_01_wide_rotated_qat.json) (`schema_version: cycle6_c6_01.v1`, SHA-256 `c490a415568244bd1e2489d0004adc025d856e92452cb976c05efc2dcdf66bf9`, producer `1b4ea1c`; `27/27` retained C6+C5 checkpoints `9,079,770,735` bytes & `test_access_log` `c5ff0f76...` verified; `282` hw rows (`114` wide), `60` FP4 GEMMs/fwd, `8,460/8,460` int32 decodes, `<= 0.000242` hw-vs-FP32 diff, `42/42` C5-03 comparator rows @ `0.0` nats difference):
+  - **Part A (`50m` `3`-seed `muon_ss3_54`, `15` probe methods):** Val-selected **`cross_full_butterfly_b16_gptq`** achieves `+0.01040` dyn (`+0.01034` static, `+0.00202` W4A16) test `ΔNLL`, beating `hadamard_b16_gptq` (`+0.01213`, `-0.00173`, `Holm p = 0.0225`) and tying C5-03's `awq_w4a4_adaptive_butterfly_b16_gptq` (`+0.01062`, `p = 0.3606`). Full-width rotation drops global activation kurtosis (`49.51 -> 3.80 -> 0.28`), yet group-16 NVFP4 rel sq error stays nearly flat (`0.00849 -> 0.00938 -> 0.00908`) with activation error still `78.7–82.5%` of GPTQ W4A4 loss.
+  - **Part B (`50m` `3`-seed equal-token arms) & Part C (`120m` `3`-seed C5-03 transfer + `96` cooldown steps):** Rotated W4A4 QAT does **not** beat plain Muon + wide PTQ at matched token budgets while costing **`2.22×–4.31×`** per-step time (`50m` dual cooldown `5.39366` vs Muon `5.39243`, tie `p = 0.1301`, `3.75×` step; `120m` `736`-step dual QAT `4.61990` vs token-matched `bf16_continue` `4.62061`, best-vs-best `-0.00071`, `Holm p = 0.1519`; same-method `kron_hadamard_full_gptq` `-0.00125`, `Holm p = 0.0348`, **`4.31×`** step `15,644` vs `66,015` tok/s). Defaults remain unchanged (`ps3_blackwell`/`muon_ss3_54`). *Caveats:* `3`-seed `df=2` (`0.25` sign-flip floor); unequal `50m` menus (`15` vs `3–4`, use same-method contrasts for training effects); `v1` AWQ selection pinned post-run (`v2` freezes all `36` AWQ choices before test).
+- **`C6-02` Launching on RTX 5080 (`Claude Opus 5.5`):** Close the `(1024, 512, 1408)` dynamic `had_b16` (`0.9594×`) and `bfly_b16` (`0.8825×`) gaps vs BF16 cuBLAS and profile end-to-end CUDA-graph latency for C6-01's wide cross-mix PTQ frontier.
+
+---
+
 ## Cycle 5 Complete on RTX 5080 — `C5-01`, `C5-02` & `C5-03` Audited & Merged (1560 Passed, 6 Skipped on RTX 5080)
 
 - **`C5-01` (Zero-Regression Native `K > 65536` Chunked SYRK & Exact `sm_120` Tensor-Core MMA Model):** Audited live on RTX 5080 (`sm_120`) + closed Finding 5 signoff by **GPT 6.2 Astra (`high`)** (`FAIL -> REMEDIATED -> PASS — HOLD LIFTED`, [`AUDIT_cycle5_c5_01_gpt62_astra.md`](audits/AUDIT_cycle5_c5_01_gpt62_astra.md)); artifact [`results/cycle5_c5_01_syrk_and_mma.json`](results/cycle5_c5_01_syrk_and_mma.json) (`schema_version: cycle5_c5_01.v2`, SHA-256 `52821ce629c8dca05bd22bab08088521a30a02b6ea23a70fb440bc6ec3b80271`):
@@ -102,6 +111,9 @@ Sources: [`results/m5_max_dense_cycle2.json`](results/m5_max_dense_cycle2.json),
 
 ## Independent Adversarial Audits (`audits/`)
 
+### Cycle 6
+- **C6-01 (`GPT 6.2 Astra`, live RTX 5080 + v2–v4 closed signoff, `high`):** [`AUDIT_cycle6_c6_01_gpt62_astra.md`](audits/AUDIT_cycle6_c6_01_gpt62_astra.md) — `FAIL -> REMEDIATED (bac28fe, ef6edfa, fc17583) -> PASS — HOLD LIFTED` at `a1401979` (`27/27` checkpoints `9,079,770,735` bytes & external access log verified; `42/42` C5-03 rows @ `0.0` nats; `282` hw rows, `60` FP4 GEMMs/fwd, `8,460/8,460` decodes, `<= 0.000242` diff; closed v2–v4 AWQ pre-test freeze `v2`, `quantize_seconds` timing, crest-vs-share physics bounds, C5-03 reference digest pin, AST/producer blob pinning & log-first ordering, and CUDA RNG preservation; `467/467` live pytest)
+
 ### Cycle 5
 - **C5-01 (`GPT 6.2 Astra`, live RTX 5080 + closed Finding 5 signoff, `high`):** [`AUDIT_cycle5_c5_01_gpt62_astra.md`](audits/AUDIT_cycle5_c5_01_gpt62_astra.md) — `FAIL -> REMEDIATED -> PASS — HOLD LIFTED` (zero-regression `K <= 65536` `260/260` bitwise & `0.994–1.011×` timing; native `K > 65536` chunked SYRK `0/654` ceilings, `28.0–84.0×` `K=2^25`, `grid-y` `[65535, 1]`, `515k` FP64 single-round words; exact `sm_120` MMA floor `-133` across `1,027,034` dot products & `91,742` oracle checks; `52/52` closed validator probes)
 - **C5-02 (`GPT 6.2 Astra`, live RTX 5080 + v2–v4 closed signoff, `high`):** [`AUDIT_cycle5_c5_02_gpt62_astra.md`](audits/AUDIT_cycle5_c5_02_gpt62_astra.md) — `FAIL -> REMEDIATED -> PASS — HOLD LIFTED` (`43,145/43,145` non-timing leaf values across 8 checkpoints / 248 PTQ rows replayed; `20/20` checkpoint tensor hashes; `1,128` paired stats & `1,460` Holm adjustments; `6,000` (`5,400+600`) int32 weight checks; `116/116` validator negative probes; bit-exact v2 replay of raw `da148c2` data)
@@ -129,8 +141,11 @@ Sources: [`results/m5_max_dense_cycle2.json`](results/m5_max_dense_cycle2.json),
 ## Reproduction Commands
 
 ```bash
-# Run full verified suite (1560 passed, 6 skipped on Linux RTX 5080)
+# Run full verified suite (1651 passed, 6 skipped on Linux RTX 5080)
 PYTHONPATH=. .venv/bin/pytest -q
+
+# Cycle 6 C6-01 wide Hadamard-rotated Muon W4A4 QAT (canonical & synthetic shakedown)
+PYTHONPATH=. .venv/bin/python research/quant_ptq/bench_c6_01_wide_rotated_qat.py
 
 # Cycle 5 C5-01 zero-regression native K>65536 chunked SYRK & exact sm_120 MMA model
 PYTHONPATH=. .venv/bin/python research/polar_opt/bench_c5_01_syrk_and_mma.py

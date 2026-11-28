@@ -2,8 +2,8 @@
   "program": "Autonomous Verifiable AI Research",
   "repo": "https://github.com/domainus/ai",
   "cycle": 6,
-  "phase": "cycle5_complete_on_bazzite_c6_01_launched",
-  "last_updated": "2026-11-27T14:18:00-07:00",
+  "phase": "cycle6_c6_01_complete_c6_02_launched",
+  "last_updated": "2026-11-28T00:51:30-07:00",
   "fleet": {
     "bazzite": {
       "environment_id": "6fb39dcd-f3b7-4929-a1d5-637d67eb79bb",
@@ -25,14 +25,15 @@
     }
   },
   "kpis": {
-    "experiments_run": 29,
+    "experiments_run": 30,
     "verified_wins": 14,
     "best_speedup_vs_pe": 2.7,
     "best_speedup_vs_ps": 2.58,
-    "tests_passing": 1560,
-    "audits_completed": 21
+    "tests_passing": 1651,
+    "audits_completed": 22
   },
   "completed": [
+    "C6-01 WIDE HADAMARD-ROTATED MUON W4A4 QAT (PASS — HOLD LIFTED; honest partial-support/negative QAT): 27 ckpts (24 trained + 3 C5-03 baselines, 9.08 GB verified), 282 hw rows (114 wide), 60 FP4 GEMMs, 8,460/8,460 decodes, <=0.000242 diff, 42/42 C5-03 rows @ 0.0 nats; Part A 50m val-best cross_full_butterfly_b16_gptq +0.01040 dNLL beats had_b16_gptq (+0.01213, -0.00173, Holm p=0.0225) & ties C5-03 AWQ+bfly (+0.01062, p=0.361), kurtosis 49.51->0.28 yet NVFP4 rel sq err 0.00849->0.00908 (78.7-82.5% act share); Part B/C rotated QAT does not beat Muon+PTQ at matched tokens (50m dual cooldown 5.39366 vs 5.39243 tie p=0.130, 3.75x step; 120m 736-step dual QAT 4.61990 vs bf16_continue 4.62061 tie p=0.152 best-vs-best / -0.00125 same-method p=0.035, 4.31x step); defaults unchanged",
     "C5-03 120M NVFP4 W4A4 & QUANTIZER FUSION (PASS — HOLD LIFTED): Beats C4-02 on 24/24 dyn graph GEMMs (1.0104-1.1551x) & BF16 on 30/32 ((1024,512,1408) none 1.044x, static_gs 1.074x, dyn had 0.959x), 1.023-1.046x C4 fwd graph (1.188-1.291x compiled BF16 120m); 120m 3-seed 20.97M-tok muon_ps3_blackwell val-best awq_w4a4_adaptive_butterfly_b16_gptq test dNLL +0.01521 dyn/+0.01518 static/+0.00311 W4A16 (alpha=0.25 6/6; 80.6% act loss; 63/63 hw, 60 FP4 GEMMs, 1260 decodes, <=0.000166 diff)",
     "C5-02 ISO-LOSS 5-SEED PTQ & MITIGATIONS (PASS — HOLD LIFTED): 5/5 val-matched (|gap|<=0.0033, test +0.0037); Muon loses 1.57-2.98x dNLL across 6 cells (Holm6<=0.00031, 48<=0.0053); 200 W4A4 rows (180+20), 60 FP4 GEMMs, 6000 decodes (5400+600), <=0.000171 hw-emul; AdamW/QAT cooldown hurt BF16 (+0.0264/+0.0065) & net NLL; weight-only AWQ neutral (-0.00036 W4A4, p>=0.485); defaults unchanged",
     "C5-01 NATIVE CHUNKED SYRK & SM120 MMA (PASS — HOLD LIFTED): K<=65536 260/260 bitwise, 15/15 launches, 0.994-1.012x timing (0% reg); K>65536 0/654 grid ceil, 28.0-84.0x K=2^25, 515k single-round, grid-y cap; sm_120 MMA floor -133 exact 1,027,034/1,027,034 (226/226 digests) & 91,742/91,742 oracle",
@@ -45,15 +46,23 @@
   ],
   "wip": [
     "C3-04: M5 Max open-lid 4096^2 rerun + live pytest tests/test_mlx.py (waiting for MacBook Pro)",
-    "C6-01: Wide Hadamard-rotated Muon W4A4 QAT at 50m (3 seeds) + 120m NVFP4 transfer (launching on RTX 5080, Claude Fable 5.2)"
+    "C6-02: Blackwell NVFP4 small-shape & fused dynamic quantizer closing (1024,512,1408) had_b16/bfly_b16 gap vs BF16 + cross_full_butterfly_b16 profiling (launching on RTX 5080, Claude Opus 5.5)"
   ],
   "blockers": [
+    "C6-01: 3-seed df=2 (0.25 sign-flip floor); unequal 50m menus (15 Muon vs 3-4 QAT, use same-method contrasts for training effects); preserved v1 AWQ pinned post-run (v2 freezes all 36 AWQ choices before test); rotated QAT costs 2.22-4.31x step time with no best-vs-best gain",
     "C4-03: SS3_54 w1536 joint p=0.130; C5-01 MMA model verified on RTX 5080 sm_120 m16n8k16 FP16/BF16 only",
     "C5-02 recipe-scoped (50m 5-seed df=4, 0.0625 sign-flip floor, seed-0 shakedowns scored test.bin, weight-only AWQ proxy, no spectral penalty tested); C4-01a fixed LRs (ps3_blackwell stays 120m default)",
     "C5-03: 120m 3-seed df=2 (0.25 sign-flip floor; butterfly & AWQ Holm6 p=0.052/0.062); dyn had_b16 (1024,512,1408) 0.9594x vs BF16 (static_gs 1.0739x); SS3_54 @ (512,2048) 0.987x vs PS3",
     "MacBook Pro unreachable (C3-04 deferred); 3 Metal-only + 3 large-size tests skipped on Linux"
   ],
   "audits": [
+    {
+      "auditor": "GPT 6.2 Astra (C6-01 live GPU + v2-v4 closed signoff, high)",
+      "verdict": "FAIL -> REMEDIATED -> PASS — HOLD LIFTED",
+      "status": "DONE",
+      "report": "audits/AUDIT_cycle6_c6_01_gpt62_astra.md",
+      "target": "Wide Hadamard-rotated Muon W4A4 QAT (50m 3-seed + 120m transfer), 27-ckpt 9.08 GB external verification, 42/42 C5-03 0.0-nat replay, schema v2 freeze/timing/bounds/producer-pin hardening (467/467 live pytest)"
+    },
     {
       "auditor": "GPT 6.2 Astra (C5-03 live GPU + v2-v4 closed signoff, high)",
       "verdict": "PASS — HOLD LIFTED",
@@ -198,7 +207,7 @@
   ],
   "next_queue": [
     "C3-04 (MacBook Pro): Open-lid caffeinate 4096^2 Metal SYRK + live pytest tests/test_mlx.py + F5 profile",
-    "C6-01 (RTX 5080, Claude Fable 5.2): Wide Hadamard-rotated Muon W4A4 QAT (50m 3-seed + 120m NVFP4 transfer)",
-    "C6-02 (RTX 5080, queued): Blackwell NVFP4 Fused Multi-Row / Split-K Activation Quantizer & Sparse-Hadamard Projection for (1024, 512, 1408)"
+    "C6-02 (RTX 5080, Claude Opus 5.5 launching): Blackwell NVFP4 Small-Shape Quantizer Fusion closing (1024, 512, 1408) had_b16/bfly_b16 gap vs BF16 + cross_full_butterfly_b16 end-to-end profiling",
+    "C6-03 (RTX 5080, queued): Cross-Mix Butterfly/Kronecker W4A4 CUDA Graph Kernel Fusion or Selective Mixed-Precision Layer Placement"
   ]
 }
